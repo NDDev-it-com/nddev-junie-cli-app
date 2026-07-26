@@ -364,7 +364,9 @@ def desired_files(target: Path, setup: dict[str, Any]) -> dict[str, bytes]:
         target / "AGENTS.md", max_bytes=MANAGED_MAX_BYTES, label="AGENTS.md"
     )
     return {
-        "config.json": merge_json_object(existing_config, render_config(target, setup), "config.json"),
+        "config.json": merge_json_object(
+            existing_config, render_config(target, setup), "config.json"
+        ),
         "allowlist.json": merge_json_object(
             existing_allowlist, dict(setup["allowlist"]), "allowlist.json"
         ),

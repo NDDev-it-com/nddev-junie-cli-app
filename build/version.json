@@ -2,7 +2,7 @@
   "schema_version": 2,
   "build_version": "0.1.0",
   "junie_cli_channel": "release",
-  "junie_cli_tested": "official-stable-release-channel-current-2026-07-26",
+  "junie_cli_tested": "2383.10",
   "nddev_builder_projection_version": "0.1.0",
   "runtime_baseline_ref": "references/junie-cli-baseline.json",
   "shared_ci": {

@@ -8,11 +8,19 @@
   },
   "release": {
     "channel": "release",
-    "stable_version": "official-stable-release-channel-current-2026-07-26",
+    "stable_version": "2383.10",
+    "marketing_version": "26.7.20",
     "eap_channel": "eap",
-    "exact_version": null,
-    "exact_artifact_hashes": null,
-    "reason": "The official stable and EAP installer scripts were confirmed, but no immutable update-info snapshot is stored in this checkout. The module records channel identity and does not claim artifact hashes."
+    "exact_version": "2383.10",
+    "update_info": "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
+    "exact_artifact_hashes": {
+      "linux-aarch64": {"sha256": "913da134b99d5fe4415fd79c7339bfff30c3449b3714fec1b2cb6a692d810b74", "size": 271996807},
+      "linux-amd64": {"sha256": "e8a4b9bd19a754bcc0d67d21ceeca08a07e72bcd52da04f9d848a7eaf393b6e1", "size": 272602042},
+      "macos-aarch64": {"sha256": "e7eccdc74046963eee1628ec6ff0952645c0bc79554bbbb22c614347d95cf7db", "size": 269469124},
+      "macos-amd64": {"sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0", "size": 270606128},
+      "windows-aarch64": {"sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28", "size": 301279985},
+      "windows-amd64": {"sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d", "size": 267185689}
+    }
   },
   "sources": [
     "https://junie.jetbrains.com/",
@@ -74,7 +82,7 @@
   },
   "unsupported": {
     "managed_software_install": null,
-    "immutable_artifact_hashes": null,
+    "immutable_artifact_hashes": "references/junie-cli-baseline.json:release.exact_artifact_hashes",
     "rules_directory": null,
     "extension_marketplace_manifest": null,
     "builder_mcp_server": null

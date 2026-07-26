@@ -45,14 +45,14 @@
     "baseline_ref": "references/junie-cli-baseline.json",
     "command": "junie",
     "channel": "release",
-    "tested_release": "official-stable-release-channel-current-2026-07-26",
-    "exact_artifact_hashes_available": false
+    "tested_release": "2383.10",
+    "exact_artifact_hashes_available": true
   },
   "runtime_launch": {
     "command": "junie",
     "direct_command": ["junie", "--skip-update-check"],
     "manager_command": "python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target --",
-    "required_version": "official-stable-release-channel-current-2026-07-26",
+    "required_version": "2383.10",
     "environment_variable": "NDDEV_JUNIE_TARGET",
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
