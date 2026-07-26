@@ -11,8 +11,8 @@
 - `skills/nddev-builder/SKILL.md`
 - `agents/nddev-builder.md`
 - `mcp/mcp.json`
-- `.nddev-junie-cli-runtime/home/.local/bin/junie`
-- `.nddev-junie-cli-runtime/home/.local/share/junie/versions/<version>/`
+- target-owned Junie shim under the isolated runtime home
+- pinned Junie version directory under the isolated runtime data root
 - `NDDEV-JUNIE-CLI-SETUP.json`
 
 Unknown JSON keys in `config.json` and `allowlist.json` are preserved. Existing

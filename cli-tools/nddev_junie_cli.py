@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
-from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -19,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -354,7 +354,11 @@ def artifact_metadata_from_update_info(
             for key, expected_value in exact_expected.items():
                 if row.get(key) != expected_value:
                     fail(f"update-info {platform_id} {key} does not match the baseline")
-        elif not isinstance(row.get("downloadUrl"), str) or not isinstance(row.get("sha256"), str) or not isinstance(row.get("size"), int):
+        elif (
+            not isinstance(row.get("downloadUrl"), str)
+            or not isinstance(row.get("sha256"), str)
+            or not isinstance(row.get("size"), int)
+        ):
             fail(f"update-info {platform_id} test artifact metadata is invalid")
     platform_id = current_platform_id()
     if platform_id not in expected:
@@ -817,9 +821,7 @@ def render_agents_block(setup: dict[str, Any]) -> str:
 
 def builder_source(relative: str) -> bytes:
     path = BUILDER_ROOT / relative
-    return read_path_bounded(
-        path, max_bytes=MANAGED_MAX_BYTES, label=f"builder source {relative}"
-    )
+    return read_path_bounded(path, max_bytes=MANAGED_MAX_BYTES, label=f"builder source {relative}")
 
 
 def desired_files(target: Path, setup: dict[str, Any]) -> dict[str, bytes]:
@@ -875,7 +877,9 @@ def runtime_lstat(path: Path, target: Path, label: str, *, repairable: bool) -> 
     try:
         info = path.lstat()
     except FileNotFoundError:
-        runtime_fail(f"{label} is missing", code=f"{label_slug(label)}_missing", repairable=repairable)
+        runtime_fail(
+            f"{label} is missing", code=f"{label_slug(label)}_missing", repairable=repairable
+        )
     try:
         require_current_owner(info, label)
     except JunieCliSetupError as exc:
@@ -890,9 +894,13 @@ def label_slug(label: str) -> str:
 def runtime_directory(path: Path, target: Path, label: str, *, repairable: bool) -> os.stat_result:
     info = runtime_lstat(path, target, label, repairable=repairable)
     if stat.S_ISLNK(info.st_mode):
-        runtime_fail(f"{label} must not be a symlink", code=f"{label_slug(label)}_symlink", repairable=False)
+        runtime_fail(
+            f"{label} must not be a symlink", code=f"{label_slug(label)}_symlink", repairable=False
+        )
     if not stat.S_ISDIR(info.st_mode):
-        runtime_fail(f"{label} must be a directory", code=f"{label_slug(label)}_type", repairable=False)
+        runtime_fail(
+            f"{label} must be a directory", code=f"{label_slug(label)}_type", repairable=False
+        )
     return info
 
 
@@ -910,11 +918,19 @@ def runtime_regular_file(
 ) -> os.stat_result:
     info = runtime_lstat(path, target, label, repairable=repairable)
     if stat.S_ISLNK(info.st_mode):
-        runtime_fail(f"{label} must not be a symlink", code=f"{label_slug(label)}_symlink", repairable=False)
+        runtime_fail(
+            f"{label} must not be a symlink", code=f"{label_slug(label)}_symlink", repairable=False
+        )
     if not stat.S_ISREG(info.st_mode):
-        runtime_fail(f"{label} must be a regular file", code=f"{label_slug(label)}_type", repairable=False)
+        runtime_fail(
+            f"{label} must be a regular file", code=f"{label_slug(label)}_type", repairable=False
+        )
     if info.st_nlink != 1:
-        runtime_fail(f"{label} must not be a hardlink", code=f"{label_slug(label)}_hardlink", repairable=False)
+        runtime_fail(
+            f"{label} must not be a hardlink",
+            code=f"{label_slug(label)}_hardlink",
+            repairable=False,
+        )
     return info
 
 
@@ -934,10 +950,14 @@ def resolve_junie_binary(version_dir: Path, target: Path) -> Path:
         except JunieCliSetupError as exc:
             runtime_fail(str(exc), code="junie_binary_owner", repairable=False)
         if stat.S_ISLNK(info.st_mode):
-            runtime_fail("Junie binary must not be a symlink", code="junie_binary_symlink", repairable=False)
+            runtime_fail(
+                "Junie binary must not be a symlink", code="junie_binary_symlink", repairable=False
+            )
         if stat.S_ISREG(info.st_mode):
             return candidate
-        runtime_fail("Junie binary must be a regular file", code="junie_binary_type", repairable=False)
+        runtime_fail(
+            "Junie binary must be a regular file", code="junie_binary_type", repairable=False
+        )
     runtime_fail(
         "Junie binary is missing from the installed version",
         code="junie_binary_missing",
@@ -976,7 +996,9 @@ def read_runtime_receipt(target: Path, baseline: dict[str, Any]) -> dict[str, An
             repairable=True,
         )
     if not isinstance(receipt, dict):
-        runtime_fail("runtime receipt must be a JSON object", code="runtime_receipt_type", repairable=True)
+        runtime_fail(
+            "runtime receipt must be a JSON object", code="runtime_receipt_type", repairable=True
+        )
     expected_common = {
         "schema_version": 1,
         "product_name": PRODUCT_NAME,
@@ -994,7 +1016,9 @@ def read_runtime_receipt(target: Path, baseline: dict[str, Any]) -> dict[str, An
             )
     artifact = receipt.get("artifact")
     if not isinstance(artifact, dict):
-        runtime_fail("runtime receipt artifact is invalid", code="runtime_receipt_artifact", repairable=True)
+        runtime_fail(
+            "runtime receipt artifact is invalid", code="runtime_receipt_artifact", repairable=True
+        )
     if not test_override_enabled():
         expected_artifact = dict(baseline["release"]["exact_artifacts"][current_platform_id()])
         expected_artifact["platform"] = current_platform_id()
@@ -1035,13 +1059,17 @@ def current_software_metadata(target: Path) -> dict[str, Any]:
     try:
         link_info = current_link.lstat()
     except FileNotFoundError:
-        runtime_fail("Junie current link is missing", code="junie_current_link_missing", repairable=True)
+        runtime_fail(
+            "Junie current link is missing", code="junie_current_link_missing", repairable=True
+        )
     try:
         require_current_owner(link_info, "Junie current link")
     except JunieCliSetupError as exc:
         runtime_fail(str(exc), code="junie_current_link_owner", repairable=False)
     if not stat.S_ISLNK(link_info.st_mode):
-        runtime_fail("Junie current link must be a symlink", code="junie_current_link_type", repairable=False)
+        runtime_fail(
+            "Junie current link must be a symlink", code="junie_current_link_type", repairable=False
+        )
     try:
         current_resolved = current_link.resolve(strict=True)
         version_resolved = version_dir.resolve(strict=True)
@@ -1120,7 +1148,12 @@ def software_state(target: Path) -> dict[str, Any]:
             "repairable": exc.repairable,
         }
     except JunieCliSetupError as exc:
-        return {"state": "partial", "error": str(exc), "code": "runtime_invalid", "repairable": False}
+        return {
+            "state": "partial",
+            "error": str(exc),
+            "code": "runtime_invalid",
+            "repairable": False,
+        }
     return {
         "state": "installed",
         "version": metadata["version"],
@@ -1249,10 +1282,7 @@ def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str
         fail("Junie installer timed out in isolated staging HOME")
     installer_output = completed.stdout + completed.stderr
     if completed.returncode != 0:
-        fail(
-            "Junie installer failed in isolated staging HOME: "
-            f"{installer_output.strip()}"
-        )
+        fail(f"Junie installer failed in isolated staging HOME: {installer_output.strip()}")
     if f"Using specified version: {baseline['release']['exact_version']}" not in installer_output:
         fail("Junie installer output did not confirm the pinned version")
     if "Found published checksum for version" not in installer_output:
@@ -1299,12 +1329,19 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
         install_result = install_software_to_stage(stage, baseline)
         staged_home = stage / "home"
         if lstat_exists(runtime_home(target)):
-            runtime_private_directory(runtime_home(target), target, "runtime home", repairable=False)
+            runtime_private_directory(
+                runtime_home(target), target, "runtime home", repairable=False
+            )
             runtime_home(target).rename(old_home)
             previous_home = old_home
         staged_home.rename(runtime_home(target))
         ensure_current_symlink(target, baseline["release"]["exact_version"])
-        for directory in (runtime_root(target), runtime_home(target), runtime_cache(target), runtime_tmp(target)):
+        for directory in (
+            runtime_root(target),
+            runtime_home(target),
+            runtime_cache(target),
+            runtime_tmp(target),
+        ):
             directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
             directory.chmod(OWNER_DIRECTORY_MODE)
         atomic_write(
@@ -1828,13 +1865,13 @@ def plan_payload(target: Path, setup: dict[str, Any]) -> dict[str, Any]:
 
 def child_args_use_target_scope_overrides(child_args: list[str]) -> str | None:
     for index, arg in enumerate(child_args):
+        if arg == "--":
+            return None
         if arg in TARGET_SCOPE_FLAGS:
             return arg
         for flag in TARGET_SCOPE_FLAGS:
             if arg.startswith(f"{flag}="):
                 return flag
-        if arg == "--":
-            continue
         if index > 0 and child_args[index - 1] in TARGET_SCOPE_FLAGS:
             return child_args[index - 1]
     return None
