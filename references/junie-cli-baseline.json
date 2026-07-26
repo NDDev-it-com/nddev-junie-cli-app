@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-07-26",
+  "product": {
+    "vendor": "JetBrains",
+    "name": "Junie CLI",
+    "official_site": "https://junie.jetbrains.com/"
+  },
+  "release": {
+    "channel": "release",
+    "stable_version": "official-stable-release-channel-current-2026-07-26",
+    "eap_channel": "eap",
+    "exact_version": null,
+    "exact_artifact_hashes": null,
+    "reason": "The official stable and EAP installer scripts were confirmed, but no immutable update-info snapshot is stored in this checkout. The module records channel identity and does not claim artifact hashes."
+  },
+  "sources": [
+    "https://junie.jetbrains.com/",
+    "https://junie.jetbrains.com/docs/junie-cli.html",
+    "https://junie.jetbrains.com/docs/parameters.html",
+    "https://junie.jetbrains.com/docs/junie-cli-eap.html",
+    "https://junie.jetbrains.com/docs/junie-cli-configuration.html",
+    "https://junie.jetbrains.com/docs/environment-variables.html",
+    "https://junie.jetbrains.com/docs/action-allowlist-junie-cli.html",
+    "https://junie.jetbrains.com/docs/agent-skills.html",
+    "https://junie.jetbrains.com/docs/junie-cli-mcp-configuration.html",
+    "https://junie.jetbrains.com/install.sh",
+    "https://junie.jetbrains.com/install-eap.sh"
+  ],
+  "runtime": {
+    "command": "junie",
+    "stable_install": "curl -fsSL https://junie.jetbrains.com/install.sh | bash",
+    "eap_install": "curl -fsSL https://junie.jetbrains.com/install-eap.sh | bash",
+    "user_config": "~/.junie/config.json",
+    "project_config": "<project-root>/.junie/config.json",
+    "user_settings": "~/.junie/settings.json",
+    "allowlist": "~/.junie/allowlist.json",
+    "trust_directory": "~/.junie/trust",
+    "user_skills": "~/.junie/skills/<skill-name>/",
+    "project_skills": "<projectRoot>/.junie/skills/<skill-name>/",
+    "mcp_config": ".junie/mcp/mcp.json",
+    "extensions_user_reference": "~/.junie/extensions/extensions.json",
+    "extensions_project_reference": ".junie/extensions.json"
+  },
+  "cli_parameters": {
+    "version": "--version",
+    "project": "--project",
+    "plan": "--plan",
+    "skip_update_check": "--skip-update-check",
+    "config_location": "--config-location",
+    "config_default_locations": "--config-default-locations false",
+    "mcp_location": "--mcp-location",
+    "mcp_default_locations": "--mcp-default-locations false",
+    "cache_dir": "--cache-dir"
+  },
+  "environment": {
+    "config_location": "JUNIE_CONFIG_LOCATION",
+    "config_default_locations": "JUNIE_CONFIG_DEFAULT_LOCATIONS",
+    "skill_locations": "JUNIE_SKILL_LOCATIONS",
+    "skill_default_locations": "JUNIE_SKILL_DEFAULT_LOCATIONS",
+    "agent_locations": "JUNIE_AGENT_LOCATIONS",
+    "agent_default_locations": "JUNIE_AGENT_DEFAULT_LOCATIONS",
+    "mcp_locations": "JUNIE_MCP_LOCATIONS",
+    "mcp_default_locations": "JUNIE_MCP_DEFAULT_LOCATIONS",
+    "extensions_default_location": "JUNIE_EXTENSIONS_DEFAULT_LOCATION",
+    "guidelines_filename": "JUNIE_GUIDELINES_FILENAME"
+  },
+  "permission_model": {
+    "approval_file": "~/.junie/allowlist.json",
+    "brave_levels": ["Off", "Auto", "On"],
+    "safe": "brave disabled; ask by default",
+    "balanced": "brave disabled; readonly command allowlist enabled",
+    "full_auto": "brave enabled; all sensitive actions may run without approval according to official Brave mode behavior"
+  },
+  "unsupported": {
+    "managed_software_install": null,
+    "immutable_artifact_hashes": null,
+    "rules_directory": null,
+    "extension_marketplace_manifest": null,
+    "builder_mcp_server": null
+  }
+}

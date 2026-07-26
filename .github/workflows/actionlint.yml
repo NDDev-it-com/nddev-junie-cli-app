@@ -1,0 +1,10 @@
+name: actionlint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  actionlint:
+    uses: NDDev-it-com/ci-workflows/.github/workflows/actionlint.yml@2ccb80e96f5771b6a6b4eae63a4f47e232906dc7 # 0.12.0

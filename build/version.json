@@ -1,4 +1,13 @@
 {
-  "schema_version": 1,
-  "build_version": "0.0.0"
+  "schema_version": 2,
+  "build_version": "0.1.0",
+  "junie_cli_channel": "release",
+  "junie_cli_tested": "official-stable-release-channel-current-2026-07-26",
+  "nddev_builder_projection_version": "0.1.0",
+  "runtime_baseline_ref": "references/junie-cli-baseline.json",
+  "shared_ci": {
+    "repository": "NDDev-it-com/ci-workflows",
+    "version": "0.12.0",
+    "commit": "2ccb80e96f5771b6a6b4eae63a4f47e232906dc7"
+  }
 }

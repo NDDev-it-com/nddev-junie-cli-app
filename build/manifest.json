@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "product_name": "nddev-junie-cli-app",
+  "build_version": "0.1.0",
+  "junie_cli_channel": "release",
+  "junie_cli_tested": "official-stable-release-channel-current-2026-07-26",
+  "setup_ids": ["safe", "balanced", "full-auto"],
+  "manager": "cli-tools/nddev_junie_cli.py",
+  "contract": "config/nddev-contract.json",
+  "runtime_baseline": "references/junie-cli-baseline.json",
+  "nddev_builder_projection_version": "0.1.0",
+  "public_validator": "cli-tools/validate_public_contracts.py"
+}

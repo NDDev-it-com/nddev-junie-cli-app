@@ -1,10 +1,80 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "product_name": "nddev-junie-cli-app",
   "github_repository": "NDDev-it-com/nddev-junie-cli-app",
   "license": "AGPL-3.0-or-later",
-  "skeleton": {
-    "status": "skeleton",
-    "harness_id": "junie-cli"
+  "manifest_ref": "build/manifest.json",
+  "version_ref": "build/version.json",
+  "managed_state": {
+    "stamp_file": "NDDEV-JUNIE-CLI-SETUP.json",
+    "stamp_schema": 1,
+    "default_target": null,
+    "environment_variable": "NDDEV_JUNIE_TARGET",
+    "managed_directory_mode": "0700",
+    "managed_file_mode": "0600",
+    "preserve_other_state": true,
+    "co_owned_config_strategy": "JSON object merge for config.json and allowlist.json; marked block merge for AGENTS.md; exact managed files for nddev-builder skill and agent"
+  },
+  "setup_system": {
+    "catalog_root": "setups",
+    "setup_ids": ["safe", "balanced", "full-auto"],
+    "identity_source": "official Junie CLI docs and installer scripts from junie.jetbrains.com",
+    "list_command": "python3 cli-tools/nddev_junie_cli.py list --json",
+    "status_command": "python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json",
+    "plan_command": "python3 cli-tools/nddev_junie_cli.py plan --setup safe --target /absolute/target --json",
+    "install_command": "python3 cli-tools/nddev_junie_cli.py install --setup safe --target /absolute/target --json",
+    "switch_command": "python3 cli-tools/nddev_junie_cli.py switch --setup balanced --target /absolute/target --json",
+    "restore_command": "python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json",
+    "remove_command": "python3 cli-tools/nddev_junie_cli.py remove --target /absolute/target --json",
+    "launch_command": "python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target --"
+  },
+  "safety": {
+    "absolute_target_required": true,
+    "relative_target_rejected": true,
+    "target_symlinks_rejected": true,
+    "managed_symlinks_rejected": true,
+    "managed_hardlinks_rejected": true,
+    "bounded_managed_reads": true,
+    "canonical_target_binding": true,
+    "rollback_on_failure": true,
+    "max_backups": 10,
+    "launch_requires_clean_managed_target": true,
+    "launch_strips_provider_credentials": true
+  },
+  "runtime_compatibility": {
+    "baseline_ref": "references/junie-cli-baseline.json",
+    "command": "junie",
+    "channel": "release",
+    "tested_release": "official-stable-release-channel-current-2026-07-26",
+    "exact_artifact_hashes_available": false
+  },
+  "runtime_launch": {
+    "command": "junie",
+    "direct_command": ["junie", "--skip-update-check"],
+    "manager_command": "python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target --",
+    "required_version": "official-stable-release-channel-current-2026-07-26",
+    "environment_variable": "NDDEV_JUNIE_TARGET",
+    "forwards_arguments": true,
+    "forwards_child_exit_code": true,
+    "streams_child_stdio": true,
+    "json_manager_errors_supported": true,
+    "target_environment_scope": "isolated HOME, JUNIE_DATA, config, skills, agents, MCP, extensions, guidelines, and cache under the explicit target"
+  },
+  "plugin_marketplace": {
+    "plugin_id": "nddev-builder",
+    "plugin_manifest": null,
+    "marketplace_manifest": null,
+    "external_marketplace_published": null,
+    "default_on_in_all_setups": true,
+    "builder_enabled_in_base_config": true,
+    "native_projection": {
+      "guidelines": "AGENTS.md via JUNIE_GUIDELINES_FILENAME",
+      "skills": "skills/nddev-builder/SKILL.md via JUNIE_SKILL_LOCATIONS",
+      "agents": "agents/nddev-builder.md via JUNIE_AGENT_LOCATIONS",
+      "mcp": "mcp/mcp.json via JUNIE_MCP_LOCATIONS with no bundled provider secrets",
+      "rules": null,
+      "extensions": null
+    },
+    "unsupported_reason": "No NDDev Junie extension marketplace manifest is confirmed or published; builder is projected through native guidelines, skills, agents, and MCP configuration locations."
   }
 }
