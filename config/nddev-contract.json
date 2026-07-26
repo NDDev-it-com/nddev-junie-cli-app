@@ -41,6 +41,19 @@
     "launch_requires_clean_managed_target": true,
     "launch_strips_provider_credentials": true
   },
+  "software_lifecycle": {
+    "installer_url": "https://junie.jetbrains.com/install.sh",
+    "installer_sha256": "a37b9ce2d7bdacdcccd59afd6b8a84d96d2349a5ab6a3707c83f5b731af294bd",
+    "version": "2383.10",
+    "update_info": "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
+    "install_only_absent": true,
+    "update_repairs_safe_partial": true,
+    "update_command": "python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json",
+    "installer_execution_home": "isolated staging HOME",
+    "persisted_runtime": ".nddev-junie-cli-runtime/home",
+    "status_executes_target_binary": false,
+    "stage_version_probe_only": true
+  },
   "runtime_compatibility": {
     "baseline_ref": "references/junie-cli-baseline.json",
     "command": "junie",

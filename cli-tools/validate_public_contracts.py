@@ -89,6 +89,27 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("baseline channel must be release")
     if baseline["runtime"]["command"] != "junie":
         raise ValueError("baseline command must be junie")
+    installer = baseline["release"]["installer"]
+    lifecycle = contract["software_lifecycle"]
+    if lifecycle["installer_url"] != installer["url"]:
+        raise ValueError("contract installer URL differs from baseline")
+    if lifecycle["installer_sha256"] != installer["sha256"]:
+        raise ValueError("contract installer SHA256 differs from baseline")
+    if lifecycle["version"] != baseline["release"]["exact_version"]:
+        raise ValueError("contract software version differs from baseline")
+    if lifecycle["update_info"] != baseline["release"]["update_info"]:
+        raise ValueError("contract update-info URL differs from baseline")
+    exact_artifacts = baseline["release"].get("exact_artifacts")
+    if not isinstance(exact_artifacts, dict) or set(exact_artifacts) != set(
+        baseline["release"]["exact_artifact_hashes"]
+    ):
+        raise ValueError("baseline exact artifact metadata is incomplete")
+    for platform_id, artifact in exact_artifacts.items():
+        hashes = baseline["release"]["exact_artifact_hashes"][platform_id]
+        if artifact["sha256"] != hashes["sha256"] or artifact["size"] != hashes["size"]:
+            raise ValueError(f"{platform_id}: exact artifact hash metadata differs")
+        if not str(artifact["download_url"]).startswith("https://github.com/JetBrains/junie/"):
+            raise ValueError(f"{platform_id}: exact artifact URL must be official")
     if contract["plugin_marketplace"]["external_marketplace_published"] is not None:
         raise ValueError("external marketplace must remain null until published")
     if contract["plugin_marketplace"]["marketplace_manifest"] is not None:

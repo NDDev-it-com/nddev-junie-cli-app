@@ -12,7 +12,43 @@
     "marketing_version": "26.7.20",
     "eap_channel": "eap",
     "exact_version": "2383.10",
+    "installer": {
+      "url": "https://junie.jetbrains.com/install.sh",
+      "sha256": "a37b9ce2d7bdacdcccd59afd6b8a84d96d2349a5ab6a3707c83f5b731af294bd"
+    },
     "update_info": "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
+    "exact_artifacts": {
+      "linux-aarch64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-linux-aarch64.zip",
+        "sha256": "913da134b99d5fe4415fd79c7339bfff30c3449b3714fec1b2cb6a692d810b74",
+        "size": 271996807
+      },
+      "linux-amd64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-linux-amd64.zip",
+        "sha256": "e8a4b9bd19a754bcc0d67d21ceeca08a07e72bcd52da04f9d848a7eaf393b6e1",
+        "size": 272602042
+      },
+      "macos-aarch64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-aarch64.zip",
+        "sha256": "e7eccdc74046963eee1628ec6ff0952645c0bc79554bbbb22c614347d95cf7db",
+        "size": 269469124
+      },
+      "macos-amd64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-amd64.zip",
+        "sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0",
+        "size": 270606128
+      },
+      "windows-aarch64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-aarch64.zip",
+        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
+        "size": 301279985
+      },
+      "windows-amd64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-amd64.zip",
+        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
+        "size": 267185689
+      }
+    },
     "exact_artifact_hashes": {
       "linux-aarch64": {"sha256": "913da134b99d5fe4415fd79c7339bfff30c3449b3714fec1b2cb6a692d810b74", "size": 271996807},
       "linux-amd64": {"sha256": "e8a4b9bd19a754bcc0d67d21ceeca08a07e72bcd52da04f9d848a7eaf393b6e1", "size": 272602042},
@@ -50,6 +86,12 @@
     "extensions_user_reference": "~/.junie/extensions/extensions.json",
     "extensions_project_reference": ".junie/extensions.json"
   },
+  "software_lifecycle": {
+    "managed_install": "official install.sh is verified by pinned SHA256, executed only in isolated staging HOME with JUNIE_VERSION=2383.10, then persisted under the explicit target runtime",
+    "install_only_absent": true,
+    "update_repairs_safe_partial": true,
+    "status_executes_target_binary": false
+  },
   "cli_parameters": {
     "version": "--version",
     "project": "--project",
@@ -81,7 +123,6 @@
     "full_auto": "brave enabled; all sensitive actions may run without approval according to official Brave mode behavior"
   },
   "unsupported": {
-    "managed_software_install": null,
     "immutable_artifact_hashes": "references/junie-cli-baseline.json:release.exact_artifact_hashes",
     "rules_directory": null,
     "extension_marketplace_manifest": null,
