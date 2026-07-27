@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -28,9 +29,12 @@ PRODUCT_NAME = "nddev-junie-cli-app"
 SETUP_ROOT = ROOT / "setups"
 BUILDER_ROOT = ROOT / "builder" / "nddev-builder"
 BASELINE_PATH = ROOT / "references" / "junie-cli-baseline.json"
-SETUP_ORDER = ("safe", "balanced", "full-auto")
+DEFAULT_SETUP_ID = "full-auto"
+SETUP_ORDER = ("safe", "full-auto")
 STAMP_NAME = "NDDEV-JUNIE-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-JUNIE-CLI-BACKUP.json"
+STAMP_SCHEMA = 2
+LEGACY_STAMP_SCHEMA = 1
 RUNTIME_DIR_NAME = ".nddev-junie-cli-runtime"
 RUNTIME_RECEIPT_NAME = "NDDEV-JUNIE-CLI-RUNTIME.json"
 MANAGED_BEGIN = "<!-- BEGIN NDDEV-JUNIE-CLI MANAGED -->"
@@ -44,16 +48,14 @@ UPDATE_INFO_MAX_BYTES = 8 * 1024 * 1024
 SOFTWARE_FILE_MAX_BYTES = 1024 * 1024 * 1024
 INSTALL_TIMEOUT_SECONDS = 900
 PROBE_TIMEOUT_SECONDS = 30
-CONTENT_MANAGED_PATHS = (
+BASE_CONTROL_MANAGED_PATHS = (
     "config.json",
-    "allowlist.json",
     "AGENTS.md",
-    "skills/nddev-builder/SKILL.md",
-    "agents/nddev-builder.md",
     "mcp/mcp.json",
 )
+RUNTIME_ALLOWLIST_RELATIVE = f"{RUNTIME_DIR_NAME}/home/.junie/allowlist.json"
 MERGED_MARKER_PATHS = {"AGENTS.md"}
-MANAGED_JSON_KEYS = {
+LEGACY_MANAGED_JSON_KEYS = {
     "config.json": (
         "auto-update",
         "brave",
@@ -86,6 +88,8 @@ PROVIDER_SECRET_NAMES = {
     "OPENROUTER_API_KEY",
 }
 TARGET_SCOPE_FLAGS = {
+    "--project",
+    "-p",
     "--cache-dir",
     "-c",
     "--config-location",
@@ -98,9 +102,21 @@ TARGET_SCOPE_FLAGS = {
     "--agent-default-location",
     "--command-location",
     "--command-default-locations",
+    "--extensions-default-location",
     "--guidelines-filename",
     "--model-location",
     "--model-default-locations",
+    "--model",
+    "--effort",
+    "--provider",
+    "--auth",
+    "-a",
+    "--auth-license",
+    "--anthropic-api-key",
+    "--google-api-key",
+    "--grok-api-key",
+    "--openai-api-key",
+    "--openrouter-api-key",
 }
 
 
@@ -849,12 +865,51 @@ def merge_json_object(existing: bytes | None, desired: dict[str, Any], label: st
     return canonical_json(value)
 
 
+def posix_relative(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def read_builder_tree(relative_root: str) -> dict[str, bytes]:
+    root = BUILDER_ROOT / relative_root
+    if not root.is_dir():
+        return {}
+    files: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        relative = posix_relative(path, root)
+        if any(part.startswith(".") for part in Path(relative).parts):
+            continue
+        info = stat_existing(path, f"builder source {relative_root}/{relative}")
+        if info is None:
+            continue
+        require_current_owner(info, f"builder source {relative_root}/{relative}")
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"builder source {relative_root}/{relative} must be a regular file")
+        if info.st_nlink != 1:
+            fail(f"builder source {relative_root}/{relative} must not be a hardlink")
+        if info.st_size > MANAGED_MAX_BYTES:
+            fail(f"builder source {relative_root}/{relative} is too large")
+        files[relative] = read_path_bounded(
+            path,
+            max_bytes=MANAGED_MAX_BYTES,
+            label=f"builder source {relative_root}/{relative}",
+        )
+    return files
+
+
+def quoted(value: Path | str) -> str:
+    return shlex.quote(str(value))
+
+
 def render_config(target: Path, setup: dict[str, Any]) -> dict[str, Any]:
     canonical = validate_target(target, create=False)
+    hook_command = (
+        f"python3 {quoted(canonical / 'hooks' / 'nddev-builder-context.py')} "
+        f"--target {quoted(canonical)}"
+    )
     return {
         "brave": bool(setup["brave"]),
-        "auto-update": false_json(),
-        "guidelines-location": str((canonical / "AGENTS.md").resolve()),
         "skill-locations": [str((canonical / "skills").resolve())],
         "skill-default-locations": false_json(),
         "agent-locations": [str((canonical / "agents").resolve())],
@@ -864,6 +919,20 @@ def render_config(target: Path, setup: dict[str, Any]) -> dict[str, Any]:
         "command-locations": [str((canonical / "commands").resolve())],
         "command-default-locations": false_json(),
         "model-default-locations": false_json(),
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash|Write|Edit|Read|Grep|Glob",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 5,
+                        }
+                    ]
+                }
+            ]
+        },
     }
 
 
@@ -871,18 +940,15 @@ def false_json() -> bool:
     return False
 
 
-def render_agents_block(setup: dict[str, Any]) -> str:
+def render_agents_content(setup: dict[str, Any]) -> str:
     return (
-        f"{MANAGED_BEGIN}\n"
-        "\n"
         "# NDDev Junie CLI Setup\n"
         "\n"
         f"This target is managed as the `{setup['id']}` setup by nddev-junie-cli-app.\n"
-        "Use the managed nddev-builder skill for setup artifact changes. Use only current\n"
-        "Junie CLI surfaces confirmed in the public baseline: guidelines, skills, agents,\n"
-        "MCP configuration, action allowlist, and explicit config locations.\n"
+        "Use the managed nddev-builder skill for Junie setup artifact changes. Work only\n"
+        "through the target-owned files passed by the manager's explicit Junie CLI flags\n"
+        "and environment variables. Do not read or write live account Junie state.\n"
         "\n"
-        f"{MANAGED_END}\n"
     )
 
 
@@ -891,50 +957,102 @@ def builder_source(relative: str) -> bytes:
     return read_path_bounded(path, max_bytes=MANAGED_MAX_BYTES, label=f"builder source {relative}")
 
 
+def render_extension_manifest() -> bytes:
+    return canonical_json(
+        {
+            "name": "nddev-builder",
+            "owner": {"name": "NDDev"},
+            "metadata": {
+                "description": "Local NDDev builder toolkit for Junie CLI setup artifacts.",
+                "version": VERSION,
+                "homepage": "https://github.com/NDDev-it-com/nddev-junie-cli-app",
+            },
+            "extensions": [
+                {
+                    "name": "nddev-builder",
+                    "source": "./extensions/nddev-builder",
+                    "description": "Creator and checker toolkit for native Junie CLI setup artifacts.",
+                    "version": VERSION,
+                    "author": {"name": "NDDev"},
+                    "category": "tooling",
+                    "keywords": ["junie", "setup", "skills", "mcp", "hooks"],
+                }
+            ],
+        }
+    )
+
+
+def render_extension_json() -> bytes:
+    return canonical_json(
+        {
+            "name": "nddev-builder",
+            "description": "Creator and checker toolkit for native Junie CLI setup artifacts.",
+        }
+    )
+
+
+def extension_prefix() -> str:
+    return "extensions/nddev-builder-marketplace"
+
+
+def copy_builder_projection(files: dict[str, bytes], source_root: str, target_root: str) -> None:
+    for relative, data in read_builder_tree(source_root).items():
+        files[f"{target_root}/{relative}"] = data
+
+
 def desired_files(target: Path, setup: dict[str, Any]) -> dict[str, bytes]:
-    existing_config = read_existing_file(
-        target / "config.json", max_bytes=MANAGED_MAX_BYTES, label="config.json"
-    )
-    existing_allowlist = read_existing_file(
-        target / "allowlist.json", max_bytes=MANAGED_MAX_BYTES, label="allowlist.json"
-    )
-    existing_agents = read_existing_file(
-        target / "AGENTS.md", max_bytes=MANAGED_MAX_BYTES, label="AGENTS.md"
-    )
-    return {
-        "config.json": merge_json_object(
-            existing_config, render_config(target, setup), "config.json"
-        ),
-        "allowlist.json": merge_json_object(
-            existing_allowlist, dict(setup["allowlist"]), "allowlist.json"
-        ),
-        "AGENTS.md": merge_managed_block(existing_agents, render_agents_block(setup)),
-        "skills/nddev-builder/SKILL.md": builder_source("skills/nddev-builder/SKILL.md"),
-        "agents/nddev-builder.md": builder_source("agents/nddev-builder.md"),
+    files: dict[str, bytes] = {
+        "config.json": canonical_json(render_config(target, setup)),
+        RUNTIME_ALLOWLIST_RELATIVE: canonical_json(dict(setup["allowlist"])),
+        "AGENTS.md": render_agents_content(setup).encode("utf-8"),
         "mcp/mcp.json": canonical_json({"mcpServers": {}}),
     }
+    copy_builder_projection(files, "skills", "skills")
+    copy_builder_projection(files, "agents", "agents")
+    copy_builder_projection(files, "commands", "commands")
+    copy_builder_projection(files, "hooks", "hooks")
+
+    package = extension_prefix()
+    files[f"{package}/.junie-extension/marketplace.json"] = render_extension_manifest()
+    files[f"{package}/extensions/nddev-builder/extension.json"] = render_extension_json()
+    files[f"{package}/extensions/nddev-builder/guidelines/AGENTS.md"] = files["AGENTS.md"]
+    files[f"{package}/extensions/nddev-builder/mcp/.mcp.json"] = canonical_json(
+        {"mcpServers": {}}
+    )
+    copy_builder_projection(
+        files, "skills", f"{package}/extensions/nddev-builder/skills"
+    )
+    copy_builder_projection(
+        files, "agents", f"{package}/extensions/nddev-builder/agents"
+    )
+    copy_builder_projection(
+        files, "commands", f"{package}/extensions/nddev-builder/commands"
+    )
+    return files
 
 
-def managed_digest_for_bytes(relative: str, data: bytes) -> str:
-    if relative in MERGED_MARKER_PATHS:
+def managed_digest_for_bytes(relative: str, data: bytes, *, legacy: bool = False) -> str:
+    if legacy and relative in MERGED_MARKER_PATHS:
         block = extract_managed_block(data.decode("utf-8"))
         if block is None:
             return ""
         return sha256_bytes(block.encode("utf-8"))
-    if relative in MANAGED_JSON_KEYS:
+    if legacy and relative in LEGACY_MANAGED_JSON_KEYS:
         value = parse_optional_json(data, relative)
-        subset = {key: value.get(key) for key in MANAGED_JSON_KEYS[relative] if key in value}
+        subset = {
+            key: value.get(key) for key in LEGACY_MANAGED_JSON_KEYS[relative] if key in value
+        }
         return sha256_bytes(canonical_json(subset))
     return sha256_bytes(data)
 
 
-def current_managed_digest(target: Path, relative: str) -> str | None:
+def current_managed_digest(target: Path, relative: str, *, legacy: bool = False) -> str | None:
     data = read_existing_file(
         safe_target_path(target, relative), max_bytes=MANAGED_MAX_BYTES, label=relative
     )
     if data is None:
         return None
-    digest = managed_digest_for_bytes(relative, data)
+    digest = managed_digest_for_bytes(relative, data, legacy=legacy)
     return digest or None
 
 
@@ -1273,12 +1391,17 @@ def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> Non
     cache = stage_home.parent / "probe-cache"
     skills = stage_home / "skills"
     agents = stage_home / "agents"
+    commands = stage_home / "commands"
     mcp = stage_home / "mcp"
-    for directory in (cache, skills, agents, mcp):
+    extensions = stage_home / "extensions-cache"
+    for directory in (cache, skills, agents, commands, mcp, extensions):
         directory.mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
     config = stage_home / "config.json"
     if not lstat_exists(config):
         atomic_write(config, b"{}\n", stage_home)
+    guidelines = stage_home / "AGENTS.md"
+    if not lstat_exists(guidelines):
+        atomic_write(guidelines, b"# Junie Stage Probe\n", stage_home)
     env = sanitized_subprocess_env(stage_home, stage_home / ".local" / "share" / "junie", tmp)
     live_before = snapshot_live_junie_home()
     try:
@@ -1286,10 +1409,14 @@ def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> Non
             [
                 str(stage_home / ".local" / "bin" / "junie"),
                 "--skip-update-check",
+                "--project",
+                str(stage_home),
                 "--config-location",
                 str(config),
                 "--config-default-locations",
                 "false",
+                "--guidelines-filename",
+                str(stage_home / "AGENTS.md"),
                 "--mcp-location",
                 str(mcp),
                 "--mcp-default-locations",
@@ -1302,6 +1429,14 @@ def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> Non
                 str(agents),
                 "--agent-default-location",
                 "false",
+                "--command-location",
+                str(commands),
+                "--command-default-locations",
+                "false",
+                "--model-default-locations",
+                "false",
+                "--extensions-default-location",
+                str(extensions),
                 "--cache-dir",
                 str(cache),
                 "--version",
@@ -1542,10 +1677,25 @@ def read_stamp(target: Path) -> dict[str, Any] | None:
     stamp = read_json_file(path, max_bytes=METADATA_MAX_BYTES, label=STAMP_NAME)
     if stamp.get("product_name") != PRODUCT_NAME:
         fail("stamp belongs to another product")
+    if stamp.get("schema_version") not in (LEGACY_STAMP_SCHEMA, STAMP_SCHEMA):
+        fail("stamp schema is unsupported")
     canonical = str(validate_target(target, create=False))
     if stamp.get("canonical_target") != canonical:
         fail("stamp is bound to a different canonical target")
     return stamp
+
+
+def stamp_managed_relatives(stamp: dict[str, Any]) -> list[str]:
+    managed = stamp.get("managed_files")
+    if not isinstance(managed, dict):
+        fail("stamp managed_files is invalid")
+    relatives: list[str] = []
+    for relative in managed:
+        if not isinstance(relative, str):
+            fail("stamp managed file path is invalid")
+        safe_target_path(Path("/tmp/nddev-junie-cli-path-check"), relative)
+        relatives.append(relative)
+    return sorted(relatives)
 
 
 def drift_for_stamp(target: Path, stamp: dict[str, Any]) -> list[str]:
@@ -1553,10 +1703,11 @@ def drift_for_stamp(target: Path, stamp: dict[str, Any]) -> list[str]:
     managed = stamp.get("managed_files")
     if not isinstance(managed, dict):
         fail("stamp managed_files is invalid")
+    legacy = stamp.get("schema_version") == LEGACY_STAMP_SCHEMA
     for relative, expected in managed.items():
         if not isinstance(relative, str) or not isinstance(expected, str):
             fail("stamp managed file digest is invalid")
-        current = current_managed_digest(target, relative)
+        current = current_managed_digest(target, relative, legacy=legacy)
         if current != expected:
             drift.append(relative)
     expected_software = stamp.get("software")
@@ -1603,27 +1754,36 @@ def status_payload(target: Path) -> dict[str, Any]:
         "canonical_target": str(canonical),
         "setup_id": stamp["setup_id"],
         "build_version": stamp["build_version"],
+        "stamp_schema": stamp["schema_version"],
+        "legacy": stamp["schema_version"] == LEGACY_STAMP_SCHEMA,
+        "launchable": stamp["schema_version"] == STAMP_SCHEMA,
         "drift": drift,
         "managed_files": sorted(stamp["managed_files"]),
         "software": software,
     }
 
 
-def snapshot_files(target: Path) -> dict[str, bytes | None]:
+def unique_relatives(relatives: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    return sorted(set(relatives))
+
+
+def snapshot_files(target: Path, relatives: list[str]) -> dict[str, bytes | None]:
     snapshot: dict[str, bytes | None] = {}
-    for relative in (*CONTENT_MANAGED_PATHS, STAMP_NAME):
+    for relative in unique_relatives([*relatives, STAMP_NAME]):
         snapshot[relative] = read_existing_file(
             safe_target_path(target, relative), max_bytes=MANAGED_MAX_BYTES, label=relative
         )
     return snapshot
 
 
-def capture_transaction_snapshot(target: Path, *, target_existed: bool) -> TransactionSnapshot:
+def capture_transaction_snapshot(
+    target: Path, *, target_existed: bool, relatives: list[str]
+) -> TransactionSnapshot:
     files: dict[str, FileSnapshot] = {}
     target_mode = None
     if target_existed:
         target_mode = stat.S_IMODE(require_real_directory(target, "target").st_mode)
-    for relative in (*CONTENT_MANAGED_PATHS, STAMP_NAME):
+    for relative in unique_relatives([*relatives, STAMP_NAME]):
         path = safe_target_path(target, relative)
         info = require_existing_managed_file(path, relative, max_bytes=MANAGED_MAX_BYTES)
         if info is None:
@@ -1652,7 +1812,7 @@ def restore_transaction_snapshot(target: Path, snapshot: TransactionSnapshot) ->
         if item.data is None or item.mode is None:
             fail("transaction snapshot is invalid")
         atomic_write(path, item.data, target, mode=item.mode)
-    prune_empty_managed_dirs(target)
+    prune_empty_managed_dirs(target, list(snapshot.files))
     if snapshot.target_existed and snapshot.target_mode is not None:
         with contextlib.suppress(FileNotFoundError):
             target.chmod(snapshot.target_mode)
@@ -1669,7 +1829,7 @@ def restore_snapshot(target: Path, snapshot: dict[str, bytes | None]) -> None:
                 path.unlink()
             continue
         atomic_write(path, data, target)
-    prune_empty_managed_dirs(target)
+    prune_empty_managed_dirs(target, list(snapshot))
 
 
 def choose_backup_slot(pool: Path) -> int:
@@ -1706,7 +1866,7 @@ def create_backup(target: Path, stamp: dict[str, Any]) -> int:
         shutil.rmtree(slot_dir)
     slot_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
     files: dict[str, Any] = {}
-    for relative in (*CONTENT_MANAGED_PATHS, STAMP_NAME):
+    for relative in unique_relatives([*stamp_managed_relatives(stamp), STAMP_NAME]):
         data = read_existing_file(
             safe_target_path(target, relative), max_bytes=MANAGED_MAX_BYTES, label=relative
         )
@@ -1732,7 +1892,7 @@ def build_stamp(
         relative: managed_digest_for_bytes(relative, data) for relative, data in files.items()
     }
     return {
-        "schema_version": 1,
+        "schema_version": STAMP_SCHEMA,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "setup_id": setup_id,
@@ -1742,12 +1902,56 @@ def build_stamp(
     }
 
 
+def assert_no_unmanaged_conflicts(target: Path, relatives: list[str]) -> None:
+    for relative in relatives:
+        path = safe_target_path(target, relative)
+        if lstat_exists(path):
+            fail(f"unmanaged file already exists at managed path: {relative}")
+
+
+def validate_legacy_migration_clean(target: Path, stamp: dict[str, Any]) -> None:
+    if stamp.get("schema_version") != LEGACY_STAMP_SCHEMA:
+        return
+    config = read_existing_file(
+        target / "config.json", max_bytes=MANAGED_MAX_BYTES, label="legacy config.json"
+    )
+    if config is not None:
+        value = parse_optional_json(config, "legacy config.json")
+        extra = sorted(set(value) - set(LEGACY_MANAGED_JSON_KEYS["config.json"]))
+        if extra:
+            fail(
+                "legacy config.json contains unmanaged keys; remove or back it up before migrate: "
+                + ", ".join(extra)
+            )
+    allowlist = read_existing_file(
+        target / "allowlist.json", max_bytes=MANAGED_MAX_BYTES, label="legacy allowlist.json"
+    )
+    if allowlist is not None:
+        value = parse_optional_json(allowlist, "legacy allowlist.json")
+        extra = sorted(set(value) - set(LEGACY_MANAGED_JSON_KEYS["allowlist.json"]))
+        if extra:
+            fail(
+                "legacy allowlist.json contains unmanaged keys; remove or back it up before migrate: "
+                + ", ".join(extra)
+            )
+    agents = read_existing_file(
+        target / "AGENTS.md", max_bytes=MANAGED_MAX_BYTES, label="legacy AGENTS.md"
+    )
+    if agents is not None:
+        text = agents.decode("utf-8")
+        block = extract_managed_block(text)
+        unmanaged = text.replace(block or "", "").strip()
+        if unmanaged:
+            fail("legacy AGENTS.md contains unmanaged text; remove or back it up before migrate")
+
+
 def write_setup_locked(
     target: Path,
     setup: dict[str, Any],
     *,
     require_existing: bool = False,
     repair_software: bool = False,
+    allow_legacy_migration: bool = False,
     directory_transaction: DirectoryTransaction | None = None,
 ) -> dict[str, Any]:
     target_existed = lstat_exists(target)
@@ -1756,24 +1960,41 @@ def write_setup_locked(
     if require_existing and current is None:
         fail("switch requires an already managed target")
     if current is not None:
+        if current["schema_version"] != STAMP_SCHEMA and not allow_legacy_migration:
+            fail("legacy managed target must be migrated before this operation")
+        if allow_legacy_migration:
+            validate_legacy_migration_clean(target, current)
         drift = drift_for_stamp(target, current)
         if drift and not (repair_software and drift == ["software"]):
             fail(f"managed target has drift: {', '.join(drift)}")
     files = desired_files(target, setup)
+    previous_relatives = [] if current is None else stamp_managed_relatives(current)
+    transaction_relatives = unique_relatives([*previous_relatives, *files])
+    if current is None:
+        assert_no_unmanaged_conflicts(target, transaction_relatives)
     changed = [
         relative
         for relative, data in files.items()
         if current_managed_digest(target, relative) != managed_digest_for_bytes(relative, data)
     ]
     backup_slot = None
-    if current is not None and current["setup_id"] != setup["id"]:
+    if current is not None and (
+        current["setup_id"] != setup["id"] or current["schema_version"] != STAMP_SCHEMA
+    ):
         backup_slot = create_backup(target, current)
-    snapshot = capture_transaction_snapshot(target, target_existed=target_existed)
+    snapshot = capture_transaction_snapshot(
+        target, target_existed=target_existed, relatives=transaction_relatives
+    )
     software_tx: SoftwareTransaction | None = None
     try:
+        software_tx = begin_software_transaction(target, repair=repair_software)
         for relative, data in files.items():
             atomic_write(safe_target_path(target, relative), data, target)
-        software_tx = begin_software_transaction(target, repair=repair_software)
+        for relative in previous_relatives:
+            if relative not in files:
+                with contextlib.suppress(FileNotFoundError):
+                    safe_target_path(target, relative).unlink()
+        prune_empty_managed_dirs(target, transaction_relatives)
         desired_stamp = build_stamp(target, setup["id"], files, software_tx.metadata)
         atomic_write(stamp_path(target), canonical_json(desired_stamp), target)
     except BaseException:
@@ -1833,6 +2054,38 @@ def update_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
         )
 
 
+def migrate_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
+    with target_lock(target, create_parent=False) as directory_transaction:
+        validate_target(target, create=False)
+        if not lstat_exists(target):
+            fail("migrate requires an already managed target")
+        current = read_stamp(target)
+        if current is None:
+            fail("migrate requires an already managed target")
+        if current["schema_version"] == STAMP_SCHEMA:
+            return {
+                "setup_id": current["setup_id"],
+                "migrated": False,
+                "target": str(validate_target(target, create=False)),
+            }
+        selected_setup = setup_id or current["setup_id"]
+        if selected_setup not in SETUP_ORDER:
+            fail(
+                "legacy setup has no supported native 0.2.0 profile; pass --setup safe or --setup full-auto"
+            )
+        result = write_setup_locked(
+            target,
+            load_setup(selected_setup),
+            require_existing=True,
+            repair_software=True,
+            allow_legacy_migration=True,
+            directory_transaction=directory_transaction,
+        )
+        result["migrated"] = True
+        result["legacy_setup_id"] = current["setup_id"]
+        return result
+
+
 def restore_backup(target: Path, slot: int) -> dict[str, Any]:
     if slot < 0 or slot > 9:
         fail("backup slot must be between 0 and 9")
@@ -1847,9 +2100,21 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
         files = envelope.get("files")
         if not isinstance(files, dict):
             fail("backup files are invalid")
-        snapshot = snapshot_files(target)
+        current_stamp = read_stamp(target)
+        current_relatives = [] if current_stamp is None else stamp_managed_relatives(current_stamp)
+        envelope_relatives = [relative for relative in files if isinstance(relative, str)]
+        if len(envelope_relatives) != len(files):
+            fail("backup file paths are invalid")
+        for relative in envelope_relatives:
+            safe_target_path(target, relative)
+        restore_relatives = unique_relatives([*current_relatives, *envelope_relatives])
+        snapshot = snapshot_files(target, restore_relatives)
         try:
-            for relative in (*CONTENT_MANAGED_PATHS, STAMP_NAME):
+            for relative in current_relatives:
+                if relative not in files:
+                    with contextlib.suppress(FileNotFoundError):
+                        safe_target_path(target, relative).unlink()
+            for relative in unique_relatives([*envelope_relatives, STAMP_NAME]):
                 encoded = files.get(relative)
                 path = safe_target_path(target, relative)
                 if encoded is None:
@@ -1859,7 +2124,7 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
                 if not isinstance(encoded, str):
                     fail("backup file payload is invalid")
                 atomic_write(path, base64.b64decode(encoded.encode("ascii")), target)
-            prune_empty_managed_dirs(target)
+            prune_empty_managed_dirs(target, restore_relatives)
         except BaseException:
             restore_snapshot(target, snapshot)
             raise
@@ -1883,21 +2148,23 @@ def remove_setup(target: Path) -> dict[str, Any]:
         if drift:
             fail(f"managed target has drift: {', '.join(drift)}")
         removed_setup_id = stamp["setup_id"]
-        snapshot = snapshot_files(target)
+        managed_relatives = stamp_managed_relatives(stamp)
+        snapshot = snapshot_files(target, managed_relatives)
         runtime_tx: RuntimeRemoveTransaction | None = None
         try:
             runtime_tx = begin_runtime_remove(target)
-            for relative in CONTENT_MANAGED_PATHS:
-                if relative in MANAGED_JSON_KEYS:
+            legacy = stamp.get("schema_version") == LEGACY_STAMP_SCHEMA
+            for relative in managed_relatives:
+                if legacy and relative in LEGACY_MANAGED_JSON_KEYS:
                     remove_managed_json_keys(target, relative)
-                elif relative in MERGED_MARKER_PATHS:
+                elif legacy and relative in MERGED_MARKER_PATHS:
                     remove_managed_block_from_target(target, relative)
                 else:
                     with contextlib.suppress(FileNotFoundError):
                         safe_target_path(target, relative).unlink()
             with contextlib.suppress(FileNotFoundError):
                 stamp_path(target).unlink()
-            prune_empty_managed_dirs(target)
+            prune_empty_managed_dirs(target, managed_relatives)
         except BaseException:
             if runtime_tx is not None:
                 rollback_runtime_remove(target, runtime_tx)
@@ -1918,7 +2185,7 @@ def remove_managed_json_keys(target: Path, relative: str) -> None:
     if data is None:
         return
     value = parse_optional_json(data, relative)
-    for key in MANAGED_JSON_KEYS[relative]:
+    for key in LEGACY_MANAGED_JSON_KEYS[relative]:
         value.pop(key, None)
     if value:
         atomic_write(path, canonical_json(value), target)
@@ -1942,9 +2209,9 @@ def remove_managed_block_from_target(target: Path, relative: str) -> None:
         path.unlink()
 
 
-def prune_empty_managed_dirs(target: Path) -> None:
+def prune_empty_managed_dirs(target: Path, relatives: list[str] | None = None) -> None:
     candidates: set[Path] = set()
-    for relative in CONTENT_MANAGED_PATHS:
+    for relative in relatives or list(BASE_CONTROL_MANAGED_PATHS):
         directory = safe_target_path(target, relative).parent
         while directory != target and target in directory.parents:
             candidates.add(directory)
@@ -1996,6 +2263,8 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
         status = status_payload(target)
         if not status["managed"]:
             fail("launch requires a managed target")
+        if not status.get("launchable"):
+            fail("launch requires a migrated schema 2 target")
         if status["drift"]:
             fail(f"managed target has drift: {', '.join(status['drift'])}")
         canonical = validate_target(target, create=False)
@@ -2011,16 +2280,21 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
             {
                 "JUNIE_CONFIG_LOCATION": str((canonical / "config.json").resolve()),
                 "JUNIE_CONFIG_DEFAULT_LOCATIONS": "false",
+                "JUNIE_PROJECT": str(canonical),
                 "JUNIE_SKILL_LOCATIONS": str((canonical / "skills").resolve()),
                 "JUNIE_SKILL_DEFAULT_LOCATIONS": "false",
                 "JUNIE_AGENT_LOCATIONS": str((canonical / "agents").resolve()),
                 "JUNIE_AGENT_DEFAULT_LOCATIONS": "false",
+                "JUNIE_COMMAND_LOCATIONS": str((canonical / "commands").resolve()),
                 "JUNIE_COMMAND_DEFAULT_LOCATIONS": "false",
                 "JUNIE_MCP_LOCATIONS": str((canonical / "mcp").resolve()),
                 "JUNIE_MCP_DEFAULT_LOCATIONS": "false",
                 "JUNIE_MODEL_DEFAULT_LOCATIONS": "false",
-                "JUNIE_EXTENSIONS_DEFAULT_LOCATION": str((canonical / "extensions").resolve()),
+                "JUNIE_EXTENSIONS_DEFAULT_LOCATION": str(
+                    (canonical / "extensions" / "cache").resolve()
+                ),
                 "JUNIE_GUIDELINES_FILENAME": str((canonical / "AGENTS.md").resolve()),
+                "NDDEV_JUNIE_TARGET": str(canonical),
             }
         )
         command = [str(canonical / metadata["shim"]["path"])]
@@ -2028,10 +2302,14 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
             command.append("--skip-update-check")
         command.extend(
             [
+                "--project",
+                str(canonical),
                 "--config-location",
                 str((canonical / "config.json").resolve()),
                 "--config-default-locations",
                 "false",
+                "--guidelines-filename",
+                str((canonical / "AGENTS.md").resolve()),
                 "--mcp-location",
                 str((canonical / "mcp").resolve()),
                 "--mcp-default-locations",
@@ -2044,6 +2322,14 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
                 str((canonical / "agents").resolve()),
                 "--agent-default-location",
                 "false",
+                "--command-location",
+                str((canonical / "commands").resolve()),
+                "--command-default-locations",
+                "false",
+                "--model-default-locations",
+                "false",
+                "--extensions-default-location",
+                str((canonical / "extensions" / "cache").resolve()),
                 "--cache-dir",
                 str(cache),
             ]
@@ -2072,15 +2358,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         command = subparsers.add_parser(name)
         command.add_argument("--target", required=True)
         command.add_argument("--json", action="store_true")
-    for name in ("plan", "install", "switch"):
+    for name in ("plan", "install"):
         command = subparsers.add_parser(name)
-        command.add_argument("--setup", required=True)
+        command.add_argument("--setup", default=DEFAULT_SETUP_ID)
         command.add_argument("--target", required=True)
         command.add_argument("--json", action="store_true")
+    switch = subparsers.add_parser("switch")
+    switch.add_argument("--setup", required=True)
+    switch.add_argument("--target", required=True)
+    switch.add_argument("--json", action="store_true")
     update = subparsers.add_parser("update")
     update.add_argument("--setup")
     update.add_argument("--target", required=True)
     update.add_argument("--json", action="store_true")
+    migrate = subparsers.add_parser("migrate")
+    migrate.add_argument("--setup")
+    migrate.add_argument("--target", required=True)
+    migrate.add_argument("--json", action="store_true")
     restore = subparsers.add_parser("restore")
     restore.add_argument("--backup", required=True, type=int)
     restore.add_argument("--target", required=True)
@@ -2118,6 +2412,10 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "update":
         target = require_absolute_target(args.target)
         emit(update_setup(target, args.setup), as_json=args.json)
+        return 0
+    if args.command == "migrate":
+        target = require_absolute_target(args.target)
+        emit(migrate_setup(target, args.setup), as_json=args.json)
         return 0
     if args.command == "restore":
         target = require_absolute_target(args.target)

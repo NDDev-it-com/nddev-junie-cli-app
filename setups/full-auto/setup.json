@@ -1,7 +1,7 @@
 {
   "id": "full-auto",
   "display_name": "Full Auto",
-  "description": "Junie CLI setup with Brave mode enabled for autonomous operation in an isolated target.",
+  "description": "Default Junie CLI setup with Brave mode enabled for autonomous operation in an isolated target.",
   "brave": true,
   "allow_readonly_commands": true,
   "plan_mode_default": false,

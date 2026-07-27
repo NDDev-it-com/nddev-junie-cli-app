@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
   "product_name": "nddev-junie-cli-app",
-  "build_version": "0.1.0",
+  "build_version": "0.2.0",
   "junie_cli_channel": "release",
   "junie_cli_tested": "2383.10",
-  "setup_ids": ["safe", "balanced", "full-auto"],
+  "setup_ids": ["safe", "full-auto"],
+  "default_setup_id": "full-auto",
   "manager": "cli-tools/nddev_junie_cli.py",
   "contract": "config/nddev-contract.json",
   "runtime_baseline": "references/junie-cli-baseline.json",
@@ -16,6 +17,6 @@
     "default_locations": "disabled through official Junie CLI flags and environment variables",
     "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches"
   },
-  "nddev_builder_projection_version": "0.1.0",
+  "nddev_builder_projection_version": "0.2.0",
   "public_validator": "cli-tools/validate_public_contracts.py"
 }

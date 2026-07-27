@@ -6,14 +6,22 @@ The manager never installs or launches against live user state by default. Every
 operation requires an explicit absolute target and writes only target-bound managed
 files with a stamp, rollback snapshot, and rotating backups.
 
+`--target` is the managed control and project root. The launched Junie Home is an
+isolated runtime directory below that target. Explicit config, guidelines, skills,
+agents, commands, MCP, hooks, and extension source files remain deterministic
+regular files under the control root and are passed to Junie by exact flags and
+environment variables. The action allowlist is pathless native Junie state and is
+materialized under the isolated runtime home.
+
 ## Commands
 
 ```bash
 python3 cli-tools/nddev_junie_cli.py list --json
-python3 cli-tools/nddev_junie_cli.py plan --setup safe --target /absolute/target --json
-python3 cli-tools/nddev_junie_cli.py install --setup safe --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py plan --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py install --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json
-python3 cli-tools/nddev_junie_cli.py switch --setup balanced --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py switch --setup safe --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py migrate --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py remove --target /absolute/target --json
@@ -33,3 +41,17 @@ artifact metadata before running `install.sh` in an isolated staging `HOME` with
 `JUNIE_DATA`, `JUNIE_LOG_DIR`, official default-location controls, cache/temp
 paths, and JVM `user.home` to target-owned or stage-owned directories; the
 manager fails closed if the account `~/.junie` metadata changes.
+
+## Setups
+
+`full-auto` is the default setup and enables Junie Brave mode. `safe` disables
+Brave mode and uses an ask-first empty allowlist. No unproven Auto-style profile
+is shipped.
+
+## Builder Toolkit
+
+The managed `nddev-builder` toolkit is projected directly through Junie-native
+guidelines, Agent Skills, custom subagents, custom commands, MCP, and hooks. The
+manager also packages a local native Junie extension marketplace source under the
+target, but it does not fabricate installed extension state because Junie does not
+document a stable noninteractive local marketplace installation command.

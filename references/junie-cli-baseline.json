@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "observed_at": "2026-07-26",
+  "schema_version": 2,
+  "observed_at": "2026-07-27",
   "product": {
     "vendor": "JetBrains",
     "name": "Junie CLI",
@@ -10,7 +10,7 @@
     "channel": "release",
     "stable_version": "2383.10",
     "marketing_version": "26.7.20",
-    "eap_channel": "eap",
+    "eap_status_note": "Official headless documentation states Junie CLI is currently EAP; NDDev pins the release channel artifact listed in update-info.jsonl.",
     "exact_version": "2383.10",
     "installer": {
       "url": "https://junie.jetbrains.com/install.sh",
@@ -37,44 +37,48 @@
         "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-amd64.zip",
         "sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0",
         "size": 270606128
-      },
-      "windows-aarch64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-aarch64.zip",
-        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
-        "size": 301279985
-      },
-      "windows-amd64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-amd64.zip",
-        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
-        "size": 267185689
       }
     },
     "exact_artifact_hashes": {
-      "linux-aarch64": {"sha256": "913da134b99d5fe4415fd79c7339bfff30c3449b3714fec1b2cb6a692d810b74", "size": 271996807},
-      "linux-amd64": {"sha256": "e8a4b9bd19a754bcc0d67d21ceeca08a07e72bcd52da04f9d848a7eaf393b6e1", "size": 272602042},
-      "macos-aarch64": {"sha256": "e7eccdc74046963eee1628ec6ff0952645c0bc79554bbbb22c614347d95cf7db", "size": 269469124},
-      "macos-amd64": {"sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0", "size": 270606128},
-      "windows-aarch64": {"sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28", "size": 301279985},
-      "windows-amd64": {"sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d", "size": 267185689}
+      "linux-aarch64": {
+        "sha256": "913da134b99d5fe4415fd79c7339bfff30c3449b3714fec1b2cb6a692d810b74",
+        "size": 271996807
+      },
+      "linux-amd64": {
+        "sha256": "e8a4b9bd19a754bcc0d67d21ceeca08a07e72bcd52da04f9d848a7eaf393b6e1",
+        "size": 272602042
+      },
+      "macos-aarch64": {
+        "sha256": "e7eccdc74046963eee1628ec6ff0952645c0bc79554bbbb22c614347d95cf7db",
+        "size": 269469124
+      },
+      "macos-amd64": {
+        "sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0",
+        "size": 270606128
+      }
     }
   },
   "sources": [
-    "https://junie.jetbrains.com/",
     "https://junie.jetbrains.com/docs/junie-cli.html",
     "https://junie.jetbrains.com/docs/parameters.html",
-    "https://junie.jetbrains.com/docs/junie-cli-eap.html",
     "https://junie.jetbrains.com/docs/junie-cli-configuration.html",
     "https://junie.jetbrains.com/docs/environment-variables.html",
     "https://junie.jetbrains.com/docs/action-allowlist-junie-cli.html",
+    "https://junie.jetbrains.com/docs/guidelines-and-memory.html",
     "https://junie.jetbrains.com/docs/agent-skills.html",
+    "https://junie.jetbrains.com/docs/junie-cli-subagents.html",
+    "https://junie.jetbrains.com/docs/custom-slash-commands.html",
     "https://junie.jetbrains.com/docs/junie-cli-mcp-configuration.html",
-    "https://junie.jetbrains.com/install.sh",
-    "https://junie.jetbrains.com/install-eap.sh"
+    "https://junie.jetbrains.com/docs/junie-cli-hooks.html",
+    "https://junie.jetbrains.com/docs/junie-cli-extensions.html",
+    "https://junie.jetbrains.com/docs/junie-headless.html",
+    "https://raw.githubusercontent.com/JetBrains/junie/refs/heads/main/install.sh",
+    "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
+    "https://github.com/JetBrains/junie-extensions"
   ],
   "runtime": {
     "command": "junie",
     "stable_install": "curl -fsSL https://junie.jetbrains.com/install.sh | bash",
-    "eap_install": "curl -fsSL https://junie.jetbrains.com/install-eap.sh | bash",
     "user_config": "~/.junie/config.json",
     "project_config": "<project-root>/.junie/config.json",
     "user_settings": "~/.junie/settings.json",
@@ -82,9 +86,12 @@
     "trust_directory": "~/.junie/trust",
     "user_skills": "~/.junie/skills/<skill-name>/",
     "project_skills": "<projectRoot>/.junie/skills/<skill-name>/",
-    "mcp_config": ".junie/mcp/mcp.json",
+    "project_agents": "<projectRoot>/.junie/agents/ and <projectRoot>/.agents/",
+    "custom_commands": ".junie/commands or ~/.junie/commands",
+    "mcp_config": ".junie/mcp/mcp.json or ~/.junie/mcp/mcp.json",
     "extensions_user_reference": "~/.junie/extensions/extensions.json",
-    "extensions_project_reference": ".junie/extensions.json"
+    "extensions_project_reference": ".junie/extensions.json",
+    "extensions_default_location_flag": "--extensions-default-location"
   },
   "software_lifecycle": {
     "managed_install": "official install.sh is verified by pinned SHA256, executed only in isolated staging HOME with JUNIE_VERSION=2383.10, then persisted under the explicit target runtime",
@@ -92,40 +99,17 @@
     "update_repairs_safe_partial": true,
     "status_executes_target_binary": false
   },
-  "cli_parameters": {
-    "version": "--version",
-    "project": "--project",
-    "plan": "--plan",
-    "skip_update_check": "--skip-update-check",
-    "config_location": "--config-location",
-    "config_default_locations": "--config-default-locations false",
-    "mcp_location": "--mcp-location",
-    "mcp_default_locations": "--mcp-default-locations false",
-    "cache_dir": "--cache-dir"
-  },
-  "environment": {
-    "config_location": "JUNIE_CONFIG_LOCATION",
-    "config_default_locations": "JUNIE_CONFIG_DEFAULT_LOCATIONS",
-    "skill_locations": "JUNIE_SKILL_LOCATIONS",
-    "skill_default_locations": "JUNIE_SKILL_DEFAULT_LOCATIONS",
-    "agent_locations": "JUNIE_AGENT_LOCATIONS",
-    "agent_default_locations": "JUNIE_AGENT_DEFAULT_LOCATIONS",
-    "mcp_locations": "JUNIE_MCP_LOCATIONS",
-    "mcp_default_locations": "JUNIE_MCP_DEFAULT_LOCATIONS",
-    "extensions_default_location": "JUNIE_EXTENSIONS_DEFAULT_LOCATION",
-    "guidelines_filename": "JUNIE_GUIDELINES_FILENAME"
-  },
   "permission_model": {
     "approval_file": "~/.junie/allowlist.json",
     "brave_levels": ["Off", "Auto", "On"],
-    "safe": "brave disabled; ask by default",
-    "balanced": "brave disabled; readonly command allowlist enabled",
-    "full_auto": "brave enabled; all sensitive actions may run without approval according to official Brave mode behavior"
+    "safe": "Brave Off; ask by default with empty allow rules",
+    "full_auto": "Brave On; all sensitive actions may run without approval according to official Brave mode behavior",
+    "unsupported": {
+      "auto_config": "Brave Auto is documented as a mode, but a stable config/env value for selecting it is not confirmed."
+    }
   },
   "unsupported": {
-    "immutable_artifact_hashes": "references/junie-cli-baseline.json:release.exact_artifact_hashes",
-    "rules_directory": null,
-    "extension_marketplace_manifest": null,
-    "builder_mcp_server": null
+    "installed_extension_state": "No documented noninteractive installation command or deterministic local marketplace installed-reference id is confirmed.",
+    "provider_secret_projection": null
   }
 }
