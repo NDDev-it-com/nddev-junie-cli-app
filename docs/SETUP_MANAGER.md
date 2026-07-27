@@ -50,17 +50,30 @@ non-private managed target directories fail before network access.
 
 `launch` takes the target-internal lifecycle lock before preflight and holds it
 until the child process exits, the post-launch live-home guard completes, and the
-lock is cleaned up. Lifecycle mutations such as `install`, `switch`, `update`,
-`migrate`, `restore`, and `remove` fail closed while a managed launch is running.
+lock is cleaned up. The lock is a regular `0600` file at
+`.nddev-junie-cli.lock/lock`, opened with `O_NOFOLLOW` and held with nonblocking
+`fcntl.flock`; the lock parent is `0500` while held. Crash-stale lock files are
+recovered by acquiring the released flock. Lifecycle mutations such as `install`,
+`switch`, `update`, `migrate`, `restore`, and `remove` fail closed while a
+managed launch is running.
 
 Before spawning the target-owned Junie shim, `launch` checks the stamp, refuses
 drift, captures the target-owned shim and pinned Junie binary path, inode, size,
 and SHA256, and revalidates those identities immediately before child execution.
-The child process gets an isolated `HOME`, `USERPROFILE`, `JUNIE_DATA`,
-`JUNIE_LOG_DIR`, JVM `user.home`, config, skill, agent, MCP, command, hook,
-extension cache, guidelines, cache, and temp scope under the managed target.
-Provider credential variables are stripped, and the manager fails closed if the
-account `~/.junie` metadata changes.
+Because macOS does not give this manager a portable `fexecve` or `/dev/fd`
+execution path, the handoff is a verified path handoff: open verified file
+descriptors are retained as evidence, the verified launcher and binary parent
+chains are write-protected through child completion, and the target-owned path is
+started with `Popen`. The child process gets an isolated `HOME`, `USERPROFILE`,
+`JUNIE_DATA`, `JUNIE_LOG_DIR`, JVM `user.home`, config, skill, agent, MCP,
+command, hook, extension cache, guidelines, cache, and temp scope under the
+managed target. Provider credential variables are stripped, and the manager fails
+closed if the account `~/.junie` metadata changes.
+
+The protection blocks ordinary unlink/replace attempts while the manager holds
+the lock and runtime parent protections. It is not a sandbox against deliberate
+same-UID chmod or ancestor replacement outside the protected runtime parent
+chain.
 
 Subprocesses receive a fixed minimal `PATH`; installer and hook interpreters are
 resolved to absolute trusted executables by the manager.

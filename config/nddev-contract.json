@@ -14,6 +14,9 @@
     "managed_directory_mode": "0700",
     "managed_file_mode": "0600",
     "lock_directory": "<target>/.nddev-junie-cli.lock",
+    "lock_file": "<target>/.nddev-junie-cli.lock/lock",
+    "lock_file_mode": "0600",
+    "lock_parent_held_mode": "0500",
     "backup_directory": "<target>/.nddev-junie-cli-backups",
     "preserve_other_state": true,
     "control_root": "explicit --target, also passed as Junie --project",
@@ -75,7 +78,11 @@
     "lock_and_backup_roots_inside_private_target": true,
     "subprocess_path": "/usr/bin:/bin:/usr/sbin:/sbin",
     "launch_holds_target_lock_until_child_exit": true,
-    "launch_blocks_lifecycle_mutations_while_child_runs": true
+    "launch_blocks_lifecycle_mutations_while_child_runs": true,
+    "lock_uses_fcntl_flock": true,
+    "lock_file_open_flags": "O_NOFOLLOW regular file with nonblocking fcntl.flock",
+    "launch_write_protects_verified_executable_paths": true,
+    "same_uid_no_sandbox_boundary": "The manager blocks ordinary unlink/replace while it holds path protections, but it is not a sandbox against deliberate same-UID chmod or ancestor tampering."
   },
   "software_lifecycle": {
     "installer_url": "https://junie.jetbrains.com/install.sh",
@@ -114,8 +121,10 @@
     "json_manager_errors_supported": true,
     "target_environment_scope": "T is the explicit control/project root; H is T/.nddev-junie-cli-runtime/home; Junie receives exact target-owned config, guidelines, skills, agents, MCP, commands, hooks, extensions cache, cache, temp, HOME, XDG, data, logs, and JVM home/tmp scopes",
     "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
-    "lock_scope": "target-internal lifecycle lock is held from launch preflight through child completion, post-launch live-home assertion, and lock cleanup",
+    "lock_scope": "target-internal lifecycle lock uses <target>/.nddev-junie-cli.lock/lock opened with O_NOFOLLOW mode 0600 and nonblocking fcntl.flock; the lock parent is 0500 while held and crash-stale lock files are recovered by flock state",
     "pre_child_artifact_revalidation": "target-owned Junie shim and pinned Junie binary path, inode, size, and SHA256 are captured during launch preflight and revalidated immediately before subprocess execution",
+    "verified_path_handoff": "macOS does not support this manager executing Junie through fexecve or /dev/fd, so launch retains open verified fds as evidence, write-protects the verified launcher and binary parent chains, immediately revalidates identity and digest, then starts the target-owned path with Popen",
+    "tamper_boundary": "This is a verified-path handoff, not a same-UID sandbox; deliberate same-UID chmod or ancestor replacement outside the protected runtime parent chain remains out of scope.",
     "managed_scope_flags": [
       "--project",
       "-p",

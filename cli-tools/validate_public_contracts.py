@@ -478,6 +478,14 @@ def expect_manager_failure(label: str, callback: Any) -> None:
     raise ValueError(f"{label}: expected fail-closed manager rejection")
 
 
+def expect_os_failure(label: str, callback: Any) -> None:
+    try:
+        callback()
+    except OSError:
+        return
+    raise ValueError(f"{label}: expected OS-level denial")
+
+
 def validate_production_source() -> None:
     source = (ROOT / "cli-tools" / "nddev_junie_cli.py").read_text(encoding="utf-8")
     forbidden_literals = [
@@ -545,13 +553,42 @@ def validate_adversarial_smokes(manager: Any) -> None:
             lambda: manager.target_lock(lock_target, create_parent=False).__enter__(),
         )
 
+        bad_lock = root / "bad-lock"
+        bad_lock.mkdir(mode=0o700)
+        bad_lock_parent = bad_lock / manager.LOCK_DIR_NAME
+        bad_lock_parent.mkdir(mode=0o777)
+        try:
+            expect_manager_failure(
+                "shared-mode lock parent",
+                lambda: manager.target_lock(bad_lock, create_parent=False).__enter__(),
+            )
+        finally:
+            os.chmod(bad_lock_parent, 0o700)
+
+        stale_lock = root / "stale-lock"
+        stale_lock.mkdir(mode=0o700)
+        stale_parent = stale_lock / manager.LOCK_DIR_NAME
+        stale_parent.mkdir(mode=0o700)
+        stale_file = stale_parent / manager.LOCK_FILE_NAME
+        stale_file.write_bytes(b"stale\n")
+        os.chmod(stale_file, 0o600)
+        os.chmod(stale_parent, 0o500)
+        with manager.target_lock(stale_lock, create_parent=False):
+            if not stale_file.is_file():
+                raise ValueError("stale flock file was not recovered")
+        if stale_parent.exists():
+            raise ValueError("recovered stale lock artifacts were not cleaned up")
+
         prelocked = root / "prelocked"
         prelocked.mkdir(mode=0o700)
-        (prelocked / manager.LOCK_DIR_NAME).mkdir(mode=0o700)
-        expect_manager_failure(
-            "precreated lock path",
-            lambda: manager.target_lock(prelocked, create_parent=False).__enter__(),
-        )
+        lock_context = manager.target_lock(prelocked, create_parent=False)
+        with lock_context:
+            expect_manager_failure(
+                "already flocked target",
+                lambda: manager.target_lock(prelocked, create_parent=False).__enter__(),
+            )
+            if not (prelocked / manager.LOCK_DIR_NAME / manager.LOCK_FILE_NAME).is_file():
+                raise ValueError("active flock file is missing")
 
         backup_target = root / "backup-target"
         backup_target.mkdir(mode=0o700)
@@ -695,7 +732,12 @@ def with_fake_software(
         manager.software_state = original_state
 
 
-def fake_launch_runtime_metadata(manager: Any, target: Path) -> dict[str, Any]:
+def fake_launch_runtime_metadata(
+    manager: Any,
+    target: Path,
+    *,
+    shim_bytes: bytes = b"#!/bin/sh\nexit 0\n",
+) -> dict[str, Any]:
     runtime = manager.runtime_root(target)
     home = manager.runtime_home(target)
     data = manager.runtime_data(target)
@@ -713,7 +755,7 @@ def fake_launch_runtime_metadata(manager: Any, target: Path) -> dict[str, Any]:
         os.chmod(directory, 0o700)
     shim = manager.runtime_bin(target)
     binary = version_dir / "junie"
-    shim.write_bytes(b"#!/bin/sh\nexit 0\n")
+    shim.write_bytes(shim_bytes)
     binary.write_bytes(b"validator Junie binary\n")
     os.chmod(shim, manager.OWNER_EXECUTABLE_MODE)
     os.chmod(binary, manager.OWNER_EXECUTABLE_MODE)
@@ -778,13 +820,14 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
 
         def run() -> None:
             manager.write_setup(canonical, setup, safe)
-            original_run = manager.subprocess.run
+            original_popen = manager.subprocess.Popen
             original_snapshot = manager.snapshot_live_junie_home
             original_guard = manager.require_live_junie_home_unchanged
             seen = {"child": False, "guard": False}
 
-            class Completed:
-                returncode = 0
+            class Process:
+                def wait(self) -> int:
+                    return 0
 
             def fake_snapshot() -> str:
                 if not lock.is_dir():
@@ -798,13 +841,12 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
                     raise ValueError("post-launch guard did not run under the target lock")
                 seen["guard"] = True
 
-            def fake_run(
+            def fake_popen(
                 command: list[str],
                 *,
                 cwd: Path,
                 env: dict[str, str],
-                check: bool,
-            ) -> Completed:
+            ) -> Process:
                 seen["child"] = True
                 if cwd != canonical:
                     raise ValueError("launch child cwd escaped target")
@@ -812,10 +854,15 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
                     raise ValueError("launch did not execute the target-owned shim")
                 if env["HOME"] != str(manager.runtime_home(canonical)):
                     raise ValueError("launch child HOME escaped runtime home")
-                if check is not False:
-                    raise ValueError("launch must forward child exit status without check=True")
                 if not lock.is_dir():
                     raise ValueError("child did not run under the target lock")
+                if stat.S_IMODE(lock.stat().st_mode) != manager.OWNER_READ_EXECUTE_DIRECTORY_MODE:
+                    raise ValueError("lock parent was not write-protected")
+                expect_os_failure(
+                    "child lock file unlink",
+                    lambda: (lock / manager.LOCK_FILE_NAME).unlink(),
+                )
+                expect_os_failure("child lock parent rmdir", lambda: lock.rmdir())
                 expect_manager_failure(
                     "mutation while launch lock held",
                     lambda: manager.write_setup(
@@ -827,15 +874,17 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
                 )
                 if not lock.is_dir():
                     raise ValueError("blocked mutation removed the launch lock")
-                return Completed()
+                if stat.S_IMODE(lock.stat().st_mode) != manager.OWNER_READ_EXECUTE_DIRECTORY_MODE:
+                    raise ValueError("blocked mutation weakened the launch lock parent")
+                return Process()
 
-            manager.subprocess.run = fake_run
+            manager.subprocess.Popen = fake_popen
             manager.snapshot_live_junie_home = fake_snapshot
             manager.require_live_junie_home_unchanged = fake_guard
             try:
                 result = manager.launch(canonical, ["--version"])
             finally:
-                manager.subprocess.run = original_run
+                manager.subprocess.Popen = original_popen
                 manager.snapshot_live_junie_home = original_snapshot
                 manager.require_live_junie_home_unchanged = original_guard
             if result != 0 or not seen["child"] or not seen["guard"]:
@@ -845,6 +894,51 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
             switched = manager.write_setup(canonical, setup, full_auto, require_existing=True)
             if switched["profile_id"] != "full-auto":
                 raise ValueError("lifecycle mutation remained blocked after launch completed")
+
+        with_fake_software(manager, run, metadata=metadata)
+
+
+def validate_verified_launcher_handoff(manager: Any) -> None:
+    script = b"""#!/bin/sh
+rm "$0" 2>/dev/null && exit 40
+printf 'replace\n' > "$TMPDIR/replacement" || exit 41
+mv "$TMPDIR/replacement" "$0" 2>/dev/null && exit 42
+exit 23
+"""
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-launch-handoff-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=0o700)
+        canonical = manager.validate_target(target, create=False)
+        metadata = fake_launch_runtime_metadata(manager, canonical, shim_bytes=script)
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        safe = manager.load_profile("safe")
+
+        def run() -> None:
+            manager.write_setup(canonical, setup, safe)
+            original_snapshot = manager.snapshot_live_junie_home
+            original_guard = manager.require_live_junie_home_unchanged
+            manager.snapshot_live_junie_home = lambda: "validator-live-home"
+            manager.require_live_junie_home_unchanged = lambda snapshot, *, context: None
+            try:
+                result = manager.launch(canonical, ["--version"])
+            finally:
+                manager.snapshot_live_junie_home = original_snapshot
+                manager.require_live_junie_home_unchanged = original_guard
+            if result != 23:
+                raise ValueError("verified launcher did not run under path protection")
+            if manager.runtime_bin(canonical).read_bytes() != script:
+                raise ValueError("verified launcher path was replaced during launch")
+            for directory in (
+                manager.runtime_root(canonical),
+                manager.runtime_home(canonical),
+                manager.runtime_home(canonical) / ".local",
+                manager.runtime_home(canonical) / ".local" / "bin",
+                manager.runtime_data(canonical),
+                manager.runtime_data(canonical) / "versions",
+                manager.runtime_data(canonical) / "versions" / "validator",
+            ):
+                if stat.S_IMODE(directory.stat().st_mode) != manager.OWNER_DIRECTORY_MODE:
+                    raise ValueError("launch parent mode was not restored")
 
         with_fake_software(manager, run, metadata=metadata)
 
@@ -1106,14 +1200,32 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("contract must declare launch lock scope")
     if contract["safety"].get("launch_blocks_lifecycle_mutations_while_child_runs") is not True:
         raise ValueError("contract must declare launch mutation blocking")
+    if contract["safety"].get("lock_uses_fcntl_flock") is not True:
+        raise ValueError("contract must declare fcntl flock locking")
+    if contract["safety"].get("launch_write_protects_verified_executable_paths") is not True:
+        raise ValueError("contract must declare verified executable path protection")
+    if contract["managed_state"].get("lock_file") != "<target>/.nddev-junie-cli.lock/lock":
+        raise ValueError("contract must declare the target lock file")
+    if contract["managed_state"].get("lock_file_mode") != "0600":
+        raise ValueError("contract must declare target lock file mode")
+    if contract["managed_state"].get("lock_parent_held_mode") != "0500":
+        raise ValueError("contract must declare held lock parent mode")
     if "lock_scope" not in contract.get("runtime_launch", {}):
         raise ValueError("contract runtime_launch must describe launch lock scope")
     if "pre_child_artifact_revalidation" not in contract.get("runtime_launch", {}):
         raise ValueError("contract runtime_launch must describe artifact revalidation")
+    if "verified_path_handoff" not in contract.get("runtime_launch", {}):
+        raise ValueError("contract runtime_launch must describe verified path handoff")
+    if "tamper_boundary" not in contract.get("runtime_launch", {}):
+        raise ValueError("contract runtime_launch must describe tamper boundary")
     if "launch_lock" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe launch lock scope")
     if "pre_child_artifact_revalidation" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe artifact revalidation")
+    if "verified_path_handoff" not in manifest.get("runtime_isolation", {}):
+        raise ValueError("manifest runtime_isolation must describe verified path handoff")
+    if "same_uid_boundary" not in manifest.get("runtime_isolation", {}):
+        raise ValueError("manifest runtime_isolation must describe same-UID boundary")
     if build.get("junie_cli_tested") != baseline["release"]["stable_version"]:
         raise ValueError("tested Junie CLI version differs from baseline release")
     validate_baseline(baseline, contract)
@@ -1126,6 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
     validate_adversarial_smokes(manager)
     validate_profile_switch_lifecycle(manager)
     validate_launch_lock_concurrency(manager)
+    validate_verified_launcher_handoff(manager)
     validate_legacy_mapping_migration(manager)
     validate_restore_backup_fail_closed(manager)
     validate_workflows()

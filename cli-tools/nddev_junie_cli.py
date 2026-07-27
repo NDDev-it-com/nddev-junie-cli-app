@@ -7,6 +7,7 @@ import argparse
 import base64
 import binascii
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -45,12 +46,14 @@ LEGACY_STAMP_SCHEMA = 1
 RUNTIME_DIR_NAME = ".nddev-junie-cli-runtime"
 RUNTIME_RECEIPT_NAME = "NDDEV-JUNIE-CLI-RUNTIME.json"
 LOCK_DIR_NAME = ".nddev-junie-cli.lock"
+LOCK_FILE_NAME = "lock"
 BACKUP_DIR_NAME = ".nddev-junie-cli-backups"
 MANAGED_BEGIN = "<!-- BEGIN NDDEV-JUNIE-CLI MANAGED -->"
 MANAGED_END = "<!-- END NDDEV-JUNIE-CLI MANAGED -->"
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 OWNER_EXECUTABLE_MODE = 0o700
+OWNER_READ_EXECUTE_DIRECTORY_MODE = 0o500
 SAFE_SUBPROCESS_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 MANAGED_MAX_BYTES = 8 * 1024 * 1024
 METADATA_MAX_BYTES = 256 * 1024
@@ -170,6 +173,17 @@ class BackupRestorePlan:
     relatives: list[str]
 
 
+@dataclass
+class TargetLockHandle:
+    directory: Path
+    lock_file: Path
+    directory_fd: int
+    lock_fd: int
+    original_directory_mode: int
+    created_directory: bool = False
+    created_lock_file: bool = False
+
+
 @dataclass(frozen=True)
 class LiveJunieHomeSnapshot:
     exists: bool
@@ -199,6 +213,19 @@ class LaunchPlan:
     cwd: Path
     shim: LaunchFileSnapshot
     binary: LaunchFileSnapshot
+
+
+@dataclass
+class ProtectedDirectory:
+    path: Path
+    fd: int
+    original_mode: int
+
+
+@dataclass
+class LaunchProtection:
+    directories: list[ProtectedDirectory]
+    file_fds: list[int]
 
 
 @dataclass
@@ -685,33 +712,188 @@ def trusted_python() -> Path:
     return trusted_executable(candidates, "python3")
 
 
-def create_lock_directory(path: Path, transaction: DirectoryTransaction) -> None:
+def nofollow_flag() -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("O_NOFOLLOW is required for target lock safety")
+    return os.O_NOFOLLOW
+
+
+def verify_fd_matches_path(fd: int, path: Path, label: str) -> os.stat_result:
+    fd_info = os.fstat(fd)
+    path_info = stat_existing(path, label)
+    if path_info is None:
+        fail(f"{label} is missing")
+    if fd_info.st_dev != path_info.st_dev or fd_info.st_ino != path_info.st_ino:
+        fail(f"{label} changed while opening")
+    return fd_info
+
+
+def open_directory_nofollow(path: Path, label: str) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | nofollow_flag()
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     try:
-        path.mkdir(mode=OWNER_DIRECTORY_MODE)
-    except FileExistsError:
-        try:
-            info = stat_existing(path, "target lock")
-            if info is not None:
-                require_current_owner(info, "target lock")
-                if not stat.S_ISDIR(info.st_mode):
-                    fail("target lock must be a directory")
-                if stat.S_IMODE(info.st_mode) & 0o077:
-                    fail("target lock must be private")
-        finally:
-            transaction.cleanup()
-        fail(f"target is locked: {path}")
+        fd = os.open(path, flags)
+    except OSError as exc:
+        fail(f"{label} could not be opened safely: {exc}")
+    try:
+        info = verify_fd_matches_path(fd, path, label)
+        require_current_owner(info, label)
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} must be a directory")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            fail(f"{label} must be private")
+        return fd, info
     except BaseException:
-        transaction.cleanup()
-        fail(f"target is locked: {path}")
-    require_private_directory(path, "target lock")
+        os.close(fd)
+        raise
 
 
-def remove_lock_directory(path: Path) -> None:
+def open_owned_directory_nofollow(path: Path, label: str) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | nofollow_flag()
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     try:
-        require_private_directory(path, "target lock")
-        path.rmdir()
-    except (FileNotFoundError, OSError, JunieCliSetupError):
-        pass
+        fd = os.open(path, flags)
+    except OSError as exc:
+        fail(f"{label} could not be opened safely: {exc}")
+    try:
+        info = verify_fd_matches_path(fd, path, label)
+        require_current_owner(info, label)
+        if not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} must be a directory")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            fail(f"{label} must not be group/world writable")
+        return fd, info
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_regular_nofollow(
+    path: Path,
+    label: str,
+    *,
+    create: bool,
+    mode: int,
+    repair_created_mode: bool = False,
+) -> tuple[int, os.stat_result]:
+    flags = os.O_RDWR | nofollow_flag()
+    if create:
+        flags |= os.O_CREAT
+    try:
+        fd = os.open(path, flags, mode)
+    except OSError as exc:
+        fail(f"{label} could not be opened safely: {exc}")
+    try:
+        info = verify_fd_matches_path(fd, path, label)
+        require_current_owner(info, label)
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{label} must be a regular file")
+        if info.st_nlink != 1:
+            fail(f"{label} must not be a hardlink")
+        if repair_created_mode and stat.S_IMODE(info.st_mode) != mode:
+            os.fchmod(fd, mode)
+            info = os.fstat(fd)
+        if stat.S_IMODE(info.st_mode) != mode:
+            fail(f"{label} mode must be {mode:04o}")
+        return fd, info
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def lock_file_path(target: Path) -> Path:
+    return lock_path(target) / LOCK_FILE_NAME
+
+
+def ensure_lock_directory(path: Path) -> tuple[bool, int, os.stat_result]:
+    created = False
+    info = stat_existing(path, "target lock parent")
+    if info is None:
+        try:
+            path.mkdir(mode=OWNER_DIRECTORY_MODE)
+            created = True
+        except FileExistsError:
+            fail("target lock parent appeared during creation")
+    fd, info = open_directory_nofollow(path, "target lock parent")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode not in (OWNER_DIRECTORY_MODE, OWNER_READ_EXECUTE_DIRECTORY_MODE):
+        os.close(fd)
+        fail("target lock parent mode must be 0700 or recovered 0500")
+    return created, fd, info
+
+
+def acquire_target_lock(canonical: Path, transaction: DirectoryTransaction) -> TargetLockHandle:
+    directory = lock_path(canonical)
+    created_directory = False
+    created_lock_file = False
+    repaired_directory_mode = False
+    directory_fd = -1
+    lock_fd = -1
+    try:
+        created_directory, directory_fd, directory_info = ensure_lock_directory(directory)
+        original_mode = stat.S_IMODE(directory_info.st_mode)
+        file_path = lock_file_path(canonical)
+        created_lock_file = not lstat_exists(file_path)
+        if original_mode == OWNER_READ_EXECUTE_DIRECTORY_MODE and created_lock_file:
+            os.fchmod(directory_fd, OWNER_DIRECTORY_MODE)
+            repaired_directory_mode = True
+            original_mode = OWNER_DIRECTORY_MODE
+        lock_fd, _ = open_regular_nofollow(
+            file_path,
+            "target lock file",
+            create=True,
+            mode=OWNER_FILE_MODE,
+            repair_created_mode=created_lock_file,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail(f"target is locked: {directory}")
+        os.fchmod(directory_fd, OWNER_READ_EXECUTE_DIRECTORY_MODE)
+        return TargetLockHandle(
+            directory=directory,
+            lock_file=file_path,
+            directory_fd=directory_fd,
+            lock_fd=lock_fd,
+            original_directory_mode=original_mode,
+            created_directory=created_directory,
+            created_lock_file=created_lock_file,
+        )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            if lock_fd >= 0:
+                os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            if directory_fd >= 0:
+                if created_directory or repaired_directory_mode:
+                    os.fchmod(directory_fd, OWNER_DIRECTORY_MODE)
+                os.close(directory_fd)
+        if created_lock_file:
+            with contextlib.suppress(OSError):
+                lock_file_path(canonical).unlink()
+        if created_directory:
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+        transaction.cleanup()
+        raise
+
+
+def release_target_lock(handle: TargetLockHandle, *, cleanup_artifacts: bool) -> None:
+    with contextlib.suppress(OSError):
+        os.fchmod(handle.directory_fd, OWNER_DIRECTORY_MODE)
+    with contextlib.suppress(OSError):
+        fcntl.flock(handle.lock_fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(handle.lock_fd)
+    with contextlib.suppress(OSError):
+        os.close(handle.directory_fd)
+    if cleanup_artifacts:
+        with contextlib.suppress(OSError):
+            handle.lock_file.unlink()
+        with contextlib.suppress(OSError):
+            handle.directory.rmdir()
 
 
 def validate_target(
@@ -792,8 +974,7 @@ def target_lock(target: Path, *, create_parent: bool = False):
         canonical = validate_target(target, create=False)
         if not lstat_exists(canonical):
             fail("target is missing")
-    path = lock_path(canonical)
-    create_lock_directory(path, transaction)
+    lock_handle = acquire_target_lock(canonical, transaction)
     failed = False
     try:
         yield transaction
@@ -801,7 +982,7 @@ def target_lock(target: Path, *, create_parent: bool = False):
         failed = True
         raise
     finally:
-        remove_lock_directory(path)
+        release_target_lock(lock_handle, cleanup_artifacts=True)
         if failed:
             transaction.cleanup()
 
@@ -1362,6 +1543,134 @@ def revalidate_launch_file_snapshot(target: Path, snapshot: LaunchFileSnapshot) 
 def revalidate_launch_artifacts(plan: LaunchPlan) -> None:
     revalidate_launch_file_snapshot(plan.cwd, plan.shim)
     revalidate_launch_file_snapshot(plan.cwd, plan.binary)
+
+
+def sha256_fd_bounded(fd: int, *, max_bytes: int, label: str) -> str:
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            fail(f"{label} is too large")
+        digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def launch_parent_directories(target: Path, snapshot: LaunchFileSnapshot) -> list[Path]:
+    path = safe_target_path(target, snapshot.relative_path)
+    root = runtime_root(target)
+    directories: list[Path] = []
+    current = path.parent
+    while current != target and target in current.parents:
+        if current == root or root in current.parents:
+            directories.append(current)
+        current = current.parent
+    return sorted(set(directories), key=lambda item: len(item.parts))
+
+
+def launch_handoff_directories(plan: LaunchPlan) -> list[Path]:
+    directories: list[Path] = []
+    for snapshot in (plan.shim, plan.binary):
+        directories.extend(launch_parent_directories(plan.cwd, snapshot))
+    return sorted(set(directories), key=lambda item: len(item.parts))
+
+
+def set_launch_parent_modes(target: Path, paths: tuple[Path, ...], mode: int) -> None:
+    directories: set[Path] = set()
+    for path in paths:
+        root = runtime_root(target)
+        current = path.parent
+        while current != target and target in current.parents:
+            if current == root or root in current.parents:
+                directories.add(current)
+            current = current.parent
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        fd, info = open_owned_directory_nofollow(directory, f"launch parent {directory}")
+        try:
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+
+
+def open_verified_launch_file(target: Path, snapshot: LaunchFileSnapshot) -> int:
+    path = safe_target_path(target, snapshot.relative_path)
+    flags = os.O_RDONLY | nofollow_flag()
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        runtime_fail(
+            f"{snapshot.label} could not be opened safely: {exc}",
+            code=f"{label_slug(snapshot.label)}_open",
+            repairable=False,
+        )
+    try:
+        info = verify_fd_matches_path(fd, path, snapshot.label)
+        require_current_owner(info, snapshot.label)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            runtime_fail(
+                f"{snapshot.label} must be a single regular file",
+                code=f"{label_slug(snapshot.label)}_type",
+                repairable=False,
+            )
+        if (
+            info.st_dev != snapshot.device
+            or info.st_ino != snapshot.inode
+            or info.st_size != snapshot.size
+        ):
+            runtime_fail(
+                f"{snapshot.label} changed before verified handoff",
+                code=f"{label_slug(snapshot.label)}_identity_changed",
+                repairable=False,
+            )
+        current_sha256 = sha256_fd_bounded(
+            fd,
+            max_bytes=snapshot.max_bytes,
+            label=snapshot.label,
+        )
+        if current_sha256 != snapshot.sha256:
+            runtime_fail(
+                f"{snapshot.label} digest changed before verified handoff",
+                code=f"{label_slug(snapshot.label)}_digest_changed",
+                repairable=False,
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def protected_launch_handoff(plan: LaunchPlan):
+    protection = LaunchProtection(directories=[], file_fds=[])
+    try:
+        for directory in launch_handoff_directories(plan):
+            fd, info = open_owned_directory_nofollow(directory, f"launch parent {directory}")
+            protection.directories.append(
+                ProtectedDirectory(
+                    path=directory,
+                    fd=fd,
+                    original_mode=stat.S_IMODE(info.st_mode),
+                )
+            )
+        for protected in protection.directories:
+            os.fchmod(protected.fd, OWNER_READ_EXECUTE_DIRECTORY_MODE)
+        protection.file_fds.append(open_verified_launch_file(plan.cwd, plan.shim))
+        protection.file_fds.append(open_verified_launch_file(plan.cwd, plan.binary))
+        yield protection
+    finally:
+        for fd in reversed(protection.file_fds):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        for protected in reversed(protection.directories):
+            with contextlib.suppress(OSError):
+                os.fchmod(protected.fd, protected.original_mode)
+            with contextlib.suppress(OSError):
+                os.close(protected.fd)
 
 
 def resolve_junie_binary(version_dir: Path, target: Path) -> Path:
@@ -2742,6 +3051,23 @@ def build_launch_plan_locked(target: Path, child_args: list[str]) -> LaunchPlan:
     tmp = runtime_tmp(canonical)
     ensure_private_directory(cache, canonical, "runtime cache")
     ensure_private_directory(tmp, canonical, "runtime tmp")
+    if not isinstance(metadata.get("shim"), dict) or not isinstance(metadata.get("binary"), dict):
+        fail("Junie software metadata is invalid")
+    shim_relative = metadata["shim"].get("path")
+    binary_relative = metadata["binary"].get("path")
+    if not isinstance(shim_relative, str) or not isinstance(binary_relative, str):
+        fail("Junie software metadata path is invalid")
+    shim_path = safe_target_path(canonical, shim_relative)
+    binary_path = safe_target_path(canonical, binary_relative)
+    set_launch_parent_modes(
+        canonical,
+        (shim_path, binary_path),
+        OWNER_DIRECTORY_MODE,
+    )
+    ensure_private_directory(data / "logs", canonical, "runtime logs")
+    ensure_private_directory(home / ".config", canonical, "runtime config home")
+    ensure_private_directory(home / ".cache", canonical, "runtime XDG cache home")
+    ensure_private_directory(home / ".local" / "state", canonical, "runtime XDG state home")
     child_env = sanitized_subprocess_env(home, data, tmp)
     child_env.update(
         {
@@ -2763,14 +3089,6 @@ def build_launch_plan_locked(target: Path, child_args: list[str]) -> LaunchPlan:
             "JUNIE_GUIDELINES_FILENAME": str((canonical / "AGENTS.md").resolve()),
         }
     )
-    if not isinstance(metadata.get("shim"), dict) or not isinstance(metadata.get("binary"), dict):
-        fail("Junie software metadata is invalid")
-    shim_relative = metadata["shim"].get("path")
-    binary_relative = metadata["binary"].get("path")
-    if not isinstance(shim_relative, str) or not isinstance(binary_relative, str):
-        fail("Junie software metadata path is invalid")
-    shim_path = safe_target_path(canonical, shim_relative)
-    binary_path = safe_target_path(canonical, binary_relative)
     command = [str(shim_path)]
     if "--skip-update-check" not in child_args:
         command.append("--skip-update-check")
@@ -2851,19 +3169,21 @@ def launch(target: Path, child_args: list[str]) -> int:
     with target_lock(target, create_parent=False):
         plan = build_launch_plan_locked(target, child_args)
         live_before = snapshot_live_junie_home()
-        revalidate_launch_artifacts(plan)
-        try:
-            completed = subprocess.run(
-                plan.command,
-                cwd=plan.cwd,
-                env=plan.child_env,
-                check=False,
-            )
-        except FileNotFoundError:
-            fail("target-owned Junie command was not found")
-        finally:
-            require_live_junie_home_unchanged(live_before, context="Junie launch")
-        return int(completed.returncode)
+        with protected_launch_handoff(plan):
+            revalidate_launch_artifacts(plan)
+            try:
+                process = subprocess.Popen(
+                    plan.command,
+                    cwd=plan.cwd,
+                    env=plan.child_env,
+                )
+            except FileNotFoundError:
+                fail("target-owned Junie command was not found")
+            try:
+                return_code = process.wait()
+            finally:
+                require_live_junie_home_unchanged(live_before, context="Junie launch")
+            return int(return_code)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

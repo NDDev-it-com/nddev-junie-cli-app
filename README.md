@@ -47,7 +47,12 @@ metadata changes. Managed launch holds the target-internal lifecycle lock throug
 child completion and post-launch live-home validation, so lifecycle mutations are
 denied while the launched Junie process is running. The target-owned shim and
 pinned Junie binary identity are captured during launch preflight and revalidated
-immediately before child execution.
+immediately before child execution. Because macOS does not provide a portable
+`fexecve` or `/dev/fd` execution path for this handoff, the manager retains open
+verified file descriptors as evidence, write-protects the verified runtime parent
+chains through child completion, and starts the target-owned path with `Popen`.
+This blocks ordinary unlink/replace during launch, but it is not a sandbox
+against deliberate same-UID chmod or ancestor tampering.
 
 ## Setups
 
