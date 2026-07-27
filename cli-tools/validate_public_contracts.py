@@ -67,6 +67,32 @@ RELEASE_RUNTIME_PATHS = [
     "references",
     "docs",
 ]
+RELEASE_PATH_TYPES = {
+    "AGENTS.md": "file",
+    "LICENSE": "file",
+    "README.md": "file",
+    "VERSION": "file",
+    ".gds": "directory",
+    ".github": "directory",
+    "build": "directory",
+    "cli-tools": "directory",
+    "config": "directory",
+    "builder": "directory",
+    "profiles": "directory",
+    "setups": "directory",
+    "references": "directory",
+    "docs": "directory",
+}
+PRIVATE_ARTIFACT_MARKERS = {
+    ".agents",
+    ".codex",
+    ".junie",
+    ".pytest_cache",
+    ".serena",
+    "__pycache__",
+    "tests",
+    "validation",
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -150,19 +176,27 @@ def validate_workflows() -> None:
             raise ValueError(f"{filename}: missing exact shared CI caller")
 
 
-def tracked_paths() -> set[str]:
-    completed = subprocess.run(
-        ["git", "ls-files", "-z"],
-        cwd=ROOT,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return {
-        item.decode("utf-8")
-        for item in completed.stdout.split(b"\0")
-        if item
-    }
+def tracked_paths() -> set[str] | None:
+    if not (ROOT / ".git").exists():
+        return None
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"git tracked path scan failed: {exc}") from exc
+    try:
+        return {
+            item.decode("utf-8")
+            for item in completed.stdout.split(b"\0")
+            if item
+        }
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"git tracked path scan returned non-UTF-8 paths: {exc}") from exc
 
 
 def release_input_paths(value: str, label: str) -> list[str]:
@@ -224,11 +258,90 @@ def path_is_tracked(path: str, tracked: set[str]) -> bool:
     return False
 
 
-def require_release_paths_tracked(paths: list[str], tracked: set[str], label: str) -> None:
+def require_release_paths_tracked(
+    paths: list[str],
+    tracked: set[str] | None,
+    label: str,
+) -> None:
+    if tracked is None:
+        return
     missing = [path for path in paths if not path_is_tracked(path, tracked)]
     if missing:
         raise ValueError(
             f"release workflow {label} paths must exist and be tracked: {', '.join(missing)}"
+        )
+
+
+def reject_private_artifact_marker(path: Path, label: str) -> None:
+    relative_parts = path.relative_to(ROOT).parts
+    for part in relative_parts:
+        if part in PRIVATE_ARTIFACT_MARKERS:
+            raise ValueError(f"release workflow {label} contains private marker {part}")
+
+
+def require_release_path_shape(path: str, label: str) -> None:
+    expected_type = RELEASE_PATH_TYPES.get(path)
+    if expected_type is None:
+        raise ValueError(f"release workflow {label} has no type contract for {path}")
+    full = ROOT / path
+    try:
+        info = full.lstat()
+    except OSError as exc:
+        raise ValueError(f"release workflow {label} path is missing: {path}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"release workflow {label} path must not be a symlink: {path}")
+    if expected_type == "file":
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"release workflow {label} path must be a file: {path}")
+        reject_private_artifact_marker(full, label)
+        return
+    if expected_type != "directory":
+        raise ValueError(f"release workflow {label} type contract is invalid for {path}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"release workflow {label} path must be a directory: {path}")
+    reject_private_artifact_marker(full, label)
+    for child in full.rglob("*"):
+        reject_private_artifact_marker(child, label)
+        try:
+            child_info = child.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"release workflow {label} path disappeared during validation: "
+                f"{child.relative_to(ROOT)}"
+            ) from exc
+        if stat.S_ISLNK(child_info.st_mode):
+            raise ValueError(
+                f"release workflow {label} must not contain symlinks: "
+                f"{child.relative_to(ROOT)}"
+            )
+
+
+def validate_release_paths_exist_and_safe(paths: list[str], label: str) -> None:
+    for path in paths:
+        require_release_path_shape(path, label)
+
+
+def validate_public_artifact_marker() -> None:
+    marker = ROOT / ".gds" / "repository.yaml"
+    if not marker.is_file():
+        raise ValueError("release archive must include .gds/repository.yaml")
+    text = marker.read_text(encoding="utf-8")
+    required = (
+        'visibility_contract: "public"',
+        'data_classification: "public"',
+        'contract: "public"',
+    )
+    for literal in required:
+        if literal not in text:
+            raise ValueError(f"release archive public marker is missing {literal}")
+
+
+def validate_release_runtime_subset(archive_paths: list[str], runtime_paths: list[str]) -> None:
+    missing = sorted(path for path in runtime_paths if not path_covered(path, archive_paths))
+    if missing:
+        raise ValueError(
+            "release workflow runtime_paths must be covered by archive_paths: "
+            + ", ".join(missing)
         )
 
 
@@ -301,6 +414,10 @@ def validate_release_workflow(
         raise ValueError("release workflow archive_paths are not synchronized")
     if runtime_paths != RELEASE_RUNTIME_PATHS:
         raise ValueError("release workflow runtime_paths are not synchronized")
+    validate_release_paths_exist_and_safe(archive_paths, "archive_paths")
+    validate_release_paths_exist_and_safe(runtime_paths, "runtime_paths")
+    validate_public_artifact_marker()
+    validate_release_runtime_subset(archive_paths, runtime_paths)
     tracked = tracked_paths()
     require_release_paths_tracked(archive_paths, tracked, "archive_paths")
     require_release_paths_tracked(runtime_paths, tracked, "runtime_paths")
@@ -1250,6 +1367,6 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except ValueError as exc:
+    except Exception as exc:
         print(f"validate_public_contracts.py: FAIL: {exc}", file=sys.stderr)
         raise SystemExit(1)
