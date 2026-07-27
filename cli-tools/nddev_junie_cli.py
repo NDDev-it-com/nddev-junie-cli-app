@@ -49,6 +49,7 @@ LAUNCH_IMAGE_DIR_NAME = "launch-image"
 LAUNCH_IMAGE_COMMAND_NAME = "junie"
 LOCK_DIR_NAME = ".nddev-junie-cli.lock"
 LOCK_FILE_NAME = "lock"
+BOOTSTRAP_LOCK_ROOT_NAME = f"{PRODUCT_NAME}-bootstrap-locks"
 BACKUP_DIR_NAME = ".nddev-junie-cli-backups"
 MANAGED_BEGIN = "<!-- BEGIN NDDEV-JUNIE-CLI MANAGED -->"
 MANAGED_END = "<!-- END NDDEV-JUNIE-CLI MANAGED -->"
@@ -184,6 +185,13 @@ class TargetLockHandle:
     original_directory_mode: int
     created_directory: bool = False
     created_lock_file: bool = False
+
+
+@dataclass
+class BootstrapLockHandle:
+    path: Path
+    fd: int
+    binding: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -624,6 +632,22 @@ def canonicalize_target_parent(target: Path) -> Path:
     return resolve_parent_allowing_missing(target.parent) / target.name
 
 
+def validate_target_identity_for_lock(target: Path) -> Path:
+    canonical = canonicalize_target_parent(target)
+    current = canonical.parent
+    while True:
+        info = stat_existing(current, "target lock identity ancestor")
+        if info is not None:
+            if not stat.S_ISDIR(info.st_mode):
+                fail("target lock identity ancestor must be a directory")
+            require_safe_target_parent(current, "target lock identity ancestor")
+            return canonical
+        parent = current.parent
+        if parent == current:
+            fail("target lock identity ancestor is missing")
+        current = parent
+
+
 def ensure_private_directory(path: Path, target: Path, label: str) -> None:
     if target not in path.parents and path != target:
         fail(f"{label} escaped managed target")
@@ -806,6 +830,187 @@ def open_regular_nofollow(
         raise
 
 
+def bootstrap_lock_system_root() -> Path:
+    system = platform.system()
+    if system == "Darwin":
+        candidate = Path("/private/tmp")
+    elif system == "Linux":
+        candidate = Path("/tmp")
+    else:
+        fail("bootstrap lock supports only macOS and Linux")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        fail(f"system bootstrap lock root is unavailable: {exc}")
+    info = stat_existing(resolved, "system bootstrap lock root")
+    if info is None:
+        fail("system bootstrap lock root is missing")
+    if not stat.S_ISDIR(info.st_mode):
+        fail("system bootstrap lock root must be a directory")
+    mode = stat.S_IMODE(info.st_mode)
+    if not (mode & stat.S_ISVTX) or not (mode & 0o002):
+        fail("system bootstrap lock root must be sticky and writable")
+    return resolved
+
+
+def bootstrap_lock_product_root_path(system_root: Path | None = None) -> Path:
+    uid = current_user_id()
+    if uid is None:
+        fail("bootstrap lock requires a POSIX current user id")
+    root = bootstrap_lock_system_root() if system_root is None else system_root
+    return root / f"{BOOTSTRAP_LOCK_ROOT_NAME}-uid-{uid}"
+
+
+def ensure_bootstrap_lock_product_root() -> Path:
+    system_root = bootstrap_lock_system_root()
+    root = bootstrap_lock_product_root_path(system_root)
+    info = stat_existing(root, "bootstrap lock product root")
+    created = False
+    if info is None:
+        try:
+            root.mkdir(mode=OWNER_DIRECTORY_MODE)
+            created = True
+        except FileExistsError:
+            pass
+    fd, info = open_directory_nofollow(root, "bootstrap lock product root")
+    try:
+        mode = stat.S_IMODE(info.st_mode)
+        if created and mode != OWNER_DIRECTORY_MODE:
+            os.fchmod(fd, OWNER_DIRECTORY_MODE)
+            mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode != OWNER_DIRECTORY_MODE:
+            fail("bootstrap lock product root mode must be 0700")
+    finally:
+        os.close(fd)
+    return root
+
+
+def bootstrap_lock_digest(canonical: Path) -> str:
+    return sha256_bytes(f"{PRODUCT_NAME}\0target-lifecycle\0{canonical}".encode("utf-8"))
+
+
+def bootstrap_lock_path(canonical: Path) -> Path:
+    return ensure_bootstrap_lock_product_root() / f"{bootstrap_lock_digest(canonical)}.lock"
+
+
+def bootstrap_lock_binding(canonical: Path) -> dict[str, Any]:
+    uid = current_user_id()
+    if uid is None:
+        fail("bootstrap lock requires a POSIX current user id")
+    digest = bootstrap_lock_digest(canonical)
+    return {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "namespace": "target-lifecycle",
+        "canonical_target": str(canonical),
+        "canonical_target_sha256": digest,
+        "uid": uid,
+    }
+
+
+def verify_bootstrap_lock_fd_path(fd: int, path: Path) -> os.stat_result:
+    info = verify_fd_matches_path(fd, path, "bootstrap lock file")
+    require_current_owner(info, "bootstrap lock file")
+    if not stat.S_ISREG(info.st_mode):
+        fail("bootstrap lock file must be a regular file")
+    if info.st_nlink != 1:
+        fail("bootstrap lock file must not be a hardlink")
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("bootstrap lock file mode must be 0600")
+    return info
+
+
+def open_bootstrap_lock_file(path: Path) -> int:
+    flags = os.O_RDWR | nofollow_flag()
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    created = False
+    try:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
+        created = True
+    except FileExistsError:
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            fail(f"bootstrap lock file could not be opened safely: {exc}")
+    except OSError as exc:
+        fail(f"bootstrap lock file could not be created safely: {exc}")
+    try:
+        info = os.fstat(fd)
+        if created and stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+            os.fchmod(fd, OWNER_FILE_MODE)
+        verify_bootstrap_lock_fd_path(fd, path)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_bootstrap_lock_bytes(fd: int) -> bytes:
+    chunks = bytearray()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        chunks.extend(chunk)
+        if len(chunks) > METADATA_MAX_BYTES:
+            fail("bootstrap lock binding is too large")
+    os.lseek(fd, 0, os.SEEK_SET)
+    return bytes(chunks)
+
+
+def write_bootstrap_lock_binding(fd: int, binding: dict[str, Any]) -> None:
+    data = canonical_json(binding)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    total = 0
+    while total < len(data):
+        total += os.write(fd, data[total:])
+    os.fsync(fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+
+
+def ensure_bootstrap_lock_binding(fd: int, binding: dict[str, Any]) -> None:
+    data = read_bootstrap_lock_bytes(fd)
+    if not data:
+        write_bootstrap_lock_binding(fd, binding)
+        data = read_bootstrap_lock_bytes(fd)
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"bootstrap lock binding is invalid JSON: {exc}")
+    if value != binding:
+        fail("bootstrap lock binding does not match the canonical target")
+
+
+def acquire_bootstrap_lock(canonical: Path) -> BootstrapLockHandle:
+    binding = bootstrap_lock_binding(canonical)
+    path = bootstrap_lock_path(canonical)
+    fd = open_bootstrap_lock_file(path)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail(f"target is locked: {path}")
+        verify_bootstrap_lock_fd_path(fd, path)
+        ensure_bootstrap_lock_binding(fd, binding)
+        verify_bootstrap_lock_fd_path(fd, path)
+        return BootstrapLockHandle(path=path, fd=fd, binding=binding)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        raise
+
+
+def release_bootstrap_lock(handle: BootstrapLockHandle) -> None:
+    with contextlib.suppress(OSError):
+        fcntl.flock(handle.fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(handle.fd)
+
+
 def lock_file_path(target: Path) -> Path:
     return lock_path(target) / LOCK_FILE_NAME
 
@@ -827,7 +1032,12 @@ def ensure_lock_directory(path: Path) -> tuple[bool, int, os.stat_result]:
     return created, fd, info
 
 
-def acquire_target_lock(canonical: Path, transaction: DirectoryTransaction) -> TargetLockHandle:
+def acquire_target_lock(
+    canonical: Path,
+    transaction: DirectoryTransaction,
+    *,
+    cleanup_created_artifacts_on_failure: bool,
+) -> TargetLockHandle:
     directory = lock_path(canonical)
     created_directory = False
     created_lock_file = False
@@ -873,10 +1083,10 @@ def acquire_target_lock(canonical: Path, transaction: DirectoryTransaction) -> T
                 if created_directory or repaired_directory_mode:
                     os.fchmod(directory_fd, OWNER_DIRECTORY_MODE)
                 os.close(directory_fd)
-        if created_lock_file:
+        if cleanup_created_artifacts_on_failure and created_lock_file:
             with contextlib.suppress(OSError):
                 lock_file_path(canonical).unlink()
-        if created_directory:
+        if cleanup_created_artifacts_on_failure and created_directory:
             with contextlib.suppress(OSError):
                 directory.rmdir()
         transaction.cleanup()
@@ -977,25 +1187,44 @@ def runtime_receipt_path(target: Path) -> Path:
 
 
 @contextlib.contextmanager
-def target_lock(target: Path, *, create_parent: bool = False):
+def target_lock(target: Path, *, create_parent: bool = False, allow_missing: bool = False):
     transaction = DirectoryTransaction([])
-    if create_parent:
-        canonical = validate_target(target, create=True, transaction=transaction)
-    else:
-        canonical = validate_target(target, create=False)
-        if not lstat_exists(canonical):
-            fail("target is missing")
-    lock_handle = acquire_target_lock(canonical, transaction)
+    canonical_identity = validate_target_identity_for_lock(target)
+    bootstrap_handle = acquire_bootstrap_lock(canonical_identity)
+    lock_handle: TargetLockHandle | None = None
+    target_created_by_operation = False
     failed = False
     try:
+        if create_parent:
+            canonical = validate_target(target, create=True, transaction=transaction)
+            target_created_by_operation = canonical in transaction.created
+        else:
+            canonical = validate_target(target, create=False)
+            if not lstat_exists(canonical):
+                if allow_missing:
+                    yield transaction
+                    return
+                fail("target is missing")
+        if canonical != canonical_identity:
+            fail("target canonical identity changed after acquiring bootstrap lock")
+        lock_handle = acquire_target_lock(
+            canonical,
+            transaction,
+            cleanup_created_artifacts_on_failure=target_created_by_operation,
+        )
         yield transaction
     except BaseException:
         failed = True
         raise
     finally:
-        release_target_lock(lock_handle, cleanup_artifacts=True)
+        if lock_handle is not None:
+            release_target_lock(
+                lock_handle,
+                cleanup_artifacts=failed and target_created_by_operation,
+            )
         if failed:
             transaction.cleanup()
+        release_bootstrap_lock(bootstrap_handle)
 
 
 def safe_target_path(target: Path, relative: str) -> Path:
@@ -2947,15 +3176,15 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
 
 
 def remove_setup(target: Path) -> dict[str, Any]:
-    if not lstat_exists(target.parent) or not lstat_exists(target):
-        return {
-            "removed_setup_id": None,
-            "removed_profile_id": None,
-            "removed_legacy_setup_id": None,
-            "target": str(validate_target(target, create=False)),
-        }
-    with target_lock(target, create_parent=False):
+    with target_lock(target, create_parent=False, allow_missing=True):
         target = validate_target(target, create=False)
+        if not lstat_exists(target):
+            return {
+                "removed_setup_id": None,
+                "removed_profile_id": None,
+                "removed_legacy_setup_id": None,
+                "target": str(target),
+            }
         stamp = read_stamp(target)
         if stamp is None:
             return {
@@ -3046,7 +3275,7 @@ def prune_empty_managed_dirs(target: Path, relatives: list[str] | None = None) -
             directory.rmdir()
 
 
-def plan_payload(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+def plan_payload_locked(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     status = status_payload(target)
     operation = "install"
     backup_required = False
@@ -3072,6 +3301,11 @@ def plan_payload(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -
         "software": status["software"],
         "mutates": False,
     }
+
+
+def plan_payload(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    with target_lock(target, create_parent=False, allow_missing=True):
+        return plan_payload_locked(target, setup, profile)
 
 
 def child_args_use_target_scope_overrides(child_args: list[str]) -> str | None:
@@ -3298,7 +3532,9 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         return 0
     if args.command == "status":
-        emit(status_payload(require_absolute_target(args.target)), as_json=args.json)
+        target = require_absolute_target(args.target)
+        with target_lock(target, create_parent=False, allow_missing=True):
+            emit(status_payload(target), as_json=args.json)
         return 0
     if args.command == "plan":
         target = require_absolute_target(args.target)

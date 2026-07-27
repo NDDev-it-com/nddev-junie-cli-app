@@ -18,7 +18,8 @@ orthogonal profile selected as `safe` or `full-auto`.
 - target-owned Junie shim under the isolated runtime home
 - pinned Junie version directory under the isolated runtime data root
 - transient launch image under `.nddev-junie-cli-runtime/launch-image/`
-- `.nddev-junie-cli.lock`
+- persistent target-internal lock at `.nddev-junie-cli.lock/lock`
+- persistent external bootstrap lock under the resolved fixed system temp root
 - `.nddev-junie-cli-backups/`
 - `NDDEV-JUNIE-CLI-SETUP.json`
 
@@ -49,14 +50,26 @@ non-private managed target directories fail before network access.
 
 ## Launch Isolation
 
-`launch` takes the target-internal lifecycle lock before preflight and holds it
-until the child process exits, the post-launch live-home guard completes, and the
-lock is cleaned up. The lock is a regular `0600` file at
+`launch` takes the external bootstrap lifecycle lock before target inspection and
+then takes the target-internal lifecycle lock before preflight. It holds both
+until the child process exits and the post-launch live-home guard completes. The
+external lock is a persistent `0600` regular file under a current-user-owned
+`0700` product root in the resolved fixed system temp directory: `/private/tmp` on
+macOS and `/tmp` on Linux. The filename is the full SHA256 of the product
+namespace plus the canonical absolute target, and the JSON binding must match
+that target. The manager never derives this root from `TMPDIR`, never exposes it
+to the child environment, and never unlinks the external lock on normal release,
+remove, or failed target creation.
+
+The target-internal secondary lock is a persistent `0600` regular file at
 `.nddev-junie-cli.lock/lock`, opened with `O_NOFOLLOW` and held with nonblocking
-`fcntl.flock`; the lock parent is `0500` while held. Crash-stale lock files are
-recovered by acquiring the released flock. Lifecycle mutations such as `install`,
-`switch`, `update`, `migrate`, `restore`, and `remove` fail closed while a
-managed launch is running.
+`fcntl.flock`; the lock parent is `0500` while held and restored to `0700` on
+release. It is not unlinked on normal lifecycle handover. Crash-stale lock files
+are recovered by acquiring the released flock. Acquisition order is external
+first and internal second; release order is internal first and external last.
+Lifecycle mutations such as `install`, `switch`, `update`, `migrate`, `restore`,
+and `remove` fail closed while a managed launch is running, even if the launched
+child renames the target-local lock directory from the writable target root.
 
 Before spawning the target-owned Junie shim, `launch` checks the stamp, refuses
 drift, captures the target-owned shim and pinned Junie binary path, inode, size,
@@ -74,10 +87,12 @@ and config/source directories remain writable for normal Junie execution.
 Provider credential variables are stripped, and the manager fails closed if the
 account `~/.junie` metadata changes.
 
-The protection blocks ordinary unlink/replace attempts inside the lock and
-launch-image directories while the manager holds them read/execute-only. It is
-not a sandbox against deliberate same-UID chmod or ancestor replacement outside
-those dedicated protected directories.
+The protection blocks ordinary target-local lock rename/unlink replacement via
+the external bootstrap lock, and blocks ordinary unlink/replace attempts inside
+the lock and launch-image directories while the manager holds them
+read/execute-only. It is not a sandbox against deliberate same-UID tampering of
+the fixed bootstrap root or other ancestors outside those dedicated protected
+directories.
 
 Subprocesses receive a fixed minimal `PATH`; installer and hook interpreters are
 resolved to absolute trusted executables by the manager.

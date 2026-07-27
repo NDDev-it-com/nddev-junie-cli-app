@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
 import io
 import importlib.util
 import json
@@ -93,6 +94,8 @@ PRIVATE_ARTIFACT_MARKERS = {
     "tests",
     "validation",
 }
+BOOTSTRAP_SNAPSHOT_MAX_CHILDREN = 1024
+BOOTSTRAP_SNAPSHOT_MAX_FILE_BYTES = 1024 * 1024
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -603,6 +606,140 @@ def expect_os_failure(label: str, callback: Any) -> None:
     raise ValueError(f"{label}: expected OS-level denial")
 
 
+def hash_bounded_regular_file(
+    path: Path,
+    expected_info: os.stat_result,
+    *,
+    max_bytes: int = BOOTSTRAP_SNAPSHOT_MAX_FILE_BYTES,
+) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if (
+            info.st_dev != expected_info.st_dev
+            or info.st_ino != expected_info.st_ino
+            or not stat.S_ISREG(info.st_mode)
+        ):
+            raise ValueError(f"bootstrap snapshot file changed while opening: {path}")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"bootstrap snapshot file is too large: {path}")
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def path_identity_snapshot(path: Path) -> tuple[str, tuple[tuple[str, Any], ...]]:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(info.st_mode):
+        kind = "regular"
+    else:
+        kind = "other"
+    item: dict[str, Any] = {
+        "name": path.name,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "kind": kind,
+        "owner": info.st_uid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+    }
+    if kind == "regular":
+        item["sha256"] = hash_bounded_regular_file(path, info)
+    return item["name"], tuple(sorted(item.items()))
+
+
+def real_bootstrap_product_root_snapshot(
+    manager: Any,
+) -> tuple[Path, bool, tuple[tuple[str, tuple[tuple[str, Any], ...]], ...]]:
+    root = manager.bootstrap_lock_product_root_path(manager.bootstrap_lock_system_root())
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return root, False, ()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError(f"real bootstrap product root is not a real directory: {root}")
+    snapshot = [path_identity_snapshot(root)]
+    children = sorted(root.iterdir(), key=lambda item: item.name)
+    if len(children) > BOOTSTRAP_SNAPSHOT_MAX_CHILDREN:
+        raise ValueError(f"real bootstrap product root has too many children: {root}")
+    for child in children:
+        snapshot.append(path_identity_snapshot(child))
+    return root, True, tuple(snapshot)
+
+
+@contextlib.contextmanager
+def injected_bootstrap_lock_root(manager: Any):
+    real_root, existed_before, entries_before = real_bootstrap_product_root_snapshot(manager)
+    original_resolver = manager.bootstrap_lock_system_root
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-bootstrap-locks-") as raw:
+        system_root = Path(raw) / "system-tmp"
+        system_root.mkdir(mode=0o700)
+        os.chmod(system_root, 0o1777)
+
+        def fake_system_root() -> Path:
+            info = system_root.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ValueError("injected bootstrap root must be a real directory")
+            mode = stat.S_IMODE(info.st_mode)
+            if not (mode & stat.S_ISVTX) or not (mode & 0o002):
+                raise ValueError("injected bootstrap root must be sticky and writable")
+            return system_root.resolve(strict=True)
+
+        manager.bootstrap_lock_system_root = fake_system_root
+        try:
+            yield system_root
+        finally:
+            manager.bootstrap_lock_system_root = original_resolver
+    if not existed_before and real_root.exists():
+        raise ValueError(f"validator created a real system bootstrap artifact: {real_root}")
+    if existed_before:
+        _, _, entries_after = real_bootstrap_product_root_snapshot(manager)
+        if entries_after != entries_before:
+            raise ValueError(f"validator changed real system bootstrap artifacts: {real_root}")
+
+
+def read_child_message(fd: int, label: str) -> str:
+    chunks = bytearray()
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        chunks.extend(chunk)
+        if len(chunks) > 8192:
+            raise ValueError(f"{label}: child message is too large")
+    return chunks.decode("utf-8")
+
+
+def wait_child_success(pid: int, label: str) -> None:
+    waited, status_code = os.waitpid(pid, 0)
+    if waited != pid:
+        raise ValueError(f"{label}: waited for unexpected child")
+    if status_code != 0:
+        raise ValueError(f"{label}: child exited with status {status_code}")
+
+
+def child_write_and_exit(fd: int, message: str, code: int) -> None:
+    with contextlib.suppress(OSError):
+        os.write(fd, message.encode("utf-8"))
+    os._exit(code)
+
+
 def validate_production_source() -> None:
     source = (ROOT / "cli-tools" / "nddev_junie_cli.py").read_text(encoding="utf-8")
     forbidden_literals = [
@@ -618,6 +755,10 @@ def validate_production_source() -> None:
         "env_timeout_seconds",
         "fixture override",
         "artifact fixture",
+        "NDDEV_JUNIE_BOOTSTRAP_LOCK_ROOT",
+        "JUNIE_BOOTSTRAP_LOCK_ROOT",
+        "BOOTSTRAP_LOCK_ROOT_OVERRIDE",
+        "LOCK_ROOT_OVERRIDE",
     ]
     present = sorted(literal for literal in forbidden_literals if literal in source)
     if present:
@@ -627,6 +768,8 @@ def validate_production_source() -> None:
         )
     if "os.environ.get(\"NDDEV_" in source or "os.environ['NDDEV_" in source:
         raise ValueError("production manager must not read NDDEV_* environment overrides")
+    if "tempfile.gettempdir" in source or "os.environ.get(\"TMPDIR\"" in source:
+        raise ValueError("bootstrap lock must not derive from ambient temp environment")
     allowed_child_env = {
         'env["NDDEV_JUNIE_EXPECTED_ARTIFACT_SHA256"] = artifact["sha256"]',
         'env["NDDEV_JUNIE_EXPECTED_ARTIFACT_SIZE"] = str(artifact["size"])',
@@ -642,6 +785,267 @@ def validate_production_source() -> None:
         raise ValueError("installer must use an absolute trusted shell, not PATH lookup")
     if '"PATH": os.environ' in source or "'PATH': os.environ" in source:
         raise ValueError("subprocess PATH must not inherit the ambient user PATH")
+
+
+def validate_bootstrap_lock_adversarial(manager: Any) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-bootstrap-adversarial-") as raw:
+        root = Path(raw)
+        target = root / "target"
+        target.mkdir(mode=0o700)
+        canonical = manager.validate_target_identity_for_lock(target)
+        system_root = manager.bootstrap_lock_system_root()
+        product_root = manager.bootstrap_lock_product_root_path(system_root)
+
+        external = system_root / "external-lock-root"
+        external.mkdir(mode=0o700)
+        product_root.symlink_to(external)
+        try:
+            expect_manager_failure(
+                "bootstrap symlink product root",
+                lambda: manager.target_lock(target, create_parent=False).__enter__(),
+            )
+        finally:
+            product_root.unlink()
+
+        product_root.mkdir(mode=0o700)
+        os.chmod(product_root, 0o777)
+        try:
+            expect_manager_failure(
+                "bootstrap shared-mode product root",
+                lambda: manager.target_lock(target, create_parent=False).__enter__(),
+            )
+        finally:
+            os.chmod(product_root, 0o700)
+            product_root.rmdir()
+
+        product_root = manager.ensure_bootstrap_lock_product_root()
+        lock_file = product_root / f"{manager.bootstrap_lock_digest(canonical)}.lock"
+        lock_file.symlink_to(external)
+        try:
+            expect_manager_failure(
+                "bootstrap symlink lock file",
+                lambda: manager.target_lock(target, create_parent=False).__enter__(),
+            )
+        finally:
+            lock_file.unlink()
+
+        lock_file.write_bytes(b"{}\n")
+        os.chmod(lock_file, 0o644)
+        try:
+            expect_manager_failure(
+                "bootstrap shared-mode lock file",
+                lambda: manager.target_lock(target, create_parent=False).__enter__(),
+            )
+        finally:
+            os.chmod(lock_file, 0o600)
+            lock_file.unlink()
+
+        bad_binding = dict(manager.bootstrap_lock_binding(canonical))
+        bad_binding["canonical_target"] = str(canonical.parent / "other-target")
+        lock_file.write_bytes(manager.canonical_json(bad_binding))
+        os.chmod(lock_file, 0o600)
+        try:
+            expect_manager_failure(
+                "bootstrap lock binding mismatch",
+                lambda: manager.target_lock(target, create_parent=False).__enter__(),
+            )
+        finally:
+            lock_file.unlink()
+
+        with manager.target_lock(target, create_parent=False):
+            if not lock_file.is_file():
+                raise ValueError("bootstrap lock file was not materialized")
+            if stat.S_IMODE(lock_file.stat().st_mode) != manager.OWNER_FILE_MODE:
+                raise ValueError("bootstrap lock file mode is not 0600")
+        if not lock_file.is_file():
+            raise ValueError("bootstrap lock file was unlinked on normal release")
+        binding = json.loads(lock_file.read_text(encoding="utf-8"))
+        if binding != manager.bootstrap_lock_binding(canonical):
+            raise ValueError("bootstrap lock binding changed after release")
+
+
+def validate_bootstrap_lock_persistent_handover(manager: Any) -> None:
+    if not hasattr(os, "fork"):
+        raise ValueError("bootstrap lock handover regression requires POSIX fork")
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-bootstrap-handover-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=0o700)
+        canonical = manager.validate_target_identity_for_lock(target)
+        lock_path = manager.bootstrap_lock_path(canonical)
+
+        def spawn_holder(label: str) -> tuple[int, int, int]:
+            ready_read, ready_write = os.pipe()
+            release_read, release_write = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(ready_read)
+                os.close(release_write)
+                handle = None
+                try:
+                    handle = manager.acquire_bootstrap_lock(canonical)
+                    info = lock_path.stat()
+                    os.write(
+                        ready_write,
+                        json.dumps({"inode": info.st_ino, "device": info.st_dev}).encode(
+                            "utf-8"
+                        ),
+                    )
+                except Exception as exc:
+                    child_write_and_exit(ready_write, f"ERROR {label}: {exc}", 1)
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.close(ready_write)
+                try:
+                    os.read(release_read, 1)
+                finally:
+                    if handle is not None:
+                        manager.release_bootstrap_lock(handle)
+                    os._exit(0)
+            os.close(ready_write)
+            os.close(release_read)
+            return pid, ready_read, release_write
+
+        first_pid, first_ready, first_release = spawn_holder("first")
+        first_message = read_child_message(first_ready, "first holder")
+        os.close(first_ready)
+        first_identity = json.loads(first_message)
+        os.write(first_release, b"x")
+        os.close(first_release)
+        wait_child_success(first_pid, "first holder")
+
+        second_pid, second_ready, second_release = spawn_holder("second")
+        second_message = read_child_message(second_ready, "second holder")
+        os.close(second_ready)
+        try:
+            second_identity = json.loads(second_message)
+            if second_identity != first_identity:
+                raise ValueError("bootstrap lock inode changed across handover")
+
+            contender_read, contender_write = os.pipe()
+            contender_pid = os.fork()
+            if contender_pid == 0:
+                os.close(contender_read)
+                try:
+                    handle = manager.acquire_bootstrap_lock(canonical)
+                except Exception as exc:
+                    if exc.__class__.__name__ == "JunieCliSetupError":
+                        child_write_and_exit(contender_write, "blocked", 0)
+                    child_write_and_exit(contender_write, f"ERROR contender: {exc}", 1)
+                else:
+                    manager.release_bootstrap_lock(handle)
+                    child_write_and_exit(contender_write, "acquired", 2)
+            os.close(contender_write)
+            contender_message = read_child_message(contender_read, "contender")
+            os.close(contender_read)
+            wait_child_success(contender_pid, "contender")
+            if contender_message != "blocked":
+                raise ValueError("third process acquired bootstrap lock while second held it")
+        finally:
+            with contextlib.suppress(OSError):
+                os.write(second_release, b"x")
+            with contextlib.suppress(OSError):
+                os.close(second_release)
+            wait_child_success(second_pid, "second holder")
+        final_info = lock_path.stat()
+        if final_info.st_ino != first_identity["inode"] or final_info.st_dev != first_identity["device"]:
+            raise ValueError("bootstrap lock inode changed after all releases")
+
+
+def validate_dual_lock_persistent_handover(manager: Any) -> None:
+    if not hasattr(os, "fork"):
+        raise ValueError("dual lock handover regression requires POSIX fork")
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-dual-lock-handover-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=0o700)
+        canonical = manager.validate_target_identity_for_lock(target)
+        internal_file = canonical / manager.LOCK_DIR_NAME / manager.LOCK_FILE_NAME
+        external_file = manager.bootstrap_lock_path(canonical)
+
+        def spawn_holder(label: str) -> tuple[int, int, int]:
+            ready_read, ready_write = os.pipe()
+            release_read, release_write = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(ready_read)
+                os.close(release_write)
+                try:
+                    with manager.target_lock(canonical, create_parent=False):
+                        identity = {
+                            "external": {
+                                "inode": external_file.stat().st_ino,
+                                "device": external_file.stat().st_dev,
+                            },
+                            "internal": {
+                                "inode": internal_file.stat().st_ino,
+                                "device": internal_file.stat().st_dev,
+                            },
+                        }
+                        os.write(ready_write, json.dumps(identity).encode("utf-8"))
+                        os.close(ready_write)
+                        os.read(release_read, 1)
+                except Exception as exc:
+                    child_write_and_exit(ready_write, f"ERROR {label}: {exc}", 1)
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.close(ready_write)
+                    with contextlib.suppress(OSError):
+                        os.close(release_read)
+                os._exit(0)
+            os.close(ready_write)
+            os.close(release_read)
+            return pid, ready_read, release_write
+
+        first_pid, first_ready, first_release = spawn_holder("first")
+        first_identity = json.loads(read_child_message(first_ready, "first dual holder"))
+        os.close(first_ready)
+        os.write(first_release, b"x")
+        os.close(first_release)
+        wait_child_success(first_pid, "first dual holder")
+
+        second_pid, second_ready, second_release = spawn_holder("second")
+        second_identity = json.loads(read_child_message(second_ready, "second dual holder"))
+        os.close(second_ready)
+        try:
+            if second_identity != first_identity:
+                raise ValueError("dual lock inode changed across handover")
+
+            contender_read, contender_write = os.pipe()
+            contender_pid = os.fork()
+            if contender_pid == 0:
+                os.close(contender_read)
+                try:
+                    with manager.target_lock(canonical, create_parent=False):
+                        child_write_and_exit(contender_write, "acquired", 2)
+                except Exception as exc:
+                    if exc.__class__.__name__ == "JunieCliSetupError":
+                        child_write_and_exit(contender_write, "blocked", 0)
+                    child_write_and_exit(contender_write, f"ERROR contender: {exc}", 1)
+            os.close(contender_write)
+            contender_message = read_child_message(contender_read, "dual contender")
+            os.close(contender_read)
+            wait_child_success(contender_pid, "dual contender")
+            if contender_message != "blocked":
+                raise ValueError("third process acquired dual lock while second held it")
+        finally:
+            with contextlib.suppress(OSError):
+                os.write(second_release, b"x")
+            with contextlib.suppress(OSError):
+                os.close(second_release)
+            wait_child_success(second_pid, "second dual holder")
+        if not internal_file.is_file() or not external_file.is_file():
+            raise ValueError("persistent dual lock files were removed after handover")
+        final_identity = {
+            "external": {
+                "inode": external_file.stat().st_ino,
+                "device": external_file.stat().st_dev,
+            },
+            "internal": {
+                "inode": internal_file.stat().st_ino,
+                "device": internal_file.stat().st_dev,
+            },
+        }
+        if final_identity != first_identity:
+            raise ValueError("dual lock inode changed after all releases")
 
 
 def validate_adversarial_smokes(manager: Any) -> None:
@@ -693,8 +1097,8 @@ def validate_adversarial_smokes(manager: Any) -> None:
         with manager.target_lock(stale_lock, create_parent=False):
             if not stale_file.is_file():
                 raise ValueError("stale flock file was not recovered")
-        if stale_parent.exists():
-            raise ValueError("recovered stale lock artifacts were not cleaned up")
+        if not stale_file.is_file() or stat.S_IMODE(stale_parent.stat().st_mode) != 0o700:
+            raise ValueError("recovered stale internal lock was not preserved safely")
 
         prelocked = root / "prelocked"
         prelocked.mkdir(mode=0o700)
@@ -778,7 +1182,7 @@ def validate_adversarial_smokes(manager: Any) -> None:
             if stat.S_IMODE(canonical.lstat().st_mode) & 0o077:
                 raise ValueError("sticky-temp target was not created private")
         canonical = manager.validate_target(target, create=False)
-        canonical.rmdir()
+        manager.safe_rmtree_private_directory(canonical, "sticky-temp validator target")
 
 
 def fake_software_metadata(
@@ -1019,11 +1423,118 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
                 manager.require_live_junie_home_unchanged = original_guard
             if result != 0 or not seen["child"] or not seen["guard"]:
                 raise ValueError("launch lock regression did not execute the child and guard")
-            if lock.exists():
-                raise ValueError("launch lock was not cleaned up after child completion")
+            if not (lock / manager.LOCK_FILE_NAME).is_file():
+                raise ValueError("persistent launch lock file was removed after child completion")
+            if stat.S_IMODE(lock.stat().st_mode) != manager.OWNER_DIRECTORY_MODE:
+                raise ValueError("persistent launch lock parent mode was not restored")
             switched = manager.write_setup(canonical, setup, full_auto, require_existing=True)
             if switched["profile_id"] != "full-auto":
                 raise ValueError("lifecycle mutation remained blocked after launch completed")
+
+        with_fake_software(manager, run, metadata=metadata)
+
+
+def validate_external_lock_survives_internal_lock_rename(manager: Any) -> None:
+    if not hasattr(os, "fork"):
+        raise ValueError("internal lock rename regression requires POSIX fork")
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-internal-lock-rename-") as raw:
+        target = Path(raw) / "target"
+        target.mkdir(mode=0o700)
+        canonical = manager.validate_target(target, create=False)
+        metadata = fake_launch_runtime_metadata(manager, canonical)
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        safe = manager.load_profile("safe")
+        full_auto = manager.load_profile("full-auto")
+        lock = canonical / manager.LOCK_DIR_NAME
+        renamed_lock = canonical / f"{manager.LOCK_DIR_NAME}.renamed"
+
+        def run() -> None:
+            manager.write_setup(canonical, setup, safe)
+            ready_read, ready_write = os.pipe()
+            release_read, release_write = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(ready_read)
+                os.close(release_write)
+                original_popen = manager.subprocess.Popen
+                original_snapshot = manager.snapshot_live_junie_home
+                original_guard = manager.require_live_junie_home_unchanged
+
+                class Process:
+                    def wait(self) -> int:
+                        os.read(release_read, 1)
+                        if renamed_lock.exists() and not lock.exists():
+                            renamed_lock.rename(lock)
+                        return 0
+
+                def fake_popen(
+                    command: list[str],
+                    *,
+                    cwd: Path,
+                    env: dict[str, str],
+                ) -> Process:
+                    if cwd != canonical or env["HOME"] != str(manager.runtime_home(canonical)):
+                        raise ValueError("launch child escaped the managed target")
+                    if not lock.is_dir():
+                        raise ValueError("internal lock was missing before child rename")
+                    lock.rename(renamed_lock)
+                    os.write(ready_write, b"renamed")
+                    os.close(ready_write)
+                    return Process()
+
+                manager.subprocess.Popen = fake_popen
+                manager.snapshot_live_junie_home = lambda: "validator-live-home"
+                manager.require_live_junie_home_unchanged = lambda snapshot, *, context: None
+                try:
+                    result = manager.launch(canonical, ["--version"])
+                    if result != 0:
+                        raise ValueError(f"launch returned {result}")
+                except Exception as exc:
+                    child_write_and_exit(ready_write, f"ERROR launch: {exc}", 1)
+                finally:
+                    manager.subprocess.Popen = original_popen
+                    manager.snapshot_live_junie_home = original_snapshot
+                    manager.require_live_junie_home_unchanged = original_guard
+                    with contextlib.suppress(OSError):
+                        os.close(release_read)
+                os._exit(0)
+
+            os.close(ready_write)
+            os.close(release_read)
+            try:
+                message = read_child_message(ready_read, "internal lock rename child")
+                if message != "renamed":
+                    raise ValueError(message or "internal lock rename child did not signal")
+                if lock.exists() or not renamed_lock.is_dir():
+                    raise ValueError("internal lock parent was not renamed during launch")
+                expect_manager_failure(
+                    "switch while internal lock parent renamed",
+                    lambda: manager.write_setup(
+                        canonical,
+                        setup,
+                        full_auto,
+                        require_existing=True,
+                    ),
+                )
+                expect_manager_failure(
+                    "remove while internal lock parent renamed",
+                    lambda: manager.remove_setup(canonical),
+                )
+                expect_manager_failure(
+                    "install while internal lock parent renamed",
+                    lambda: manager.write_setup(canonical, setup, safe),
+                )
+            finally:
+                with contextlib.suppress(OSError):
+                    os.write(release_write, b"x")
+                with contextlib.suppress(OSError):
+                    os.close(release_write)
+                os.close(ready_read)
+                wait_child_success(pid, "internal lock rename launch")
+            if renamed_lock.exists():
+                raise ValueError("renamed internal lock parent was not restored")
+            if not (lock / manager.LOCK_FILE_NAME).is_file():
+                raise ValueError("persistent internal lock file was removed after launch")
 
         with_fake_software(manager, run, metadata=metadata)
 
@@ -1367,12 +1878,36 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("contract must declare launch mutation blocking")
     if contract["safety"].get("lock_uses_fcntl_flock") is not True:
         raise ValueError("contract must declare fcntl flock locking")
+    if contract["safety"].get("external_bootstrap_lock_outside_target") is not True:
+        raise ValueError("contract must declare external bootstrap lock outside target")
+    if contract["safety"].get("external_bootstrap_lock_not_in_child_env") is not True:
+        raise ValueError("contract must declare bootstrap lock is not exposed to child env")
+    if "never ambient TMPDIR" not in contract["safety"].get(
+        "external_bootstrap_lock_fixed_system_temp", ""
+    ):
+        raise ValueError("contract must declare fixed system temp bootstrap lock root")
     if contract["safety"].get("launch_write_protects_verified_executable_paths") is not True:
         raise ValueError("contract must declare verified executable path protection")
     if contract["safety"].get("launch_keeps_runtime_state_writable") is not True:
         raise ValueError("contract must declare writable runtime state during launch")
     if contract["managed_state"].get("lock_file") != "<target>/.nddev-junie-cli.lock/lock":
         raise ValueError("contract must declare the target lock file")
+    if (
+        contract["managed_state"].get("bootstrap_lock_root")
+        != "<resolved fixed system temp>/nddev-junie-cli-app-bootstrap-locks-uid-<uid>"
+    ):
+        raise ValueError("contract must declare the bootstrap lock root")
+    if (
+        contract["managed_state"].get("bootstrap_lock_file")
+        != "sha256(product namespace plus canonical absolute target).lock"
+    ):
+        raise ValueError("contract must declare the bootstrap lock file binding")
+    if contract["managed_state"].get("bootstrap_lock_file_mode") != "0600":
+        raise ValueError("contract must declare bootstrap lock file mode")
+    if contract["managed_state"].get("bootstrap_lock_persistent") is not True:
+        raise ValueError("contract must declare persistent bootstrap lock files")
+    if contract["managed_state"].get("target_lock_persistent") is not True:
+        raise ValueError("contract must declare persistent target lock files")
     if (
         contract["managed_state"].get("launch_image")
         != "<target>/.nddev-junie-cli-runtime/launch-image/junie"
@@ -1394,6 +1929,9 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("contract runtime_launch must describe tamper boundary")
     if "launch_lock" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe launch lock scope")
+    launch_lock_text = manifest.get("runtime_isolation", {}).get("launch_lock", "")
+    if "external bootstrap" not in launch_lock_text or "persistent target-internal" not in launch_lock_text:
+        raise ValueError("manifest launch lock must describe persistent dual locking")
     if "pre_child_artifact_revalidation" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe artifact revalidation")
     if "verified_path_handoff" not in manifest.get("runtime_isolation", {}):
@@ -1408,15 +1946,20 @@ def main(argv: list[str] | None = None) -> int:
     validate_required_files()
     manager = load_manager()
     validate_production_source()
-    validate_generated_files(manager, version)
-    validate_builder_projection_invariant(manager)
-    validate_manager_parse(manager)
-    validate_adversarial_smokes(manager)
-    validate_profile_switch_lifecycle(manager)
-    validate_launch_lock_concurrency(manager)
-    validate_verified_launcher_handoff(manager)
-    validate_legacy_mapping_migration(manager)
-    validate_restore_backup_fail_closed(manager)
+    with injected_bootstrap_lock_root(manager):
+        validate_generated_files(manager, version)
+        validate_builder_projection_invariant(manager)
+        validate_manager_parse(manager)
+        validate_bootstrap_lock_adversarial(manager)
+        validate_bootstrap_lock_persistent_handover(manager)
+        validate_dual_lock_persistent_handover(manager)
+        validate_adversarial_smokes(manager)
+        validate_profile_switch_lifecycle(manager)
+        validate_launch_lock_concurrency(manager)
+        validate_external_lock_survives_internal_lock_rename(manager)
+        validate_verified_launcher_handoff(manager)
+        validate_legacy_mapping_migration(manager)
+        validate_restore_backup_fail_closed(manager)
     validate_workflows()
     validate_release_workflow(version, contract, manifest)
     print("validate_public_contracts.py: PASS")
