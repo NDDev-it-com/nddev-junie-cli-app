@@ -29,4 +29,7 @@ name `junie`. Official sources are recorded in
 The manager verifies the official installer SHA256 and exact `update-info.jsonl`
 artifact metadata before running `install.sh` in an isolated staging `HOME` with
 `JUNIE_VERSION` set to the pinned release. Only the target-owned runtime under
-`.nddev-junie-cli-runtime/` is persisted.
+`.nddev-junie-cli-runtime/` is persisted. Runtime probes and launches also bind
+`JUNIE_DATA`, `JUNIE_LOG_DIR`, official default-location controls, cache/temp
+paths, and JVM `user.home` to target-owned or stage-owned directories; the
+manager fails closed if the account `~/.junie` metadata changes.

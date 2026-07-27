@@ -71,7 +71,8 @@
     "forwards_child_exit_code": true,
     "streams_child_stdio": true,
     "json_manager_errors_supported": true,
-    "target_environment_scope": "isolated HOME, JUNIE_DATA, config, skills, agents, MCP, extensions, guidelines, and cache under the explicit target"
+    "target_environment_scope": "isolated HOME, USERPROFILE, JUNIE_DATA, JUNIE_LOG_DIR, JVM user.home/java.io.tmpdir, config, skills, agents, MCP, extensions, guidelines, and cache under the explicit target",
+    "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches"
   },
   "plugin_marketplace": {
     "plugin_id": "nddev-builder",

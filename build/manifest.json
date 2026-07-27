@@ -8,6 +8,14 @@
   "manager": "cli-tools/nddev_junie_cli.py",
   "contract": "config/nddev-contract.json",
   "runtime_baseline": "references/junie-cli-baseline.json",
+  "runtime_isolation": {
+    "home": "target-owned HOME and USERPROFILE",
+    "data": "target-owned JUNIE_DATA",
+    "logs": "target-owned JUNIE_LOG_DIR",
+    "java": "target-owned JVM user.home and java.io.tmpdir",
+    "default_locations": "disabled through official Junie CLI flags and environment variables",
+    "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches"
+  },
   "nddev_builder_projection_version": "0.1.0",
   "public_validator": "cli-tools/validate_public_contracts.py"
 }

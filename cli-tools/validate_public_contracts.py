@@ -83,6 +83,29 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("contract must not expose skeleton status")
     if manifest.get("setup_ids") != ids or contract["setup_system"]["setup_ids"] != ids:
         raise ValueError("setup ids are not synchronized")
+    runtime_isolation = manifest.get("runtime_isolation")
+    if not isinstance(runtime_isolation, dict):
+        raise ValueError("manifest runtime_isolation must be an object")
+    required_isolation = {
+        "home": "target-owned HOME and USERPROFILE",
+        "data": "target-owned JUNIE_DATA",
+        "logs": "target-owned JUNIE_LOG_DIR",
+        "java": "target-owned JVM user.home and java.io.tmpdir",
+        "default_locations": "disabled through official Junie CLI flags and environment variables",
+        "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
+    }
+    if runtime_isolation != required_isolation:
+        raise ValueError("manifest runtime isolation contract mismatch")
+    runtime_launch = contract.get("runtime_launch")
+    if not isinstance(runtime_launch, dict):
+        raise ValueError("contract runtime_launch must be an object")
+    if runtime_launch.get("target_environment_scope") != (
+        "isolated HOME, USERPROFILE, JUNIE_DATA, JUNIE_LOG_DIR, JVM user.home/java.io.tmpdir, "
+        "config, skills, agents, MCP, extensions, guidelines, and cache under the explicit target"
+    ):
+        raise ValueError("contract runtime launch isolation scope mismatch")
+    if runtime_launch.get("live_home_guard") != required_isolation["live_home_guard"]:
+        raise ValueError("contract live home guard mismatch")
     if build.get("junie_cli_tested") != baseline["release"]["stable_version"]:
         raise ValueError("tested Junie CLI version differs from baseline release")
     if baseline["release"]["channel"] != "release":

@@ -96,7 +96,11 @@ TARGET_SCOPE_FLAGS = {
     "--skill-default-locations",
     "--agent-location",
     "--agent-default-location",
+    "--command-location",
+    "--command-default-locations",
     "--guidelines-filename",
+    "--model-location",
+    "--model-default-locations",
 }
 
 
@@ -130,6 +134,17 @@ class SoftwareTransaction:
 class RuntimeRemoveTransaction:
     changed: bool
     removed_root: Path | None = None
+
+
+@dataclass(frozen=True)
+class LiveJunieHomeSnapshot:
+    exists: bool
+    inode: int | None = None
+    mode: int | None = None
+    size: int | None = None
+    mtime_ns: int | None = None
+    ctime_ns: int | None = None
+    is_symlink: bool = False
 
 
 @dataclass
@@ -180,6 +195,58 @@ def sha256_file_bounded(path: Path, *, max_bytes: int, label: str) -> str:
                 fail(f"{label} is too large")
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def java_option_quote(path: Path) -> str:
+    value = str(path)
+    if "\x00" in value or "\n" in value or "\r" in value:
+        fail("Java runtime isolation path contains unsupported control characters")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def java_isolation_options(home: Path, tmp: Path) -> str:
+    return " ".join(
+        (
+            f"-Duser.home={java_option_quote(home)}",
+            f"-Djava.io.tmpdir={java_option_quote(tmp)}",
+        )
+    )
+
+
+def account_junie_home() -> Path:
+    if os.name != "posix":
+        fail("Junie live-state guard requires a POSIX account home")
+    import pwd
+
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".junie"
+    except KeyError:
+        fail("cannot resolve account home for Junie live-state guard")
+
+
+def snapshot_live_junie_home() -> LiveJunieHomeSnapshot:
+    path = account_junie_home()
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return LiveJunieHomeSnapshot(exists=False)
+    return LiveJunieHomeSnapshot(
+        exists=True,
+        inode=info.st_ino,
+        mode=stat.S_IMODE(info.st_mode),
+        size=info.st_size,
+        mtime_ns=info.st_mtime_ns,
+        ctime_ns=info.st_ctime_ns,
+        is_symlink=stat.S_ISLNK(info.st_mode),
+    )
+
+
+def require_live_junie_home_unchanged(
+    before: LiveJunieHomeSnapshot, *, context: str
+) -> None:
+    after = snapshot_live_junie_home()
+    if after != before:
+        fail(f"{context} changed the live account Junie home; target isolation failed")
 
 
 def read_path_bounded(path: Path, *, max_bytes: int, label: str) -> bytes:
@@ -1163,13 +1230,22 @@ def software_state(target: Path) -> dict[str, Any]:
 
 
 def sanitized_subprocess_env(home: Path, data: Path, tmp: Path) -> dict[str, str]:
+    java_options = java_isolation_options(home, tmp)
     env: dict[str, str] = {
         "HOME": str(home),
+        "USERPROFILE": str(home),
         "JUNIE_DATA": str(data),
+        "JUNIE_LOG_DIR": str(data / "logs"),
+        "JUNIE_SKIP_UPDATE_CHECK": "1",
         "TMPDIR": str(tmp),
+        "TMP": str(tmp),
+        "TEMP": str(tmp),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "XDG_CACHE_HOME": str(home / ".cache"),
         "XDG_DATA_HOME": str(home / ".local" / "share"),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+        "JDK_JAVA_OPTIONS": java_options,
+        "JAVA_TOOL_OPTIONS": java_options,
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
@@ -1194,10 +1270,42 @@ def write_stage_installer(stage: Path, installer_bytes: bytes) -> Path:
 def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> None:
     tmp = stage_home.parent / "probe-tmp"
     tmp.mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
+    cache = stage_home.parent / "probe-cache"
+    skills = stage_home / "skills"
+    agents = stage_home / "agents"
+    mcp = stage_home / "mcp"
+    for directory in (cache, skills, agents, mcp):
+        directory.mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
+    config = stage_home / "config.json"
+    if not lstat_exists(config):
+        atomic_write(config, b"{}\n", stage_home)
     env = sanitized_subprocess_env(stage_home, stage_home / ".local" / "share" / "junie", tmp)
+    live_before = snapshot_live_junie_home()
     try:
         completed = subprocess.run(
-            [str(stage_home / ".local" / "bin" / "junie"), "--skip-update-check", "--version"],
+            [
+                str(stage_home / ".local" / "bin" / "junie"),
+                "--skip-update-check",
+                "--config-location",
+                str(config),
+                "--config-default-locations",
+                "false",
+                "--mcp-location",
+                str(mcp),
+                "--mcp-default-locations",
+                "false",
+                "--skill-location",
+                str(skills),
+                "--skill-default-locations",
+                "false",
+                "--agent-location",
+                str(agents),
+                "--agent-default-location",
+                "false",
+                "--cache-dir",
+                str(cache),
+                "--version",
+            ],
             cwd=stage_home,
             env=env,
             text=True,
@@ -1209,6 +1317,7 @@ def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> Non
         fail(f"stage Junie version probe command is missing: {exc}")
     except subprocess.TimeoutExpired:
         fail("stage Junie version probe timed out")
+    require_live_junie_home_unchanged(live_before, context="stage Junie version probe")
     output = completed.stdout + completed.stderr
     if completed.returncode != 0:
         fail(f"stage Junie version probe failed: {output.strip()}")
@@ -1266,6 +1375,7 @@ def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str
     env["JUNIE_VERSION"] = baseline["release"]["exact_version"]
     env["NDDEV_JUNIE_EXPECTED_ARTIFACT_SHA256"] = artifact["sha256"]
     env["NDDEV_JUNIE_EXPECTED_ARTIFACT_SIZE"] = str(artifact["size"])
+    live_before = snapshot_live_junie_home()
     try:
         completed = subprocess.run(
             ["bash", str(installer_path)],
@@ -1280,6 +1390,7 @@ def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str
         fail(f"Junie installer shell is missing: {exc}")
     except subprocess.TimeoutExpired:
         fail("Junie installer timed out in isolated staging HOME")
+    require_live_junie_home_unchanged(live_before, context="Junie installer")
     installer_output = completed.stdout + completed.stderr
     if completed.returncode != 0:
         fail(f"Junie installer failed in isolated staging HOME: {installer_output.strip()}")
@@ -1904,8 +2015,10 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
                 "JUNIE_SKILL_DEFAULT_LOCATIONS": "false",
                 "JUNIE_AGENT_LOCATIONS": str((canonical / "agents").resolve()),
                 "JUNIE_AGENT_DEFAULT_LOCATIONS": "false",
+                "JUNIE_COMMAND_DEFAULT_LOCATIONS": "false",
                 "JUNIE_MCP_LOCATIONS": str((canonical / "mcp").resolve()),
                 "JUNIE_MCP_DEFAULT_LOCATIONS": "false",
+                "JUNIE_MODEL_DEFAULT_LOCATIONS": "false",
                 "JUNIE_EXTENSIONS_DEFAULT_LOCATION": str((canonical / "extensions").resolve()),
                 "JUNIE_GUIDELINES_FILENAME": str((canonical / "AGENTS.md").resolve()),
             }
@@ -1913,17 +2026,40 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
         command = [str(canonical / metadata["shim"]["path"])]
         if "--skip-update-check" not in child_args:
             command.append("--skip-update-check")
-        command.extend(["--cache-dir", str(cache)])
+        command.extend(
+            [
+                "--config-location",
+                str((canonical / "config.json").resolve()),
+                "--config-default-locations",
+                "false",
+                "--mcp-location",
+                str((canonical / "mcp").resolve()),
+                "--mcp-default-locations",
+                "false",
+                "--skill-location",
+                str((canonical / "skills").resolve()),
+                "--skill-default-locations",
+                "false",
+                "--agent-location",
+                str((canonical / "agents").resolve()),
+                "--agent-default-location",
+                "false",
+                "--cache-dir",
+                str(cache),
+            ]
+        )
         command.extend(child_args)
         return command, child_env, canonical
 
 
 def launch(target: Path, child_args: list[str]) -> int:
     command, child_env, cwd = prepare_launch(target, child_args)
+    live_before = snapshot_live_junie_home()
     try:
         completed = subprocess.run(command, cwd=cwd, env=child_env, check=False)
     except FileNotFoundError:
         fail("target-owned Junie command was not found")
+    require_live_junie_home_unchanged(live_before, context="Junie launch")
     return int(completed.returncode)
 
 

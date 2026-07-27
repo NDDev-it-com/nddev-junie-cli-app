@@ -24,7 +24,9 @@ skills, agents, MCP files, auth files, logs, and session state are not removed.
 `install` verifies the pinned official `install.sh` digest, verifies the official
 `update-info.jsonl` metadata for the pinned release, and runs the installer only in
 an isolated staging `HOME` with `JUNIE_VERSION` set. A stage-local `junie --version`
-probe must report the pinned version before the runtime is moved under the target.
+probe must report the pinned version with target-owned Junie log/data/cache paths,
+official default-location controls disabled, and JVM `user.home` isolated before
+the runtime is moved under the target.
 
 Healthy target-owned software is not reinstalled by `install`. Use `update` to
 repair a safe partial runtime. Unsafe target path types, symlinks, hardlinks, and
@@ -34,7 +36,9 @@ non-private managed target directories fail before network access.
 
 `launch` checks the stamp and refuses drift before spawning the target-owned Junie
 shim. The child process
-gets an isolated `HOME`, `JUNIE_DATA`, config, skill, agent, MCP, extension, guidelines,
-and cache scope under the managed target. Provider credential variables are stripped.
+gets an isolated `HOME`, `USERPROFILE`, `JUNIE_DATA`, `JUNIE_LOG_DIR`, JVM
+`user.home`, config, skill, agent, MCP, extension, guidelines, cache, and temp
+scope under the managed target. Provider credential variables are stripped, and
+the manager fails closed if the account `~/.junie` metadata changes.
 
 `--skip-update-check` is added unless the caller already supplied it.
