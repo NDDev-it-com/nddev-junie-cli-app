@@ -1,11 +1,10 @@
 {
   "id": "safe",
   "display_name": "Safe",
-  "description": "Ask-first Junie CLI setup with nddev-builder projected through native guidance and skill surfaces.",
+  "description": "Ask-first Junie CLI permission profile with Brave mode disabled.",
   "brave": false,
   "allow_readonly_commands": false,
   "plan_mode_default": false,
-  "nddev_builder_default": true,
   "allowlist": {
     "defaultBehavior": "ask",
     "allowReadonlyCommands": false,

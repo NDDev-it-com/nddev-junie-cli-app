@@ -1,0 +1,15 @@
+{
+  "id": "nddev-builder",
+  "display_name": "NDDev Builder",
+  "description": "Shared Junie CLI setup that projects the nddev-builder toolkit through native guidance, skill, agent, command, MCP, hook, and extension source surfaces.",
+  "nddev_builder_default": true,
+  "content_projection": {
+    "guidelines": true,
+    "skills": true,
+    "agents": true,
+    "commands": true,
+    "mcp": true,
+    "hooks": true,
+    "local_extension_marketplace": true
+  }
+}

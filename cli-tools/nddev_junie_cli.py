@@ -28,13 +28,18 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 PRODUCT_NAME = "nddev-junie-cli-app"
 SETUP_ROOT = ROOT / "setups"
+PROFILE_ROOT = ROOT / "profiles"
 BUILDER_ROOT = ROOT / "builder" / "nddev-builder"
 BASELINE_PATH = ROOT / "references" / "junie-cli-baseline.json"
-DEFAULT_SETUP_ID = "full-auto"
-SETUP_ORDER = ("safe", "full-auto")
+DEFAULT_SETUP_ID = "nddev-builder"
+SETUP_ORDER = ("nddev-builder",)
+DEFAULT_PROFILE_ID = "full-auto"
+PROFILE_ORDER = ("safe", "full-auto")
+LEGACY_SETUP_IDS = ("safe", "full-auto", "balanced")
 STAMP_NAME = "NDDEV-JUNIE-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-JUNIE-CLI-BACKUP.json"
-STAMP_SCHEMA = 2
+STAMP_SCHEMA = 3
+LEGACY_STAMP_SCHEMAS = (1, 2)
 LEGACY_STAMP_SCHEMA = 1
 RUNTIME_DIR_NAME = ".nddev-junie-cli-runtime"
 RUNTIME_RECEIPT_NAME = "NDDEV-JUNIE-CLI-RUNTIME.json"
@@ -901,6 +906,16 @@ def load_setup(setup_id: str) -> dict[str, Any]:
     return setup
 
 
+def load_profile(profile_id: str) -> dict[str, Any]:
+    if not SETUP_ID_PATTERN.fullmatch(profile_id):
+        fail(f"invalid profile id: {profile_id}")
+    path = PROFILE_ROOT / profile_id / "profile.json"
+    profile = read_json_file(path, max_bytes=METADATA_MAX_BYTES, label=f"profile {profile_id}")
+    if profile.get("id") != profile_id:
+        fail(f"profile id mismatch in {path}")
+    return profile
+
+
 def list_setups() -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for setup_id in SETUP_ORDER:
@@ -910,9 +925,24 @@ def list_setups() -> list[dict[str, Any]]:
                 "id": setup["id"],
                 "display_name": setup["display_name"],
                 "description": setup["description"],
-                "brave": setup["brave"],
-                "allow_readonly_commands": setup["allow_readonly_commands"],
                 "nddev_builder_default": setup["nddev_builder_default"],
+                "content_projection": setup["content_projection"],
+            }
+        )
+    return items
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for profile_id in PROFILE_ORDER:
+        profile = load_profile(profile_id)
+        items.append(
+            {
+                "id": profile["id"],
+                "display_name": profile["display_name"],
+                "description": profile["description"],
+                "brave": profile["brave"],
+                "allow_readonly_commands": profile["allow_readonly_commands"],
             }
         )
     return items
@@ -988,14 +1018,14 @@ def quoted(value: Path | str) -> str:
     return shlex.quote(str(value))
 
 
-def render_config(target: Path, setup: dict[str, Any]) -> dict[str, Any]:
+def render_config(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     canonical = validate_target(target, create=False)
     hook_command = (
         f"{quoted(trusted_python())} {quoted(canonical / 'hooks' / 'nddev-builder-context.py')} "
         f"--target {quoted(canonical)}"
     )
     return {
-        "brave": bool(setup["brave"]),
+        "brave": bool(profile["brave"]),
         "skill-locations": [str((canonical / "skills").resolve())],
         "skill-default-locations": false_json(),
         "agent-locations": [str((canonical / "agents").resolve())],
@@ -1026,11 +1056,12 @@ def false_json() -> bool:
     return False
 
 
-def render_agents_content(setup: dict[str, Any]) -> str:
+def render_agents_content(setup: dict[str, Any], profile: dict[str, Any]) -> str:
     return (
         "# NDDev Junie CLI Setup\n"
         "\n"
-        f"This target is managed as the `{setup['id']}` setup by nddev-junie-cli-app.\n"
+        f"This target is managed as the `{setup['id']}` setup with the "
+        f"`{profile['id']}` permission profile by nddev-junie-cli-app.\n"
         "Use the managed nddev-builder skill for Junie setup artifact changes. Work only\n"
         "through the target-owned files passed by the manager's explicit Junie CLI flags\n"
         "and environment variables. Do not read or write live account Junie state.\n"
@@ -1086,11 +1117,11 @@ def copy_builder_projection(files: dict[str, bytes], source_root: str, target_ro
         files[f"{target_root}/{relative}"] = data
 
 
-def desired_files(target: Path, setup: dict[str, Any]) -> dict[str, bytes]:
+def desired_files(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, bytes]:
     files: dict[str, bytes] = {
-        "config.json": canonical_json(render_config(target, setup)),
-        RUNTIME_ALLOWLIST_RELATIVE: canonical_json(dict(setup["allowlist"])),
-        "AGENTS.md": render_agents_content(setup).encode("utf-8"),
+        "config.json": canonical_json(render_config(target, setup, profile)),
+        RUNTIME_ALLOWLIST_RELATIVE: canonical_json(dict(profile["allowlist"])),
+        "AGENTS.md": render_agents_content(setup, profile).encode("utf-8"),
         "mcp/mcp.json": canonical_json({"mcpServers": {}}),
     }
     copy_builder_projection(files, "skills", "skills")
@@ -1752,12 +1783,41 @@ def read_stamp(target: Path) -> dict[str, Any] | None:
     stamp = read_json_file(path, max_bytes=METADATA_MAX_BYTES, label=STAMP_NAME)
     if stamp.get("product_name") != PRODUCT_NAME:
         fail("stamp belongs to another product")
-    if stamp.get("schema_version") not in (LEGACY_STAMP_SCHEMA, STAMP_SCHEMA):
+    schema = stamp.get("schema_version")
+    if schema not in (*LEGACY_STAMP_SCHEMAS, STAMP_SCHEMA):
         fail("stamp schema is unsupported")
+    setup_id = stamp.get("setup_id")
+    if schema == STAMP_SCHEMA:
+        if setup_id not in SETUP_ORDER:
+            fail("stamp setup_id is unsupported")
+        if stamp.get("profile_id") not in PROFILE_ORDER:
+            fail("stamp profile_id is unsupported")
+    elif setup_id not in LEGACY_SETUP_IDS:
+        fail("legacy stamp setup_id is unsupported")
     canonical = str(validate_target(target, create=False))
     if stamp.get("canonical_target") != canonical:
         fail("stamp is bound to a different canonical target")
     return stamp
+
+
+def is_legacy_stamp(stamp: dict[str, Any]) -> bool:
+    return stamp.get("schema_version") != STAMP_SCHEMA
+
+
+def stamp_profile_id(stamp: dict[str, Any]) -> str | None:
+    if not is_legacy_stamp(stamp):
+        profile_id = stamp.get("profile_id")
+        return profile_id if isinstance(profile_id, str) else None
+    setup_id = stamp.get("setup_id")
+    if setup_id in PROFILE_ORDER:
+        return str(setup_id)
+    return None
+
+
+def stamp_setup_id(stamp: dict[str, Any]) -> str:
+    if is_legacy_stamp(stamp):
+        return DEFAULT_SETUP_ID
+    return str(stamp["setup_id"])
 
 
 def stamp_managed_relatives(stamp: dict[str, Any]) -> list[str]:
@@ -1807,6 +1867,8 @@ def status_payload(target: Path) -> dict[str, Any]:
             "managed": False,
             "canonical_target": str(canonical),
             "setup_id": None,
+            "profile_id": None,
+            "legacy_setup_id": None,
             "drift": [],
             "software": {"state": "absent"},
         }
@@ -1818,19 +1880,24 @@ def status_payload(target: Path) -> dict[str, Any]:
             "managed": False,
             "canonical_target": str(canonical),
             "setup_id": None,
+            "profile_id": None,
+            "legacy_setup_id": None,
             "drift": [],
             "software": software_state(target),
         }
     drift = drift_for_stamp(target, stamp)
     software = software_state(target)
+    legacy = is_legacy_stamp(stamp)
     return {
         "state": "managed",
         "managed": True,
         "canonical_target": str(canonical),
-        "setup_id": stamp["setup_id"],
+        "setup_id": stamp_setup_id(stamp),
+        "profile_id": stamp_profile_id(stamp),
+        "legacy_setup_id": stamp["setup_id"] if legacy else None,
         "build_version": stamp["build_version"],
         "stamp_schema": stamp["schema_version"],
-        "legacy": stamp["schema_version"] == LEGACY_STAMP_SCHEMA,
+        "legacy": legacy,
         "launchable": stamp["schema_version"] == STAMP_SCHEMA,
         "drift": drift,
         "managed_files": sorted(stamp["managed_files"]),
@@ -1954,12 +2021,14 @@ def create_backup(target: Path, stamp: dict[str, Any]) -> int:
         )
         files[relative] = None if data is None else base64.b64encode(data).decode("ascii")
     envelope = {
-        "schema_version": 1,
+        "schema_version": 2,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "slot": slot,
         "canonical_target": str(validate_target(target, create=False)),
         "source_setup_id": stamp["setup_id"],
+        "source_profile_id": stamp_profile_id(stamp),
+        "source_legacy_setup_id": stamp["setup_id"] if is_legacy_stamp(stamp) else None,
         "created_at": int(time.time()),
         "files": files,
     }
@@ -1968,7 +2037,11 @@ def create_backup(target: Path, stamp: dict[str, Any]) -> int:
 
 
 def build_stamp(
-    target: Path, setup_id: str, files: dict[str, bytes], software: dict[str, Any]
+    target: Path,
+    setup_id: str,
+    profile_id: str,
+    files: dict[str, bytes],
+    software: dict[str, Any],
 ) -> dict[str, Any]:
     managed = {
         relative: managed_digest_for_bytes(relative, data) for relative, data in files.items()
@@ -1978,6 +2051,7 @@ def build_stamp(
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "setup_id": setup_id,
+        "profile_id": profile_id,
         "canonical_target": str(validate_target(target, create=False)),
         "managed_files": managed,
         "software": software,
@@ -2030,6 +2104,7 @@ def validate_legacy_migration_clean(target: Path, stamp: dict[str, Any]) -> None
 def write_setup_locked(
     target: Path,
     setup: dict[str, Any],
+    profile: dict[str, Any],
     *,
     require_existing: bool = False,
     repair_software: bool = False,
@@ -2041,7 +2116,7 @@ def write_setup_locked(
     target_existed = target not in created_paths
     current = read_stamp(target)
     if require_existing and current is None:
-        fail("switch requires an already managed target")
+        fail("operation requires an already managed target")
     if current is not None:
         if current["schema_version"] != STAMP_SCHEMA and not allow_legacy_migration:
             fail("legacy managed target must be migrated before this operation")
@@ -2050,7 +2125,7 @@ def write_setup_locked(
         drift = drift_for_stamp(target, current)
         if drift and not (repair_software and drift == ["software"]):
             fail(f"managed target has drift: {', '.join(drift)}")
-    files = desired_files(target, setup)
+    files = desired_files(target, setup, profile)
     previous_relatives = [] if current is None else stamp_managed_relatives(current)
     transaction_relatives = unique_relatives([*previous_relatives, *files])
     if current is None:
@@ -2062,7 +2137,9 @@ def write_setup_locked(
     ]
     backup_slot = None
     if current is not None and (
-        current["setup_id"] != setup["id"] or current["schema_version"] != STAMP_SCHEMA
+        current["schema_version"] != STAMP_SCHEMA
+        or current["setup_id"] != setup["id"]
+        or current.get("profile_id") != profile["id"]
     ):
         backup_slot = create_backup(target, current)
     snapshot = capture_transaction_snapshot(
@@ -2078,7 +2155,7 @@ def write_setup_locked(
                 with contextlib.suppress(FileNotFoundError):
                     safe_target_path(target, relative).unlink()
         prune_empty_managed_dirs(target, transaction_relatives)
-        desired_stamp = build_stamp(target, setup["id"], files, software_tx.metadata)
+        desired_stamp = build_stamp(target, setup["id"], profile["id"], files, software_tx.metadata)
         atomic_write(stamp_path(target), canonical_json(desired_stamp), target)
     except BaseException:
         if software_tx is not None:
@@ -2090,6 +2167,7 @@ def write_setup_locked(
     commit_software_transaction(software_tx)
     return {
         "setup_id": setup["id"],
+        "profile_id": profile["id"],
         "changed": changed,
         "backup_slot": backup_slot,
         "software_changed": software_tx.changed,
@@ -2105,6 +2183,7 @@ def write_setup_locked(
 def write_setup(
     target: Path,
     setup: dict[str, Any],
+    profile: dict[str, Any],
     *,
     require_existing: bool = False,
     repair_software: bool = False,
@@ -2113,13 +2192,14 @@ def write_setup(
         return write_setup_locked(
             target,
             setup,
+            profile,
             require_existing=require_existing,
             repair_software=repair_software,
             directory_transaction=directory_transaction,
         )
 
 
-def update_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
+def update_setup(target: Path, setup_id: str | None, profile_id: str | None) -> dict[str, Any]:
     with target_lock(target, create_parent=False) as directory_transaction:
         target = validate_target(target, create=False)
         if not lstat_exists(target):
@@ -2127,17 +2207,21 @@ def update_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
         current = read_stamp(target)
         if current is None:
             fail("update requires an already managed target")
+        if is_legacy_stamp(current):
+            fail("legacy managed target must be migrated before update")
         setup = load_setup(setup_id or current["setup_id"])
+        profile = load_profile(profile_id or current["profile_id"])
         return write_setup_locked(
             target,
             setup,
+            profile,
             require_existing=True,
             repair_software=True,
             directory_transaction=directory_transaction,
         )
 
 
-def migrate_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
+def migrate_setup(target: Path, setup_id: str | None, profile_id: str | None) -> dict[str, Any]:
     with target_lock(target, create_parent=False) as directory_transaction:
         target = validate_target(target, create=False)
         if not lstat_exists(target):
@@ -2146,19 +2230,27 @@ def migrate_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
         if current is None:
             fail("migrate requires an already managed target")
         if current["schema_version"] == STAMP_SCHEMA:
+            if setup_id is not None and setup_id != current["setup_id"]:
+                fail("migrate setup selection does not match the current target")
+            if profile_id is not None and profile_id != current["profile_id"]:
+                fail("migrate profile selection does not match the current target")
             return {
                 "setup_id": current["setup_id"],
+                "profile_id": current["profile_id"],
                 "migrated": False,
                 "target": str(validate_target(target, create=False)),
             }
-        selected_setup = setup_id or current["setup_id"]
-        if selected_setup not in SETUP_ORDER:
-            fail(
-                "legacy setup has no supported native 0.2.0 profile; pass --setup safe or --setup full-auto"
-            )
+        selected_setup = setup_id or DEFAULT_SETUP_ID
+        if selected_setup != DEFAULT_SETUP_ID:
+            fail("migrate supports only --setup nddev-builder")
+        selected_profile = profile_id or stamp_profile_id(current)
+        if selected_profile is None:
+            fail("legacy setup has no safe profile mapping; pass --profile safe or --profile full-auto")
+        profile = load_profile(selected_profile)
         result = write_setup_locked(
             target,
             load_setup(selected_setup),
+            profile,
             require_existing=True,
             repair_software=True,
             allow_legacy_migration=True,
@@ -2215,7 +2307,13 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
             raise
         restored_stamp = read_stamp(target)
         return {
-            "setup_id": None if restored_stamp is None else restored_stamp["setup_id"],
+            "setup_id": None if restored_stamp is None else stamp_setup_id(restored_stamp),
+            "profile_id": None if restored_stamp is None else stamp_profile_id(restored_stamp),
+            "legacy_setup_id": (
+                None
+                if restored_stamp is None or not is_legacy_stamp(restored_stamp)
+                else restored_stamp["setup_id"]
+            ),
             "backup_slot": slot,
             "target": str(validate_target(target, create=False)),
         }
@@ -2223,16 +2321,28 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
 
 def remove_setup(target: Path) -> dict[str, Any]:
     if not lstat_exists(target.parent) or not lstat_exists(target):
-        return {"removed_setup_id": None, "target": str(validate_target(target, create=False))}
+        return {
+            "removed_setup_id": None,
+            "removed_profile_id": None,
+            "removed_legacy_setup_id": None,
+            "target": str(validate_target(target, create=False)),
+        }
     with target_lock(target, create_parent=False):
         target = validate_target(target, create=False)
         stamp = read_stamp(target)
         if stamp is None:
-            return {"removed_setup_id": None, "target": str(validate_target(target, create=False))}
+            return {
+                "removed_setup_id": None,
+                "removed_profile_id": None,
+                "removed_legacy_setup_id": None,
+                "target": str(validate_target(target, create=False)),
+            }
         drift = drift_for_stamp(target, stamp)
         if drift:
             fail(f"managed target has drift: {', '.join(drift)}")
-        removed_setup_id = stamp["setup_id"]
+        removed_setup_id = stamp_setup_id(stamp)
+        removed_profile_id = stamp_profile_id(stamp)
+        removed_legacy_setup_id = stamp["setup_id"] if is_legacy_stamp(stamp) else None
         managed_relatives = stamp_managed_relatives(stamp)
         snapshot = snapshot_files(target, managed_relatives)
         runtime_tx: RuntimeRemoveTransaction | None = None
@@ -2259,6 +2369,8 @@ def remove_setup(target: Path) -> dict[str, Any]:
             commit_runtime_remove(runtime_tx)
         return {
             "removed_setup_id": removed_setup_id,
+            "removed_profile_id": removed_profile_id,
+            "removed_legacy_setup_id": removed_legacy_setup_id,
             "software_removed": runtime_tx.changed if runtime_tx is not None else False,
             "target": str(validate_target(target, create=False)),
         }
@@ -2307,18 +2419,27 @@ def prune_empty_managed_dirs(target: Path, relatives: list[str] | None = None) -
             directory.rmdir()
 
 
-def plan_payload(target: Path, setup: dict[str, Any]) -> dict[str, Any]:
+def plan_payload(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     status = status_payload(target)
     operation = "install"
     backup_required = False
     if status["managed"]:
-        operation = "update" if status["setup_id"] == setup["id"] else "switch"
-        backup_required = status["setup_id"] != setup["id"]
+        if not status.get("launchable"):
+            operation = "migrate"
+            backup_required = True
+        elif status["setup_id"] == setup["id"] and status["profile_id"] == profile["id"]:
+            operation = "update"
+        else:
+            operation = "switch"
+            backup_required = True
     return {
         "operation": operation,
         "setup_id": setup["id"],
+        "profile_id": profile["id"],
         "target": str(validate_target(target, create=False)),
         "current_setup_id": status["setup_id"],
+        "current_profile_id": status["profile_id"],
+        "legacy_setup_id": status["legacy_setup_id"],
         "drift": status["drift"],
         "backup_required": backup_required,
         "software": status["software"],
@@ -2350,7 +2471,7 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
         if not status["managed"]:
             fail("launch requires a managed target")
         if not status.get("launchable"):
-            fail("launch requires a migrated schema 2 target")
+            fail("launch requires a migrated schema 3 target")
         if status["drift"]:
             fail(f"managed target has drift: {', '.join(status['drift'])}")
         canonical = validate_target(target, create=False)
@@ -2446,18 +2567,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for name in ("plan", "install"):
         command = subparsers.add_parser(name)
         command.add_argument("--setup", default=DEFAULT_SETUP_ID)
+        command.add_argument("--profile", default=DEFAULT_PROFILE_ID)
         command.add_argument("--target", required=True)
         command.add_argument("--json", action="store_true")
     switch = subparsers.add_parser("switch")
-    switch.add_argument("--setup", required=True)
+    switch.add_argument("--setup", default=DEFAULT_SETUP_ID)
+    switch.add_argument("--profile", required=True)
     switch.add_argument("--target", required=True)
     switch.add_argument("--json", action="store_true")
     update = subparsers.add_parser("update")
     update.add_argument("--setup")
+    update.add_argument("--profile")
     update.add_argument("--target", required=True)
     update.add_argument("--json", action="store_true")
     migrate = subparsers.add_parser("migrate")
     migrate.add_argument("--setup")
+    migrate.add_argument("--profile")
     migrate.add_argument("--target", required=True)
     migrate.add_argument("--json", action="store_true")
     restore = subparsers.add_parser("restore")
@@ -2477,30 +2602,55 @@ def emit(payload: dict[str, Any], *, as_json: bool) -> None:
 def dispatch(args: argparse.Namespace) -> int:
     if args.command == "list":
         items = list_setups()
-        emit({"setups": [item["id"] for item in items], "items": items}, as_json=args.json)
+        profiles = list_profiles()
+        emit(
+            {
+                "setups": [item["id"] for item in items],
+                "profiles": [item["id"] for item in profiles],
+                "items": items,
+                "profile_items": profiles,
+                "default_setup_id": DEFAULT_SETUP_ID,
+                "default_profile_id": DEFAULT_PROFILE_ID,
+            },
+            as_json=args.json,
+        )
         return 0
     if args.command == "status":
         emit(status_payload(require_absolute_target(args.target)), as_json=args.json)
         return 0
     if args.command == "plan":
         target = require_absolute_target(args.target)
-        emit(plan_payload(target, load_setup(args.setup)), as_json=args.json)
+        emit(
+            plan_payload(target, load_setup(args.setup), load_profile(args.profile)),
+            as_json=args.json,
+        )
         return 0
     if args.command == "install":
         target = require_absolute_target(args.target)
-        emit(write_setup(target, load_setup(args.setup)), as_json=args.json)
+        emit(
+            write_setup(target, load_setup(args.setup), load_profile(args.profile)),
+            as_json=args.json,
+        )
         return 0
     if args.command == "switch":
         target = require_absolute_target(args.target)
-        emit(write_setup(target, load_setup(args.setup), require_existing=True), as_json=args.json)
+        emit(
+            write_setup(
+                target,
+                load_setup(args.setup),
+                load_profile(args.profile),
+                require_existing=True,
+            ),
+            as_json=args.json,
+        )
         return 0
     if args.command == "update":
         target = require_absolute_target(args.target)
-        emit(update_setup(target, args.setup), as_json=args.json)
+        emit(update_setup(target, args.setup, args.profile), as_json=args.json)
         return 0
     if args.command == "migrate":
         target = require_absolute_target(args.target)
-        emit(migrate_setup(target, args.setup), as_json=args.json)
+        emit(migrate_setup(target, args.setup, args.profile), as_json=args.json)
         return 0
     if args.command == "restore":
         target = require_absolute_target(args.target)

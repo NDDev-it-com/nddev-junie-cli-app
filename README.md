@@ -18,11 +18,11 @@ materialized under the isolated runtime home.
 
 ```bash
 python3 cli-tools/nddev_junie_cli.py list --json
-python3 cli-tools/nddev_junie_cli.py plan --target /absolute/target --json
-python3 cli-tools/nddev_junie_cli.py install --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py plan --setup nddev-builder --profile full-auto --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py install --setup nddev-builder --profile full-auto --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json
-python3 cli-tools/nddev_junie_cli.py switch --setup safe --target /absolute/target --json
-python3 cli-tools/nddev_junie_cli.py migrate --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py switch --setup nddev-builder --profile safe --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py migrate --setup nddev-builder --profile full-auto --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py remove --target /absolute/target --json
@@ -47,9 +47,10 @@ metadata changes.
 
 ## Setups
 
-`full-auto` is the default setup and enables Junie Brave mode. `safe` disables
-Brave mode and uses an ask-first empty allowlist. No unproven Auto-style profile
-is shipped.
+`nddev-builder` is the only active content setup. `full-auto` is the default
+permission profile and enables Junie Brave mode. `safe` disables Brave mode and
+uses an ask-first empty allowlist. Profile switches do not duplicate or replace
+the shared builder toolkit. No unproven Auto-style profile is shipped.
 
 ## Builder Toolkit
 

@@ -10,6 +10,10 @@ Use this skill when a task involves Junie CLI setup artifacts managed by
 commands, MCP, hooks, local extensions, launch isolation, migration, or
 validation.
 
+The active content setup is `nddev-builder`. Permission policy is orthogonal and
+lives in `profiles/`; profile switches must not replace or duplicate builder
+content.
+
 ## First Checks
 
 1. Identify whether the task is creating an artifact, checking an artifact, or

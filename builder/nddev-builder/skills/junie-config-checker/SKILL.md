@@ -11,4 +11,4 @@ Read `../nddev-builder/references/native-path-model.md` and
 `../nddev-builder/references/config.md` first.
 
 Verify the JSON object is manager-owned, target-scoped, secret-free, and aligned
-with the setup permission profile.
+with the selected permission profile.

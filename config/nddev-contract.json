@@ -7,8 +7,8 @@
   "version_ref": "build/version.json",
   "managed_state": {
     "stamp_file": "NDDEV-JUNIE-CLI-SETUP.json",
-    "stamp_schema": 2,
-    "legacy_stamp_schema_readable": 1,
+    "stamp_schema": 3,
+    "legacy_stamp_schemas_readable": [1, 2],
     "default_target": null,
     "environment_variable": null,
     "managed_directory_mode": "0700",
@@ -21,24 +21,32 @@
     "pathless_native_state": {
       "allowlist": "<target>/.nddev-junie-cli-runtime/home/.junie/allowlist.json"
     },
-    "co_owned_config_strategy": "schema-2 config and allowlist are complete managed JSON files; legacy schema-1 co-owned files are readable only for status, migrate, restore, and remove"
+    "co_owned_config_strategy": "schema-3 config and runtime allowlist are complete managed JSON files; legacy schema-1 co-owned files and schema-2 coupled setup files are readable only for status, migrate, restore, and remove",
+    "identity_fields": {
+      "setup_id": "nddev-builder",
+      "profile_id": "safe or full-auto"
+    }
   },
   "setup_system": {
     "catalog_root": "setups",
-    "setup_ids": ["safe", "full-auto"],
-    "default_setup_id": "full-auto",
+    "setup_ids": ["nddev-builder"],
+    "default_setup_id": "nddev-builder",
+    "content_setup": "nddev-builder",
     "identity_source": "official Junie CLI docs and installer scripts from junie.jetbrains.com",
     "list_command": "python3 cli-tools/nddev_junie_cli.py list --json",
     "status_command": "python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json",
-    "plan_command": "python3 cli-tools/nddev_junie_cli.py plan --target /absolute/target --json",
-    "install_command": "python3 cli-tools/nddev_junie_cli.py install --target /absolute/target --json",
-    "switch_command": "python3 cli-tools/nddev_junie_cli.py switch --setup safe --target /absolute/target --json",
-    "migrate_command": "python3 cli-tools/nddev_junie_cli.py migrate --target /absolute/target --json",
+    "plan_command": "python3 cli-tools/nddev_junie_cli.py plan --setup nddev-builder --profile full-auto --target /absolute/target --json",
+    "install_command": "python3 cli-tools/nddev_junie_cli.py install --setup nddev-builder --profile full-auto --target /absolute/target --json",
+    "switch_command": "python3 cli-tools/nddev_junie_cli.py switch --setup nddev-builder --profile safe --target /absolute/target --json",
+    "migrate_command": "python3 cli-tools/nddev_junie_cli.py migrate --setup nddev-builder --profile full-auto --target /absolute/target --json",
     "restore_command": "python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json",
     "remove_command": "python3 cli-tools/nddev_junie_cli.py remove --target /absolute/target --json",
     "launch_command": "python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target --"
   },
   "permission_profiles": {
+    "catalog_root": "profiles",
+    "profile_ids": ["safe", "full-auto"],
+    "default_profile_id": "full-auto",
     "safe": {
       "native_brave": false,
       "allowlist": "ask-first empty allow rules"
@@ -62,7 +70,7 @@
     "rollback_on_failure": true,
     "max_backups": 10,
     "launch_requires_clean_managed_target": true,
-    "launch_requires_schema_2": true,
+    "launch_requires_schema_3": true,
     "launch_strips_provider_credentials": true,
     "lock_and_backup_roots_inside_private_target": true,
     "subprocess_path": "/usr/bin:/bin:/usr/sbin:/sbin"
