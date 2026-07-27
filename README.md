@@ -35,34 +35,20 @@ The public contract is pinned to the official stable `release` channel and comma
 name `junie`. Official sources are recorded in
 `references/junie-cli-baseline.json`.
 
-The manager verifies the official installer SHA256 and exact `update-info.jsonl`
-artifact metadata before running `install.sh` in an isolated staging `HOME` with
-`JUNIE_VERSION` set to the pinned release. Public commands do not accept env-based
-source, fixture, or timeout overrides. Only the target-owned runtime under
-`.nddev-junie-cli-runtime/` is persisted. Runtime probes and launches use a fixed
-minimal subprocess `PATH` and bind `JUNIE_DATA`, `JUNIE_LOG_DIR`, official
-default-location controls, cache/temp paths, and JVM `user.home` to target-owned
-or stage-owned directories; the manager fails closed if the account `~/.junie`
-metadata changes. Managed lifecycle operations acquire a persistent external
-bootstrap flock first, under the resolved fixed system temp root
-(`/private/tmp` on macOS, `/tmp` on Linux) and keyed by the full SHA256 of the
-product namespace plus canonical absolute target. The persistent target-internal
-lock is acquired second and released first; the external lock is released last
-and is never exposed to the child environment. Managed launch holds both locks
-through child completion and post-launch live-home validation, so lifecycle
-mutations are denied while the launched Junie process is running even if the
-target-local lock directory is renamed from the writable target root. The
-target-owned shim and pinned Junie binary identity are captured during launch
-preflight and revalidated immediately before child execution. Because macOS does
-not provide a portable `fexecve` or `/dev/fd` execution path for this handoff,
-the manager retains open verified file descriptors as evidence, materializes a
-dedicated launch image at `.nddev-junie-cli-runtime/launch-image/junie`,
-write-protects only that dedicated launcher directory through child completion,
-and starts the launch image path with `Popen`. Runtime `HOME`, `TMP`, XDG, data,
-log, project, and config/source directories remain writable for the launched
-CLI. This blocks ordinary target-local lock and launcher replacement during
-launch, but it is not a sandbox against deliberate same-UID bootstrap-root or
-ancestor tampering.
+Install, update, and launch behavior is intentionally code-owned. See
+`cli-tools/nddev_junie_cli.py` for the executable lifecycle implementation,
+`config/nddev-contract.json` for the public safety and runtime contract,
+`references/junie-cli-baseline.json` for official source pins, and `AGENTS.md`
+for the repository source-of-truth rule.
+
+At the public interface level, lifecycle commands use pinned official sources,
+isolate Junie from live account state, reject unsafe target state, and fail
+closed rather than silently repairing unmanaged drift. Managed launch keeps the
+target lifecycle owned until the child exits and post-launch state checks finish,
+so concurrent lifecycle mutations are denied while Junie is running. The exact
+managed paths, installer probe details, lock implementation, launch handoff,
+scope flags, environment bindings, and same-user tamper boundary are defined by
+the code-owned sources above.
 
 ## Setups
 
