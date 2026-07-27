@@ -96,6 +96,8 @@ PRIVATE_ARTIFACT_MARKERS = {
 }
 BOOTSTRAP_SNAPSHOT_MAX_CHILDREN = 1024
 BOOTSTRAP_SNAPSHOT_MAX_FILE_BYTES = 1024 * 1024
+GDS_REPOSITORY_YAML_SIZE = 1240
+GDS_REPOSITORY_YAML_SHA256 = "29e5172545ed4f83243c0c5129e8065decf30912eab3e8cb616df625a870c74d"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -328,7 +330,14 @@ def validate_public_artifact_marker() -> None:
     marker = ROOT / ".gds" / "repository.yaml"
     if not marker.is_file():
         raise ValueError("release archive must include .gds/repository.yaml")
-    text = marker.read_text(encoding="utf-8")
+    siblings = sorted(item.name for item in marker.parent.iterdir())
+    if siblings != ["repository.yaml"]:
+        raise ValueError(".gds must not contain generated policy copies")
+    raw = marker.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if len(raw) != GDS_REPOSITORY_YAML_SIZE or digest != GDS_REPOSITORY_YAML_SHA256:
+        raise ValueError(".gds/repository.yaml bytes are not synchronized")
+    text = raw.decode("utf-8")
     required = (
         'visibility_contract: "public"',
         'data_classification: "public"',
