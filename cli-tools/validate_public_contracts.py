@@ -43,6 +43,7 @@ RELEASE_ARCHIVE_PATHS = [
     "LICENSE",
     "README.md",
     "VERSION",
+    ".claude",
     ".gds",
     ".github",
     "build",
@@ -73,6 +74,7 @@ RELEASE_PATH_TYPES = {
     "LICENSE": "file",
     "README.md": "file",
     "VERSION": "file",
+    ".claude": "directory",
     ".gds": "directory",
     ".github": "directory",
     "build": "directory",
@@ -96,8 +98,6 @@ PRIVATE_ARTIFACT_MARKERS = {
 }
 BOOTSTRAP_SNAPSHOT_MAX_CHILDREN = 1024
 BOOTSTRAP_SNAPSHOT_MAX_FILE_BYTES = 1024 * 1024
-GDS_REPOSITORY_YAML_SIZE = 1240
-GDS_REPOSITORY_YAML_SHA256 = "29e5172545ed4f83243c0c5129e8065decf30912eab3e8cb616df625a870c74d"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -326,26 +326,61 @@ def validate_release_paths_exist_and_safe(paths: list[str], label: str) -> None:
         require_release_path_shape(path, label)
 
 
-def validate_public_artifact_marker() -> None:
+def require_marker_token(text: str, token: str, label: str) -> None:
+    if text.splitlines().count(token) != 1:
+        raise ValueError(f"release archive public marker missing or duplicated {label}")
+
+
+def validate_public_artifact_marker(contract: dict[str, Any]) -> None:
     marker = ROOT / ".gds" / "repository.yaml"
     if not marker.is_file():
         raise ValueError("release archive must include .gds/repository.yaml")
     siblings = sorted(item.name for item in marker.parent.iterdir())
     if siblings != ["repository.yaml"]:
         raise ValueError(".gds must not contain generated policy copies")
-    raw = marker.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
-    if len(raw) != GDS_REPOSITORY_YAML_SIZE or digest != GDS_REPOSITORY_YAML_SHA256:
-        raise ValueError(".gds/repository.yaml bytes are not synchronized")
-    text = raw.decode("utf-8")
-    required = (
-        'visibility_contract: "public"',
-        'data_classification: "public"',
-        'contract: "public"',
+    text = marker.read_text(encoding="utf-8")
+    owner, name = str(contract["github_repository"]).split("/", 1)
+    required_tokens = (
+        ("schema_version: 1", "schema version"),
+        (f'  display_name: "{contract["product_name"]}"', "repository display name"),
+        ('    - "module"', "module role"),
+        ('  type: "github"', "GitHub provider type"),
+        ('  installation: "installation:github-organization"', "GitHub installation"),
+        (f'  owner: "{owner}"', "GitHub owner"),
+        (f'  name: "{name}"', "GitHub repository name"),
+        ('  visibility_contract: "public"', "public visibility"),
+        ('  data_classification: "public"', "public data classification"),
+        ('  contract: "public"', "public module contract"),
+        ('      - "python3 cli-tools/validate_public_contracts.py"', "test command"),
+        ('    - "test"', "required test"),
     )
-    for literal in required:
-        if literal not in text:
-            raise ValueError(f"release archive public marker is missing {literal}")
+    for item in required_tokens:
+        if isinstance(item, tuple):
+            token, label = item
+        else:
+            token = item
+            label = item
+        require_marker_token(text, token, label)
+
+
+def validate_claude_import_bridge() -> None:
+    directory = ROOT / ".claude"
+    bridge = directory / "CLAUDE.md"
+    try:
+        directory_info = directory.lstat()
+        bridge_info = bridge.lstat()
+    except OSError as exc:
+        raise ValueError(".claude/CLAUDE.md import bridge is missing") from exc
+    if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode):
+        raise ValueError(".claude must be a real directory")
+    if stat.S_ISLNK(bridge_info.st_mode) or not stat.S_ISREG(bridge_info.st_mode):
+        raise ValueError(".claude/CLAUDE.md must be a regular file")
+    if sorted(item.name for item in directory.iterdir()) != ["CLAUDE.md"]:
+        raise ValueError(".claude must contain only the Claude import bridge")
+    if bridge.read_bytes() != b"@../AGENTS.md\n":
+        raise ValueError(".claude/CLAUDE.md must exactly import ../AGENTS.md")
+    if not (ROOT / "AGENTS.md").is_file():
+        raise ValueError(".claude/CLAUDE.md import target is missing")
 
 
 def validate_release_runtime_subset(archive_paths: list[str], runtime_paths: list[str]) -> None:
@@ -428,7 +463,7 @@ def validate_release_workflow(
         raise ValueError("release workflow runtime_paths are not synchronized")
     validate_release_paths_exist_and_safe(archive_paths, "archive_paths")
     validate_release_paths_exist_and_safe(runtime_paths, "runtime_paths")
-    validate_public_artifact_marker()
+    validate_public_artifact_marker(contract)
     validate_release_runtime_subset(archive_paths, runtime_paths)
     tracked = tracked_paths()
     require_release_paths_tracked(archive_paths, tracked, "archive_paths")
@@ -443,6 +478,7 @@ def validate_required_files() -> None:
         "AGENTS.md",
         "VERSION",
         "README.md",
+        ".claude/CLAUDE.md",
         "build/version.json",
         "build/manifest.json",
         "config/nddev-contract.json",
@@ -1953,6 +1989,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("tested Junie CLI version differs from baseline release")
     validate_baseline(baseline, contract)
     validate_required_files()
+    validate_claude_import_bridge()
     manager = load_manager()
     validate_production_source()
     with injected_bootstrap_lock_root(manager):
