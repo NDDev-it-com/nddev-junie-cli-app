@@ -48,13 +48,19 @@ non-private managed target directories fail before network access.
 
 ## Launch Isolation
 
-`launch` checks the stamp and refuses drift before spawning the target-owned Junie
-shim. The child process
-gets an isolated `HOME`, `USERPROFILE`, `JUNIE_DATA`, `JUNIE_LOG_DIR`, JVM
-`user.home`, config, skill, agent, MCP, command, hook, extension cache,
-guidelines, cache, and temp scope under the managed target. Provider credential
-variables are stripped, and the manager fails closed if the account `~/.junie`
-metadata changes.
+`launch` takes the target-internal lifecycle lock before preflight and holds it
+until the child process exits, the post-launch live-home guard completes, and the
+lock is cleaned up. Lifecycle mutations such as `install`, `switch`, `update`,
+`migrate`, `restore`, and `remove` fail closed while a managed launch is running.
+
+Before spawning the target-owned Junie shim, `launch` checks the stamp, refuses
+drift, captures the target-owned shim and pinned Junie binary path, inode, size,
+and SHA256, and revalidates those identities immediately before child execution.
+The child process gets an isolated `HOME`, `USERPROFILE`, `JUNIE_DATA`,
+`JUNIE_LOG_DIR`, JVM `user.home`, config, skill, agent, MCP, command, hook,
+extension cache, guidelines, cache, and temp scope under the managed target.
+Provider credential variables are stripped, and the manager fails closed if the
+account `~/.junie` metadata changes.
 
 Subprocesses receive a fixed minimal `PATH`; installer and hook interpreters are
 resolved to absolute trusted executables by the manager.

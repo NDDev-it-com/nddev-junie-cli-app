@@ -43,7 +43,11 @@ source, fixture, or timeout overrides. Only the target-owned runtime under
 minimal subprocess `PATH` and bind `JUNIE_DATA`, `JUNIE_LOG_DIR`, official
 default-location controls, cache/temp paths, and JVM `user.home` to target-owned
 or stage-owned directories; the manager fails closed if the account `~/.junie`
-metadata changes.
+metadata changes. Managed launch holds the target-internal lifecycle lock through
+child completion and post-launch live-home validation, so lifecycle mutations are
+denied while the launched Junie process is running. The target-owned shim and
+pinned Junie binary identity are captured during launch preflight and revalidated
+immediately before child execution.
 
 ## Setups
 

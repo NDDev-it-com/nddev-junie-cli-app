@@ -173,6 +173,26 @@ class LiveJunieHomeSnapshot:
     is_symlink: bool = False
 
 
+@dataclass(frozen=True)
+class LaunchFileSnapshot:
+    label: str
+    relative_path: str
+    device: int
+    inode: int
+    size: int
+    sha256: str
+    max_bytes: int
+
+
+@dataclass(frozen=True)
+class LaunchPlan:
+    command: list[str]
+    child_env: dict[str, str]
+    cwd: Path
+    shim: LaunchFileSnapshot
+    binary: LaunchFileSnapshot
+
+
 @dataclass
 class DirectoryTransaction:
     created: list[Path]
@@ -1234,6 +1254,106 @@ def runtime_regular_file(
             repairable=False,
         )
     return info
+
+
+def require_runtime_parent_chain(path: Path, target: Path, label: str) -> None:
+    if target not in path.parents:
+        runtime_fail(f"{label} escaped managed target", code="escaped_target", repairable=False)
+    current = target
+    try:
+        relative_parent = path.relative_to(target).parent
+    except ValueError:
+        runtime_fail(f"{label} escaped managed target", code="escaped_target", repairable=False)
+    for part in relative_parent.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            runtime_fail(
+                f"{label} parent is missing",
+                code=f"{label_slug(label)}_parent_missing",
+                repairable=True,
+            )
+        try:
+            require_current_owner(info, f"{label} parent")
+        except JunieCliSetupError as exc:
+            runtime_fail(str(exc), code=f"{label_slug(label)}_parent_owner", repairable=False)
+        if stat.S_ISLNK(info.st_mode):
+            runtime_fail(
+                f"{label} parent must not be a symlink",
+                code=f"{label_slug(label)}_parent_symlink",
+                repairable=False,
+            )
+        if not stat.S_ISDIR(info.st_mode):
+            runtime_fail(
+                f"{label} parent must be a directory",
+                code=f"{label_slug(label)}_parent_type",
+                repairable=False,
+            )
+
+
+def capture_launch_file_snapshot(
+    target: Path,
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+) -> LaunchFileSnapshot:
+    require_runtime_parent_chain(path, target, label)
+    info = runtime_regular_file(path, target, label, repairable=False)
+    if not os.access(path, os.X_OK):
+        runtime_fail(
+            f"{label} is not executable",
+            code=f"{label_slug(label)}_mode",
+            repairable=False,
+        )
+    return LaunchFileSnapshot(
+        label=label,
+        relative_path=relative_to_target(target, path),
+        device=info.st_dev,
+        inode=info.st_ino,
+        size=info.st_size,
+        sha256=sha256_file_bounded(path, max_bytes=max_bytes, label=label),
+        max_bytes=max_bytes,
+    )
+
+
+def revalidate_launch_file_snapshot(target: Path, snapshot: LaunchFileSnapshot) -> None:
+    path = safe_target_path(target, snapshot.relative_path)
+    require_runtime_parent_chain(path, target, snapshot.label)
+    info = runtime_regular_file(path, target, snapshot.label, repairable=False)
+    if not os.access(path, os.X_OK):
+        runtime_fail(
+            f"{snapshot.label} is not executable",
+            code=f"{label_slug(snapshot.label)}_mode",
+            repairable=False,
+        )
+    if (
+        info.st_dev != snapshot.device
+        or info.st_ino != snapshot.inode
+        or info.st_size != snapshot.size
+    ):
+        runtime_fail(
+            f"{snapshot.label} changed after launch preflight",
+            code=f"{label_slug(snapshot.label)}_identity_changed",
+            repairable=False,
+        )
+    current_sha256 = sha256_file_bounded(
+        path,
+        max_bytes=snapshot.max_bytes,
+        label=snapshot.label,
+    )
+    if current_sha256 != snapshot.sha256:
+        runtime_fail(
+            f"{snapshot.label} digest changed after launch preflight",
+            code=f"{label_slug(snapshot.label)}_digest_changed",
+            repairable=False,
+        )
+
+
+def revalidate_launch_artifacts(plan: LaunchPlan) -> None:
+    revalidate_launch_file_snapshot(plan.cwd, plan.shim)
+    revalidate_launch_file_snapshot(plan.cwd, plan.binary)
 
 
 def resolve_junie_binary(version_dir: Path, target: Path) -> Path:
@@ -2461,98 +2581,145 @@ def child_args_use_target_scope_overrides(child_args: list[str]) -> str | None:
     return None
 
 
-def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict[str, str], Path]:
+def build_launch_plan_locked(target: Path, child_args: list[str]) -> LaunchPlan:
+    target = validate_target(target, create=False)
+    status = status_payload(target)
+    if not status["managed"]:
+        fail("launch requires a managed target")
+    if not status.get("launchable"):
+        fail("launch requires a migrated schema 3 target")
+    if status["drift"]:
+        fail(f"managed target has drift: {', '.join(status['drift'])}")
+    canonical = validate_target(target, create=False)
+    metadata = current_software_metadata(canonical)
+    home = runtime_home(canonical)
+    data = runtime_data(canonical)
+    cache = runtime_cache(canonical)
+    tmp = runtime_tmp(canonical)
+    ensure_private_directory(cache, canonical, "runtime cache")
+    ensure_private_directory(tmp, canonical, "runtime tmp")
+    child_env = sanitized_subprocess_env(home, data, tmp)
+    child_env.update(
+        {
+            "JUNIE_CONFIG_LOCATION": str((canonical / "config.json").resolve()),
+            "JUNIE_CONFIG_DEFAULT_LOCATIONS": "false",
+            "JUNIE_PROJECT": str(canonical),
+            "JUNIE_SKILL_LOCATIONS": str((canonical / "skills").resolve()),
+            "JUNIE_SKILL_DEFAULT_LOCATIONS": "false",
+            "JUNIE_AGENT_LOCATIONS": str((canonical / "agents").resolve()),
+            "JUNIE_AGENT_DEFAULT_LOCATIONS": "false",
+            "JUNIE_COMMAND_LOCATIONS": str((canonical / "commands").resolve()),
+            "JUNIE_COMMAND_DEFAULT_LOCATIONS": "false",
+            "JUNIE_MCP_LOCATIONS": str((canonical / "mcp").resolve()),
+            "JUNIE_MCP_DEFAULT_LOCATIONS": "false",
+            "JUNIE_MODEL_DEFAULT_LOCATIONS": "false",
+            "JUNIE_EXTENSIONS_DEFAULT_LOCATION": str(
+                (canonical / "extensions" / "cache").resolve()
+            ),
+            "JUNIE_GUIDELINES_FILENAME": str((canonical / "AGENTS.md").resolve()),
+        }
+    )
+    if not isinstance(metadata.get("shim"), dict) or not isinstance(metadata.get("binary"), dict):
+        fail("Junie software metadata is invalid")
+    shim_relative = metadata["shim"].get("path")
+    binary_relative = metadata["binary"].get("path")
+    if not isinstance(shim_relative, str) or not isinstance(binary_relative, str):
+        fail("Junie software metadata path is invalid")
+    shim_path = safe_target_path(canonical, shim_relative)
+    binary_path = safe_target_path(canonical, binary_relative)
+    command = [str(shim_path)]
+    if "--skip-update-check" not in child_args:
+        command.append("--skip-update-check")
+    command.extend(
+        [
+            "--project",
+            str(canonical),
+            "--config-location",
+            str((canonical / "config.json").resolve()),
+            "--config-default-locations",
+            "false",
+            "--guidelines-filename",
+            str((canonical / "AGENTS.md").resolve()),
+            "--mcp-location",
+            str((canonical / "mcp").resolve()),
+            "--mcp-default-locations",
+            "false",
+            "--skill-location",
+            str((canonical / "skills").resolve()),
+            "--skill-default-locations",
+            "false",
+            "--agent-location",
+            str((canonical / "agents").resolve()),
+            "--agent-default-location",
+            "false",
+            "--command-location",
+            str((canonical / "commands").resolve()),
+            "--command-default-locations",
+            "false",
+            "--model-default-locations",
+            "false",
+            "--extensions-default-location",
+            str((canonical / "extensions" / "cache").resolve()),
+            "--cache-dir",
+            str(cache),
+        ]
+    )
+    command.extend(child_args)
+    shim = capture_launch_file_snapshot(
+        canonical,
+        shim_path,
+        "Junie shim",
+        max_bytes=MANAGED_MAX_BYTES,
+    )
+    binary = capture_launch_file_snapshot(
+        canonical,
+        binary_path,
+        "Junie binary",
+        max_bytes=SOFTWARE_FILE_MAX_BYTES,
+    )
+    if shim.sha256 != metadata["shim"].get("sha256"):
+        runtime_fail(
+            "Junie shim digest changed after software validation",
+            code="junie_shim_digest_changed",
+            repairable=False,
+        )
+    expected_binary_size = metadata["binary"].get("size")
+    expected_binary_sha256 = metadata["binary"].get("sha256")
+    if binary.size != expected_binary_size or binary.sha256 != expected_binary_sha256:
+        runtime_fail(
+            "Junie binary changed after software validation",
+            code="junie_binary_changed",
+            repairable=False,
+        )
+    return LaunchPlan(
+        command=command,
+        child_env=child_env,
+        cwd=canonical,
+        shim=shim,
+        binary=binary,
+    )
+
+
+def launch(target: Path, child_args: list[str]) -> int:
     override = child_args_use_target_scope_overrides(child_args)
     if override is not None:
         fail(f"{override} is managed by the target launch environment")
     with target_lock(target, create_parent=False):
-        target = validate_target(target, create=False)
-        status = status_payload(target)
-        if not status["managed"]:
-            fail("launch requires a managed target")
-        if not status.get("launchable"):
-            fail("launch requires a migrated schema 3 target")
-        if status["drift"]:
-            fail(f"managed target has drift: {', '.join(status['drift'])}")
-        canonical = validate_target(target, create=False)
-        metadata = current_software_metadata(canonical)
-        home = runtime_home(canonical)
-        data = runtime_data(canonical)
-        cache = runtime_cache(canonical)
-        tmp = runtime_tmp(canonical)
-        ensure_private_directory(cache, canonical, "runtime cache")
-        ensure_private_directory(tmp, canonical, "runtime tmp")
-        child_env = sanitized_subprocess_env(home, data, tmp)
-        child_env.update(
-            {
-                "JUNIE_CONFIG_LOCATION": str((canonical / "config.json").resolve()),
-                "JUNIE_CONFIG_DEFAULT_LOCATIONS": "false",
-                "JUNIE_PROJECT": str(canonical),
-                "JUNIE_SKILL_LOCATIONS": str((canonical / "skills").resolve()),
-                "JUNIE_SKILL_DEFAULT_LOCATIONS": "false",
-                "JUNIE_AGENT_LOCATIONS": str((canonical / "agents").resolve()),
-                "JUNIE_AGENT_DEFAULT_LOCATIONS": "false",
-                "JUNIE_COMMAND_LOCATIONS": str((canonical / "commands").resolve()),
-                "JUNIE_COMMAND_DEFAULT_LOCATIONS": "false",
-                "JUNIE_MCP_LOCATIONS": str((canonical / "mcp").resolve()),
-                "JUNIE_MCP_DEFAULT_LOCATIONS": "false",
-                "JUNIE_MODEL_DEFAULT_LOCATIONS": "false",
-                "JUNIE_EXTENSIONS_DEFAULT_LOCATION": str(
-                    (canonical / "extensions" / "cache").resolve()
-                ),
-                "JUNIE_GUIDELINES_FILENAME": str((canonical / "AGENTS.md").resolve()),
-            }
-        )
-        command = [str(canonical / metadata["shim"]["path"])]
-        if "--skip-update-check" not in child_args:
-            command.append("--skip-update-check")
-        command.extend(
-            [
-                "--project",
-                str(canonical),
-                "--config-location",
-                str((canonical / "config.json").resolve()),
-                "--config-default-locations",
-                "false",
-                "--guidelines-filename",
-                str((canonical / "AGENTS.md").resolve()),
-                "--mcp-location",
-                str((canonical / "mcp").resolve()),
-                "--mcp-default-locations",
-                "false",
-                "--skill-location",
-                str((canonical / "skills").resolve()),
-                "--skill-default-locations",
-                "false",
-                "--agent-location",
-                str((canonical / "agents").resolve()),
-                "--agent-default-location",
-                "false",
-                "--command-location",
-                str((canonical / "commands").resolve()),
-                "--command-default-locations",
-                "false",
-                "--model-default-locations",
-                "false",
-                "--extensions-default-location",
-                str((canonical / "extensions" / "cache").resolve()),
-                "--cache-dir",
-                str(cache),
-            ]
-        )
-        command.extend(child_args)
-        return command, child_env, canonical
-
-
-def launch(target: Path, child_args: list[str]) -> int:
-    command, child_env, cwd = prepare_launch(target, child_args)
-    live_before = snapshot_live_junie_home()
-    try:
-        completed = subprocess.run(command, cwd=cwd, env=child_env, check=False)
-    except FileNotFoundError:
-        fail("target-owned Junie command was not found")
-    require_live_junie_home_unchanged(live_before, context="Junie launch")
-    return int(completed.returncode)
+        plan = build_launch_plan_locked(target, child_args)
+        live_before = snapshot_live_junie_home()
+        revalidate_launch_artifacts(plan)
+        try:
+            completed = subprocess.run(
+                plan.command,
+                cwd=plan.cwd,
+                env=plan.child_env,
+                check=False,
+            )
+        except FileNotFoundError:
+            fail("target-owned Junie command was not found")
+        finally:
+            require_live_junie_home_unchanged(live_before, context="Junie launch")
+        return int(completed.returncode)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

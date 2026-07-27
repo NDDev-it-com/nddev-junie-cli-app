@@ -17,7 +17,9 @@
     "logs": "target-owned JUNIE_LOG_DIR",
     "java": "target-owned JVM user.home and java.io.tmpdir",
     "default_locations": "disabled through official Junie CLI flags and environment variables",
-    "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches"
+    "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
+    "launch_lock": "target-internal lifecycle lock stays held from launch preflight through child completion, post-launch live-home assertion, and cleanup",
+    "pre_child_artifact_revalidation": "target-owned Junie shim and pinned Junie binary path, inode, size, and SHA256 are revalidated immediately before child execution"
   },
   "nddev_builder_projection_version": "0.2.0",
   "public_validator": "cli-tools/validate_public_contracts.py"
