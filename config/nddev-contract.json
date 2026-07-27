@@ -10,9 +10,11 @@
     "stamp_schema": 2,
     "legacy_stamp_schema_readable": 1,
     "default_target": null,
-    "environment_variable": "NDDEV_JUNIE_TARGET",
+    "environment_variable": null,
     "managed_directory_mode": "0700",
     "managed_file_mode": "0600",
+    "lock_directory": "<target>/.nddev-junie-cli.lock",
+    "backup_directory": "<target>/.nddev-junie-cli-backups",
     "preserve_other_state": true,
     "control_root": "explicit --target, also passed as Junie --project",
     "runtime_home": "<target>/.nddev-junie-cli-runtime/home",
@@ -61,7 +63,9 @@
     "max_backups": 10,
     "launch_requires_clean_managed_target": true,
     "launch_requires_schema_2": true,
-    "launch_strips_provider_credentials": true
+    "launch_strips_provider_credentials": true,
+    "lock_and_backup_roots_inside_private_target": true,
+    "subprocess_path": "/usr/bin:/bin:/usr/sbin:/sbin"
   },
   "software_lifecycle": {
     "installer_url": "https://junie.jetbrains.com/install.sh",
@@ -73,6 +77,8 @@
     "update_repairs_safe_partial": true,
     "update_command": "python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json",
     "installer_execution_home": "isolated staging HOME",
+    "source_overrides": false,
+    "test_environment_overrides": false,
     "persisted_runtime": ".nddev-junie-cli-runtime/home",
     "status_executes_target_binary": false,
     "stage_version_probe_only": true
@@ -91,7 +97,7 @@
     "direct_command": ["junie", "--skip-update-check"],
     "manager_command": "python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target --",
     "required_version": "2383.10",
-    "environment_variable": "NDDEV_JUNIE_TARGET",
+    "environment_variable": null,
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
     "streams_child_stdio": true,

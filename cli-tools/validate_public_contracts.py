@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import shlex
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -221,6 +224,161 @@ def validate_manager_parse(manager: Any) -> None:
     manager.parse_args(["launch", "--target", "/tmp/target", "--", "--version"])
 
 
+def expect_manager_failure(label: str, callback: Any) -> None:
+    try:
+        callback()
+    except Exception as exc:
+        if exc.__class__.__name__ == "JunieCliSetupError":
+            return
+        raise ValueError(f"{label}: unexpected exception {exc!r}") from exc
+    raise ValueError(f"{label}: expected fail-closed manager rejection")
+
+
+def validate_production_source() -> None:
+    source = (ROOT / "cli-tools" / "nddev_junie_cli.py").read_text(encoding="utf-8")
+    forbidden_literals = [
+        "ALLOW_TEST",
+        "TEST_INSTALLER",
+        "INSTALLER_URL",
+        "INSTALLER_SHA256",
+        "UPDATE_INFO_URL",
+        "VERIFY_ARTIFACT_SHA256",
+        "INSTALL_TIMEOUT_SECONDS\"",
+        "PROBE_TIMEOUT_SECONDS\"",
+        "test_override_enabled",
+        "env_timeout_seconds",
+        "fixture override",
+        "artifact fixture",
+    ]
+    present = sorted(literal for literal in forbidden_literals if literal in source)
+    if present:
+        raise ValueError(
+            "production manager exposes test/source/timeout switch literals: "
+            + ", ".join(present)
+        )
+    if "os.environ.get(\"NDDEV_" in source or "os.environ['NDDEV_" in source:
+        raise ValueError("production manager must not read NDDEV_* environment overrides")
+    allowed_child_env = {
+        'env["NDDEV_JUNIE_EXPECTED_ARTIFACT_SHA256"] = artifact["sha256"]',
+        'env["NDDEV_JUNIE_EXPECTED_ARTIFACT_SIZE"] = str(artifact["size"])',
+    }
+    nddev_lines = {
+        line.strip()
+        for line in source.splitlines()
+        if "NDDEV_" in line and not line.strip().startswith("#")
+    }
+    if nddev_lines != allowed_child_env:
+        raise ValueError("production manager has unexpected NDDEV_* environment surface")
+    if '["bash",' in source or "'bash'," in source:
+        raise ValueError("installer must use an absolute trusted shell, not PATH lookup")
+    if '"PATH": os.environ' in source or "'PATH': os.environ" in source:
+        raise ValueError("subprocess PATH must not inherit the ambient user PATH")
+
+
+def validate_adversarial_smokes(manager: Any) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-security-") as raw:
+        root = Path(raw)
+        target = root / "target"
+        target.mkdir(mode=0o700)
+
+        open_target = root / "open-target"
+        open_target.mkdir(mode=0o777)
+        try:
+            expect_manager_failure(
+                "0777 target",
+                lambda: manager.validate_target(open_target, create=False),
+            )
+        finally:
+            os.chmod(open_target, 0o700)
+
+        lock_target = root / "lock-target"
+        lock_target.mkdir(mode=0o700)
+        external_lock = root / "external-lock"
+        external_lock.mkdir(mode=0o700)
+        (lock_target / manager.LOCK_DIR_NAME).symlink_to(external_lock)
+        expect_manager_failure(
+            "symlink lock path",
+            lambda: manager.target_lock(lock_target, create_parent=False).__enter__(),
+        )
+
+        prelocked = root / "prelocked"
+        prelocked.mkdir(mode=0o700)
+        (prelocked / manager.LOCK_DIR_NAME).mkdir(mode=0o700)
+        expect_manager_failure(
+            "precreated lock path",
+            lambda: manager.target_lock(prelocked, create_parent=False).__enter__(),
+        )
+
+        backup_target = root / "backup-target"
+        backup_target.mkdir(mode=0o700)
+        external_backup = root / "external-backup"
+        external_backup.mkdir(mode=0o700)
+        (backup_target / manager.BACKUP_DIR_NAME).symlink_to(external_backup)
+        expect_manager_failure(
+            "symlink backup pool",
+            lambda: manager.choose_backup_slot(manager.backup_pool(backup_target)),
+        )
+
+        slot_target = root / "slot-target"
+        slot_target.mkdir(mode=0o700)
+        pool = slot_target / manager.BACKUP_DIR_NAME
+        pool.mkdir(mode=0o700)
+        slot = pool / "0"
+        slot.mkdir(mode=0o777)
+        try:
+            expect_manager_failure(
+                "precreated shared backup slot",
+                lambda: manager.choose_backup_slot(pool),
+            )
+        finally:
+            os.chmod(slot, 0o700)
+
+        marker_target = root / "marker-target"
+        marker_target.mkdir(mode=0o700)
+        marker = marker_target / "external-marker.txt"
+        marker.write_text("keep\n", encoding="utf-8")
+        managed = marker_target / "config.json"
+        manager.atomic_write(managed, b"{}\n", marker_target)
+        snapshot = manager.snapshot_files(marker_target, ["config.json"])
+        managed.unlink()
+        manager.restore_snapshot(marker_target, snapshot)
+        if marker.read_text(encoding="utf-8") != "keep\n":
+            raise ValueError("external marker was not preserved by restore snapshot")
+
+        old_path = os.environ.get("PATH")
+        fake_bin = root / "fake-bin"
+        fake_bin.mkdir(mode=0o700)
+        (fake_bin / "python3").write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        os.chmod(fake_bin / "python3", 0o700)
+        os.environ["PATH"] = str(fake_bin)
+        try:
+            env = manager.sanitized_subprocess_env(
+                root / "home", root / "home" / ".local" / "share" / "junie", root / "tmp"
+            )
+            if env["PATH"] != manager.SAFE_SUBPROCESS_PATH:
+                raise ValueError("subprocess env inherited fake PATH")
+            config = manager.render_config(target, manager.load_setup(DEFAULT_SETUP_ID))
+            hook_command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            hook_exe = Path(shlex.split(hook_command)[0])
+            if not hook_exe.is_absolute() or hook_exe.parent == fake_bin:
+                raise ValueError("hook command used a PATH-selected interpreter")
+        finally:
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+
+    sticky_parent = Path("/tmp")
+    if sticky_parent.is_dir() and (stat.S_IMODE(sticky_parent.stat().st_mode) & stat.S_ISVTX):
+        target = sticky_parent / f"nddev-junie-validator-{os.getpid()}-{id(manager)}"
+        with manager.target_lock(target, create_parent=True):
+            canonical = manager.validate_target(target, create=False)
+            if stat.S_IMODE(canonical.lstat().st_mode) & 0o077:
+                raise ValueError("sticky-temp target was not created private")
+        canonical = manager.validate_target(target, create=False)
+        canonical.rmdir()
+
+
 def main(argv: list[str] | None = None) -> int:
     parse_args(argv)
     version = load_version()
@@ -252,8 +410,10 @@ def main(argv: list[str] | None = None) -> int:
     validate_baseline(baseline, contract)
     validate_required_files()
     manager = load_manager()
+    validate_production_source()
     validate_generated_files(manager, version)
     validate_manager_parse(manager)
+    validate_adversarial_smokes(manager)
     validate_workflows()
     print("validate_public_contracts.py: PASS")
     return 0

@@ -15,6 +15,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -37,10 +38,14 @@ STAMP_SCHEMA = 2
 LEGACY_STAMP_SCHEMA = 1
 RUNTIME_DIR_NAME = ".nddev-junie-cli-runtime"
 RUNTIME_RECEIPT_NAME = "NDDEV-JUNIE-CLI-RUNTIME.json"
+LOCK_DIR_NAME = ".nddev-junie-cli.lock"
+BACKUP_DIR_NAME = ".nddev-junie-cli-backups"
 MANAGED_BEGIN = "<!-- BEGIN NDDEV-JUNIE-CLI MANAGED -->"
 MANAGED_END = "<!-- END NDDEV-JUNIE-CLI MANAGED -->"
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
+OWNER_EXECUTABLE_MODE = 0o700
+SAFE_SUBPROCESS_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 MANAGED_MAX_BYTES = 8 * 1024 * 1024
 METADATA_MAX_BYTES = 256 * 1024
 INSTALLER_MAX_BYTES = 2 * 1024 * 1024
@@ -283,13 +288,6 @@ def read_path_bounded(path: Path, *, max_bytes: int, label: str) -> bytes:
 
 def read_url_bounded(url: str, *, max_bytes: int, label: str) -> bytes:
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme in ("", "file"):
-        if os.environ.get("NDDEV_JUNIE_ALLOW_TEST_INSTALLER") != "1":
-            fail(f"{label} must use the official HTTPS source")
-        path = Path(urllib.request.url2pathname(parsed.path) if parsed.scheme else url)
-        if not path.is_absolute():
-            fail(f"{label} fixture path must be absolute")
-        return read_path_bounded(path, max_bytes=max_bytes, label=label)
     if parsed.scheme != "https":
         fail(f"{label} must use HTTPS")
     request = urllib.request.Request(url, headers={"User-Agent": PRODUCT_NAME})
@@ -329,42 +327,13 @@ def load_baseline() -> dict[str, Any]:
     return read_json_file(BASELINE_PATH, max_bytes=METADATA_MAX_BYTES, label="baseline")
 
 
-def test_override_enabled() -> bool:
-    return os.environ.get("NDDEV_JUNIE_ALLOW_TEST_INSTALLER") == "1"
-
-
 def installer_source(baseline: dict[str, Any]) -> tuple[str, str]:
     installer = baseline["release"]["installer"]
-    official_url = installer["url"]
-    official_sha256 = installer["sha256"]
-    url = os.environ.get("NDDEV_JUNIE_INSTALLER_URL", official_url)
-    expected_sha256 = os.environ.get("NDDEV_JUNIE_INSTALLER_SHA256", official_sha256)
-    if (url != official_url or expected_sha256 != official_sha256) and not test_override_enabled():
-        fail("unofficial Junie installer override is disabled")
-    return url, expected_sha256
+    return installer["url"], installer["sha256"]
 
 
 def update_info_source(baseline: dict[str, Any]) -> str:
-    official_url = baseline["release"]["update_info"]
-    url = os.environ.get("NDDEV_JUNIE_UPDATE_INFO_URL", official_url)
-    if url != official_url and not test_override_enabled():
-        fail("unofficial Junie update metadata override is disabled")
-    return url
-
-
-def env_timeout_seconds(name: str, default: int, label: str) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    if not test_override_enabled():
-        fail(f"{label} timeout override is disabled")
-    try:
-        value = int(raw)
-    except ValueError:
-        fail(f"{label} timeout override is invalid")
-    if value <= 0:
-        fail(f"{label} timeout override must be positive")
-    return value
+    return baseline["release"]["update_info"]
 
 
 def current_platform_id() -> str:
@@ -417,7 +386,6 @@ def artifact_metadata_from_update_info(
     missing = sorted(set(expected) - set(matches))
     if missing:
         fail(f"update-info is missing Junie {version} artifacts: {', '.join(missing)}")
-    strict_official = not test_override_enabled()
     for platform_id, artifact in expected.items():
         row = matches[platform_id]
         common_expected = {
@@ -428,21 +396,14 @@ def artifact_metadata_from_update_info(
         for key, expected_value in common_expected.items():
             if row.get(key) != expected_value:
                 fail(f"update-info {platform_id} {key} does not match the baseline")
-        if strict_official:
-            exact_expected = {
-                "downloadUrl": artifact["download_url"],
-                "sha256": artifact["sha256"],
-                "size": artifact["size"],
-            }
-            for key, expected_value in exact_expected.items():
-                if row.get(key) != expected_value:
-                    fail(f"update-info {platform_id} {key} does not match the baseline")
-        elif (
-            not isinstance(row.get("downloadUrl"), str)
-            or not isinstance(row.get("sha256"), str)
-            or not isinstance(row.get("size"), int)
-        ):
-            fail(f"update-info {platform_id} test artifact metadata is invalid")
+        exact_expected = {
+            "downloadUrl": artifact["download_url"],
+            "sha256": artifact["sha256"],
+            "size": artifact["size"],
+        }
+        for key, expected_value in exact_expected.items():
+            if row.get(key) != expected_value:
+                fail(f"update-info {platform_id} {key} does not match the baseline")
     platform_id = current_platform_id()
     if platform_id not in expected:
         fail(f"Junie {version} artifact is not pinned for {platform_id}")
@@ -459,28 +420,7 @@ def artifact_metadata_from_update_info(
 def verify_artifact_binding(artifact: dict[str, Any]) -> dict[str, Any]:
     url = str(artifact["download_url"])
     expected_size = int(artifact["size"])
-    expected_sha256 = str(artifact["sha256"])
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme in ("", "file"):
-        if not test_override_enabled():
-            fail("Junie artifact fixture override is disabled")
-        path = Path(urllib.request.url2pathname(parsed.path) if parsed.scheme else url)
-        if not path.is_absolute():
-            fail("Junie artifact fixture path must be absolute")
-        info = stat_existing(path, "Junie artifact fixture")
-        if info is None:
-            fail("Junie artifact fixture is missing")
-        require_current_owner(info, "Junie artifact fixture")
-        if not stat.S_ISREG(info.st_mode):
-            fail("Junie artifact fixture must be a regular file")
-        if info.st_size != expected_size:
-            fail("Junie artifact fixture size does not match update-info")
-        actual_sha256 = sha256_file_bounded(
-            path, max_bytes=expected_size + 1, label="Junie artifact fixture"
-        )
-        if actual_sha256 != expected_sha256:
-            fail("Junie artifact fixture SHA256 does not match update-info")
-        return {"size_verified": True, "sha256_verified": True, "method": "file"}
     if parsed.scheme != "https":
         fail("Junie artifact URL must use HTTPS")
     if parsed.netloc.lower() != "github.com" or not parsed.path.startswith("/JetBrains/junie/"):
@@ -500,13 +440,6 @@ def verify_artifact_binding(artifact: dict[str, Any]) -> dict[str, Any]:
             fail("Junie artifact Content-Length is invalid")
         if declared != expected_size:
             fail("Junie artifact Content-Length does not match update-info")
-    if os.environ.get("NDDEV_JUNIE_VERIFY_ARTIFACT_SHA256") == "1":
-        data = read_url_bounded(url, max_bytes=expected_size + 1, label="Junie artifact")
-        if len(data) != expected_size:
-            fail("Junie artifact download size does not match update-info")
-        if sha256_bytes(data) != expected_sha256:
-            fail("Junie artifact SHA256 does not match update-info")
-        return {"size_verified": True, "sha256_verified": True, "method": "download"}
     return {"size_verified": True, "sha256_verified": False, "method": "head"}
 
 
@@ -536,9 +469,13 @@ def current_user_id() -> int | None:
     return int(getuid())
 
 
-def require_current_owner(info: os.stat_result, label: str) -> None:
+def is_current_owner(info: os.stat_result) -> bool:
     uid = current_user_id()
-    if uid is not None and info.st_uid != uid:
+    return uid is None or info.st_uid == uid
+
+
+def require_current_owner(info: os.stat_result, label: str) -> None:
+    if not is_current_owner(info):
         fail(f"{label} must be owned by the current user")
 
 
@@ -564,9 +501,11 @@ def ensure_directory_chain(path: Path, transaction: DirectoryTransaction, label:
         if parent == current:
             fail(f"{label} parent is missing")
         current = parent
+    require_safe_target_parent(current, label)
     for directory in reversed(missing):
         directory.mkdir(mode=OWNER_DIRECTORY_MODE)
         transaction.created.append(directory)
+        require_private_directory(directory, label)
 
 
 def require_real_directory(path: Path, label: str) -> os.stat_result:
@@ -586,16 +525,166 @@ def require_private_directory(path: Path, label: str) -> os.stat_result:
     return info
 
 
-def require_not_shared_writable(path: Path, label: str) -> os.stat_result:
-    info = require_real_directory(path, label)
-    if stat.S_IMODE(info.st_mode) & 0o022:
-        fail(f"{label} must not be group- or world-writable")
-    return info
+def require_safe_target_parent(path: Path, label: str) -> os.stat_result:
+    info = stat_existing(path, label)
+    if info is None:
+        fail(f"{label} is missing")
+    if not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a directory")
+    mode = stat.S_IMODE(info.st_mode)
+    if is_current_owner(info) and not (mode & 0o022):
+        return info
+    if (mode & stat.S_ISVTX) and (mode & 0o002):
+        return info
+    fail(f"{label} must be current-user-owned private or sticky")
+
+
+def resolve_parent_allowing_missing(path: Path) -> Path:
+    missing: list[str] = []
+    current = path
+    while True:
+        try:
+            resolved = current.resolve(strict=True)
+        except FileNotFoundError:
+            if current.parent == current:
+                fail(f"path parent is missing: {path}")
+            missing.append(current.name)
+            current = current.parent
+            continue
+        result = resolved
+        for part in reversed(missing):
+            result = result / part
+        return result
+
+
+def canonicalize_target_parent(target: Path) -> Path:
+    return resolve_parent_allowing_missing(target.parent) / target.name
+
+
+def ensure_private_directory(path: Path, target: Path, label: str) -> None:
+    if target not in path.parents and path != target:
+        fail(f"{label} escaped managed target")
+    info = stat_existing(path, label)
+    if info is None:
+        path.mkdir(mode=OWNER_DIRECTORY_MODE)
+        require_private_directory(path, label)
+        return
+    require_private_directory(path, label)
+
+
+def safe_rmtree_private_directory(path: Path, label: str) -> None:
+    require_private_directory(path, label)
+    shutil.rmtree(path)
+
+
+def safe_rmtree_private_directory_if_exists(path: Path, label: str) -> None:
+    if lstat_exists(path):
+        safe_rmtree_private_directory(path, label)
+
+
+def chmod_private_directory(path: Path, mode: int, label: str) -> None:
+    require_real_directory(path, label)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def trusted_executable(candidates: tuple[Path, ...], label: str) -> Path:
+    uid = current_user_id()
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            info = resolved.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
+            continue
+        if uid is not None and info.st_uid not in (0, uid):
+            continue
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            continue
+        trusted = True
+        for parent in resolved.parents:
+            try:
+                parent_info = parent.lstat()
+            except OSError:
+                trusted = False
+                break
+            parent_mode = stat.S_IMODE(parent_info.st_mode)
+            if not stat.S_ISDIR(parent_info.st_mode):
+                trusted = False
+                break
+            if uid is not None and parent_info.st_uid not in (0, uid):
+                trusted = False
+                break
+            if parent_mode & 0o022:
+                trusted = False
+                break
+        if trusted:
+            return resolved
+    fail(f"{label} executable is unavailable from trusted absolute paths")
+
+
+def trusted_bash() -> Path:
+    return trusted_executable((Path("/bin/bash"), Path("/usr/bin/bash")), "bash")
+
+
+def trusted_python() -> Path:
+    candidates = tuple(
+        dict.fromkeys(
+            [
+                Path("/usr/bin/python3"),
+                Path("/opt/homebrew/bin/python3"),
+                Path("/usr/local/bin/python3"),
+                Path(sys.executable),
+            ]
+        )
+    )
+    return trusted_executable(candidates, "python3")
+
+
+def create_lock_directory(path: Path, transaction: DirectoryTransaction) -> None:
+    try:
+        path.mkdir(mode=OWNER_DIRECTORY_MODE)
+    except FileExistsError:
+        try:
+            info = stat_existing(path, "target lock")
+            if info is not None:
+                require_current_owner(info, "target lock")
+                if not stat.S_ISDIR(info.st_mode):
+                    fail("target lock must be a directory")
+                if stat.S_IMODE(info.st_mode) & 0o077:
+                    fail("target lock must be private")
+        finally:
+            transaction.cleanup()
+        fail(f"target is locked: {path}")
+    except BaseException:
+        transaction.cleanup()
+        fail(f"target is locked: {path}")
+    require_private_directory(path, "target lock")
+
+
+def remove_lock_directory(path: Path) -> None:
+    try:
+        require_private_directory(path, "target lock")
+        path.rmdir()
+    except (FileNotFoundError, OSError, JunieCliSetupError):
+        pass
 
 
 def validate_target(
     target: Path, *, create: bool = False, transaction: DirectoryTransaction | None = None
 ) -> Path:
+    target = canonicalize_target_parent(target)
     parent = target.parent
     if create:
         ensure_directory_chain(parent, transaction or DirectoryTransaction([]), "target parent")
@@ -606,14 +695,18 @@ def validate_target(
         return target.resolve(strict=False)
     if not stat.S_ISDIR(parent_info.st_mode):
         fail("target parent must be a directory")
-    require_not_shared_writable(parent, "target parent")
+    require_safe_target_parent(parent, "target parent")
     info = stat_existing(target, "target")
     if info is None:
         if not create:
             return target.resolve(strict=False)
-        target.mkdir(mode=OWNER_DIRECTORY_MODE)
+        try:
+            target.mkdir(mode=OWNER_DIRECTORY_MODE)
+        except FileExistsError:
+            fail("target appeared during creation")
         if transaction is not None:
             transaction.created.append(target)
+        require_private_directory(target, "target")
         return target.resolve()
     if not stat.S_ISDIR(info.st_mode):
         fail("target must be a real directory")
@@ -622,11 +715,11 @@ def validate_target(
 
 
 def backup_pool(target: Path) -> Path:
-    return target.parent / f".{target.name}.nddev-junie-cli-backups"
+    return target / BACKUP_DIR_NAME
 
 
 def lock_path(target: Path) -> Path:
-    return target.parent / f".{target.name}.nddev-junie-cli.lock"
+    return target / LOCK_DIR_NAME
 
 
 def runtime_root(target: Path) -> Path:
@@ -661,19 +754,13 @@ def runtime_receipt_path(target: Path) -> Path:
 def target_lock(target: Path, *, create_parent: bool = False):
     transaction = DirectoryTransaction([])
     if create_parent:
-        ensure_directory_chain(target.parent, transaction, "target parent")
+        canonical = validate_target(target, create=True, transaction=transaction)
     else:
-        require_real_directory(target.parent, "target parent")
-    require_not_shared_writable(target.parent, "target parent")
-    path = lock_path(target)
-    try:
-        path.mkdir(mode=OWNER_DIRECTORY_MODE)
-    except FileExistsError:
-        transaction.cleanup()
-        fail(f"target is locked: {path}")
-    except BaseException:
-        transaction.cleanup()
-        fail(f"target is locked: {path}")
+        canonical = validate_target(target, create=False)
+        if not lstat_exists(canonical):
+            fail("target is missing")
+    path = lock_path(canonical)
+    create_lock_directory(path, transaction)
     failed = False
     try:
         yield transaction
@@ -681,8 +768,7 @@ def target_lock(target: Path, *, create_parent: bool = False):
         failed = True
         raise
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            path.rmdir()
+        remove_lock_directory(path)
         if failed:
             transaction.cleanup()
 
@@ -771,9 +857,9 @@ def atomic_write(path: Path, data: bytes, target: Path, *, mode: int = OWNER_FIL
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), mode)
             handle.write(data)
         os.replace(temporary, path)
-        path.chmod(mode)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
@@ -905,7 +991,7 @@ def quoted(value: Path | str) -> str:
 def render_config(target: Path, setup: dict[str, Any]) -> dict[str, Any]:
     canonical = validate_target(target, create=False)
     hook_command = (
-        f"python3 {quoted(canonical / 'hooks' / 'nddev-builder-context.py')} "
+        f"{quoted(trusted_python())} {quoted(canonical / 'hooks' / 'nddev-builder-context.py')} "
         f"--target {quoted(canonical)}"
     )
     return {
@@ -1160,7 +1246,7 @@ def ensure_current_symlink(target: Path, version: str) -> None:
     if info is not None:
         require_current_owner(info, "Junie current link")
         if stat.S_ISDIR(info.st_mode):
-            shutil.rmtree(current)
+            safe_rmtree_private_directory(current, "Junie current directory")
         else:
             current.unlink()
     current.symlink_to(desired)
@@ -1204,15 +1290,14 @@ def read_runtime_receipt(target: Path, baseline: dict[str, Any]) -> dict[str, An
         runtime_fail(
             "runtime receipt artifact is invalid", code="runtime_receipt_artifact", repairable=True
         )
-    if not test_override_enabled():
-        expected_artifact = dict(baseline["release"]["exact_artifacts"][current_platform_id()])
-        expected_artifact["platform"] = current_platform_id()
-        if artifact != expected_artifact:
-            runtime_fail(
-                "runtime receipt artifact does not match the baseline",
-                code="runtime_receipt_artifact",
-                repairable=True,
-            )
+    expected_artifact = dict(baseline["release"]["exact_artifacts"][current_platform_id()])
+    expected_artifact["platform"] = current_platform_id()
+    if artifact != expected_artifact:
+        runtime_fail(
+            "runtime receipt artifact does not match the baseline",
+            code="runtime_receipt_artifact",
+            repairable=True,
+        )
     verification = receipt.get("artifact_verification")
     if not isinstance(verification, dict) or verification.get("size_verified") is not True:
         runtime_fail(
@@ -1364,7 +1449,7 @@ def sanitized_subprocess_env(home: Path, data: Path, tmp: Path) -> dict[str, str
         "XDG_STATE_HOME": str(home / ".local" / "state"),
         "JDK_JAVA_OPTIONS": java_options,
         "JAVA_TOOL_OPTIONS": java_options,
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": SAFE_SUBPROCESS_PATH,
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     for name in ("TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT"):
@@ -1380,14 +1465,17 @@ def write_stage_installer(stage: Path, installer_bytes: bytes) -> Path:
     installer = stage / "install.sh"
     fd = os.open(installer, os.O_WRONLY | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
     with os.fdopen(fd, "wb") as handle:
+        os.fchmod(handle.fileno(), OWNER_EXECUTABLE_MODE)
         handle.write(installer_bytes)
-    installer.chmod(0o700)
     return installer
 
 
 def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> None:
+    stage_root = stage_home.parent
+    require_private_directory(stage_root, "stage root")
+    require_private_directory(stage_home, "stage home")
     tmp = stage_home.parent / "probe-tmp"
-    tmp.mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
+    ensure_private_directory(tmp, stage_root, "stage probe tmp")
     cache = stage_home.parent / "probe-cache"
     skills = stage_home / "skills"
     agents = stage_home / "agents"
@@ -1395,7 +1483,7 @@ def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> Non
     mcp = stage_home / "mcp"
     extensions = stage_home / "extensions-cache"
     for directory in (cache, skills, agents, commands, mcp, extensions):
-        directory.mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
+        ensure_private_directory(directory, stage_root, f"stage probe directory {directory.name}")
     config = stage_home / "config.json"
     if not lstat_exists(config):
         atomic_write(config, b"{}\n", stage_home)
@@ -1481,16 +1569,6 @@ def build_runtime_receipt(
 
 
 def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str, Any]:
-    install_timeout = env_timeout_seconds(
-        "NDDEV_JUNIE_INSTALL_TIMEOUT_SECONDS",
-        INSTALL_TIMEOUT_SECONDS,
-        "Junie installer",
-    )
-    probe_timeout = env_timeout_seconds(
-        "NDDEV_JUNIE_PROBE_TIMEOUT_SECONDS",
-        PROBE_TIMEOUT_SECONDS,
-        "Junie version probe",
-    )
     installer_url, expected_installer_sha256 = installer_source(baseline)
     update_info_url = update_info_source(baseline)
     installer_bytes = read_url_bounded(
@@ -1513,13 +1591,13 @@ def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str
     live_before = snapshot_live_junie_home()
     try:
         completed = subprocess.run(
-            ["bash", str(installer_path)],
+            [str(trusted_bash()), str(installer_path)],
             cwd=stage,
             env=env,
             text=True,
             capture_output=True,
             check=False,
-            timeout=install_timeout,
+            timeout=INSTALL_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as exc:
         fail(f"Junie installer shell is missing: {exc}")
@@ -1535,7 +1613,7 @@ def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str
         fail("Junie installer output did not confirm update-info checksum binding")
     if "Checksum verified" not in installer_output:
         fail("Junie installer output did not confirm artifact checksum verification")
-    run_stage_version_probe(stage_home, baseline["release"]["exact_version"], probe_timeout)
+    run_stage_version_probe(stage_home, baseline["release"]["exact_version"], PROBE_TIMEOUT_SECONDS)
     return {
         "installer_url": installer_url,
         "installer_sha256": expected_installer_sha256,
@@ -1567,6 +1645,7 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
         runtime_private_directory(runtime_home(target), target, "runtime home", repairable=False)
     if root_info is None:
         root.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True)
+        runtime_private_directory(root, target, "runtime root", repairable=False)
     stage = root / f".install-stage.{os.getpid()}.{time.time_ns()}"
     old_home = root / f".home-old.{os.getpid()}.{time.time_ns()}"
     stage.mkdir(mode=OWNER_DIRECTORY_MODE)
@@ -1582,14 +1661,10 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
             previous_home = old_home
         staged_home.rename(runtime_home(target))
         ensure_current_symlink(target, baseline["release"]["exact_version"])
-        for directory in (
-            runtime_root(target),
-            runtime_home(target),
-            runtime_cache(target),
-            runtime_tmp(target),
-        ):
-            directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
-            directory.chmod(OWNER_DIRECTORY_MODE)
+        ensure_private_directory(runtime_root(target), target, "runtime root")
+        ensure_private_directory(runtime_home(target), target, "runtime home")
+        ensure_private_directory(runtime_cache(target), target, "runtime cache")
+        ensure_private_directory(runtime_tmp(target), target, "runtime tmp")
         atomic_write(
             runtime_receipt_path(target),
             canonical_json(install_result["receipt"]),
@@ -1599,13 +1674,13 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             if lstat_exists(runtime_home(target)) and previous_home is not None:
-                shutil.rmtree(runtime_home(target))
+                safe_rmtree_private_directory(runtime_home(target), "runtime home")
         if previous_home is not None and lstat_exists(previous_home):
             previous_home.rename(runtime_home(target))
-        shutil.rmtree(stage, ignore_errors=True)
+        safe_rmtree_private_directory_if_exists(stage, "software install stage")
         prune_empty_runtime_dirs(target)
         raise
-    shutil.rmtree(stage, ignore_errors=True)
+    safe_rmtree_private_directory_if_exists(stage, "software install stage")
     return SoftwareTransaction(
         metadata=metadata,
         changed=True,
@@ -1616,14 +1691,14 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
 
 def commit_software_transaction(transaction: SoftwareTransaction) -> None:
     if transaction.previous_home is not None and lstat_exists(transaction.previous_home):
-        shutil.rmtree(transaction.previous_home, ignore_errors=True)
+        safe_rmtree_private_directory(transaction.previous_home, "previous runtime home")
 
 
 def rollback_software_transaction(target: Path, transaction: SoftwareTransaction) -> None:
     if not transaction.changed:
         return
     if transaction.new_home is not None and lstat_exists(transaction.new_home):
-        shutil.rmtree(transaction.new_home, ignore_errors=True)
+        safe_rmtree_private_directory(transaction.new_home, "new runtime home")
     if transaction.previous_home is not None and lstat_exists(transaction.previous_home):
         transaction.previous_home.rename(runtime_home(target))
     prune_empty_runtime_dirs(target)
@@ -1641,7 +1716,7 @@ def begin_runtime_remove(target: Path) -> RuntimeRemoveTransaction:
 
 def commit_runtime_remove(transaction: RuntimeRemoveTransaction) -> None:
     if transaction.removed_root is not None:
-        shutil.rmtree(transaction.removed_root, ignore_errors=True)
+        safe_rmtree_private_directory(transaction.removed_root, "removed runtime root")
 
 
 def rollback_runtime_remove(target: Path, transaction: RuntimeRemoveTransaction) -> None:
@@ -1649,7 +1724,7 @@ def rollback_runtime_remove(target: Path, transaction: RuntimeRemoveTransaction)
         if lstat_exists(runtime_root(target)):
             info = runtime_root(target).lstat()
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                shutil.rmtree(runtime_root(target), ignore_errors=True)
+                safe_rmtree_private_directory(runtime_root(target), "runtime root")
             else:
                 runtime_root(target).unlink()
         transaction.removed_root.rename(runtime_root(target))
@@ -1815,7 +1890,7 @@ def restore_transaction_snapshot(target: Path, snapshot: TransactionSnapshot) ->
     prune_empty_managed_dirs(target, list(snapshot.files))
     if snapshot.target_existed and snapshot.target_mode is not None:
         with contextlib.suppress(FileNotFoundError):
-            target.chmod(snapshot.target_mode)
+            chmod_private_directory(target, snapshot.target_mode, "target")
     if not snapshot.target_existed:
         with contextlib.suppress(OSError):
             target.rmdir()
@@ -1835,7 +1910,11 @@ def restore_snapshot(target: Path, snapshot: dict[str, bytes | None]) -> None:
 def choose_backup_slot(pool: Path) -> int:
     info = stat_existing(pool, "backup pool")
     if info is None:
-        pool.mkdir(mode=OWNER_DIRECTORY_MODE)
+        try:
+            pool.mkdir(mode=OWNER_DIRECTORY_MODE)
+        except FileExistsError:
+            fail("backup pool appeared during creation")
+        require_private_directory(pool, "backup pool")
     else:
         require_current_owner(info, "backup pool")
         if not stat.S_ISDIR(info.st_mode):
@@ -1862,9 +1941,12 @@ def create_backup(target: Path, stamp: dict[str, Any]) -> int:
     slot = choose_backup_slot(pool)
     slot_dir = pool / str(slot)
     if lstat_exists(slot_dir):
-        require_private_directory(slot_dir, f"backup slot {slot}")
-        shutil.rmtree(slot_dir)
-    slot_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
+        safe_rmtree_private_directory(slot_dir, f"backup slot {slot}")
+    try:
+        slot_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
+    except FileExistsError:
+        fail(f"backup slot {slot} appeared during creation")
+    require_private_directory(slot_dir, f"backup slot {slot}")
     files: dict[str, Any] = {}
     for relative in unique_relatives([*stamp_managed_relatives(stamp), STAMP_NAME]):
         data = read_existing_file(
@@ -1954,8 +2036,9 @@ def write_setup_locked(
     allow_legacy_migration: bool = False,
     directory_transaction: DirectoryTransaction | None = None,
 ) -> dict[str, Any]:
-    target_existed = lstat_exists(target)
-    validate_target(target, create=True, transaction=directory_transaction)
+    target = validate_target(target, create=True, transaction=directory_transaction)
+    created_paths = [] if directory_transaction is None else directory_transaction.created
+    target_existed = target not in created_paths
     current = read_stamp(target)
     if require_existing and current is None:
         fail("switch requires an already managed target")
@@ -2038,7 +2121,7 @@ def write_setup(
 
 def update_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
     with target_lock(target, create_parent=False) as directory_transaction:
-        validate_target(target, create=False)
+        target = validate_target(target, create=False)
         if not lstat_exists(target):
             fail("update requires an already managed target")
         current = read_stamp(target)
@@ -2056,7 +2139,7 @@ def update_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
 
 def migrate_setup(target: Path, setup_id: str | None) -> dict[str, Any]:
     with target_lock(target, create_parent=False) as directory_transaction:
-        validate_target(target, create=False)
+        target = validate_target(target, create=False)
         if not lstat_exists(target):
             fail("migrate requires an already managed target")
         current = read_stamp(target)
@@ -2090,7 +2173,9 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
     if slot < 0 or slot > 9:
         fail("backup slot must be between 0 and 9")
     with target_lock(target, create_parent=True) as directory_transaction:
-        validate_target(target, create=True, transaction=directory_transaction)
+        target = validate_target(target, create=True, transaction=directory_transaction)
+        require_private_directory(backup_pool(target), "backup pool")
+        require_private_directory(backup_pool(target) / str(slot), f"backup slot {slot}")
         envelope_path = backup_pool(target) / str(slot) / BACKUP_NAME
         envelope = read_json_file(envelope_path, max_bytes=METADATA_MAX_BYTES, label=BACKUP_NAME)
         if envelope.get("product_name") != PRODUCT_NAME:
@@ -2140,7 +2225,7 @@ def remove_setup(target: Path) -> dict[str, Any]:
     if not lstat_exists(target.parent) or not lstat_exists(target):
         return {"removed_setup_id": None, "target": str(validate_target(target, create=False))}
     with target_lock(target, create_parent=False):
-        validate_target(target, create=False)
+        target = validate_target(target, create=False)
         stamp = read_stamp(target)
         if stamp is None:
             return {"removed_setup_id": None, "target": str(validate_target(target, create=False))}
@@ -2260,6 +2345,7 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
     if override is not None:
         fail(f"{override} is managed by the target launch environment")
     with target_lock(target, create_parent=False):
+        target = validate_target(target, create=False)
         status = status_payload(target)
         if not status["managed"]:
             fail("launch requires a managed target")
@@ -2273,8 +2359,8 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
         data = runtime_data(canonical)
         cache = runtime_cache(canonical)
         tmp = runtime_tmp(canonical)
-        for directory in (cache, tmp):
-            directory.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+        ensure_private_directory(cache, canonical, "runtime cache")
+        ensure_private_directory(tmp, canonical, "runtime tmp")
         child_env = sanitized_subprocess_env(home, data, tmp)
         child_env.update(
             {
@@ -2294,7 +2380,6 @@ def prepare_launch(target: Path, child_args: list[str]) -> tuple[list[str], dict
                     (canonical / "extensions" / "cache").resolve()
                 ),
                 "JUNIE_GUIDELINES_FILENAME": str((canonical / "AGENTS.md").resolve()),
-                "NDDEV_JUNIE_TARGET": str(canonical),
             }
         )
         command = [str(canonical / metadata["shim"]["path"])]

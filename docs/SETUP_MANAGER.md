@@ -16,6 +16,8 @@
 - `.nddev-junie-cli-runtime/home/.junie/allowlist.json`
 - target-owned Junie shim under the isolated runtime home
 - pinned Junie version directory under the isolated runtime data root
+- `.nddev-junie-cli.lock`
+- `.nddev-junie-cli-backups/`
 - `NDDEV-JUNIE-CLI-SETUP.json`
 
 Schema-2 `config.json`, `AGENTS.md`, and the runtime allowlist are complete
@@ -34,6 +36,9 @@ probe must report the pinned version with target-owned Junie log/data/cache path
 official default-location controls disabled, and JVM `user.home` isolated before
 the runtime is moved under the target.
 
+Public commands always use pinned official sources and production timeouts. They do
+not honor env-based source, fixture, artificial-failure, or timeout switches.
+
 Healthy target-owned software is not reinstalled by `install`. Use `update` to
 repair a safe partial runtime. Unsafe target path types, symlinks, hardlinks, and
 non-private managed target directories fail before network access.
@@ -47,6 +52,9 @@ gets an isolated `HOME`, `USERPROFILE`, `JUNIE_DATA`, `JUNIE_LOG_DIR`, JVM
 guidelines, cache, and temp scope under the managed target. Provider credential
 variables are stripped, and the manager fails closed if the account `~/.junie`
 metadata changes.
+
+Subprocesses receive a fixed minimal `PATH`; installer and hook interpreters are
+resolved to absolute trusted executables by the manager.
 
 `--skip-update-check` is added unless the caller already supplied it.
 
