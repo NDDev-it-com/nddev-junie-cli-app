@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import contextlib
 import hashlib
 import json
@@ -160,6 +161,13 @@ class SoftwareTransaction:
 class RuntimeRemoveTransaction:
     changed: bool
     removed_root: Path | None = None
+
+
+@dataclass(frozen=True)
+class BackupRestorePlan:
+    files: dict[str, bytes]
+    stamp: dict[str, Any]
+    relatives: list[str]
 
 
 @dataclass(frozen=True)
@@ -2156,6 +2164,160 @@ def create_backup(target: Path, stamp: dict[str, Any]) -> int:
     return slot
 
 
+def require_backup_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        fail(f"{label} is invalid")
+    return value
+
+
+def require_backup_int(value: Any, label: str) -> int:
+    if type(value) is not int:
+        fail(f"{label} is invalid")
+    return value
+
+
+def require_backup_optional_string(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        fail(f"{label} is invalid")
+    return value
+
+
+def parse_backup_stamp(target: Path, data: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"backup stamp is invalid JSON: {exc}")
+    if not isinstance(value, dict):
+        fail("backup stamp must contain a JSON object")
+    if value.get("product_name") != PRODUCT_NAME:
+        fail("backup stamp belongs to another product")
+    schema = value.get("schema_version")
+    if schema not in (*LEGACY_STAMP_SCHEMAS, STAMP_SCHEMA):
+        fail("backup stamp schema is unsupported")
+    if not isinstance(value.get("build_version"), str) or not value.get("build_version"):
+        fail("backup stamp build_version is invalid")
+    setup_id = value.get("setup_id")
+    if not isinstance(setup_id, str):
+        fail("backup stamp setup_id is invalid")
+    if schema == STAMP_SCHEMA:
+        if setup_id not in SETUP_ORDER:
+            fail("backup stamp setup_id is unsupported")
+        if value.get("profile_id") not in PROFILE_ORDER:
+            fail("backup stamp profile_id is unsupported")
+    elif setup_id not in LEGACY_SETUP_IDS:
+        fail("legacy backup stamp setup_id is unsupported")
+    if value.get("canonical_target") != str(validate_target(target, create=False)):
+        fail("backup stamp is bound to a different canonical target")
+    managed = value.get("managed_files")
+    if not isinstance(managed, dict):
+        fail("backup stamp managed_files is invalid")
+    for relative, expected in managed.items():
+        if not isinstance(relative, str) or not isinstance(expected, str) or not expected:
+            fail("backup stamp managed file digest is invalid")
+        safe_target_path(target, relative)
+    if not isinstance(value.get("software"), dict):
+        fail("backup stamp software is invalid")
+    return value
+
+
+def decode_backup_payload(relative: str, encoded: Any) -> bytes:
+    if not isinstance(encoded, str):
+        fail("backup file payload is invalid")
+    try:
+        data = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        fail("backup file payload is invalid")
+    if len(data) > MANAGED_MAX_BYTES:
+        fail("backup file payload is too large")
+    return data
+
+
+def validate_backup_envelope_scalars(
+    target: Path,
+    slot: int,
+    envelope: dict[str, Any],
+) -> None:
+    if envelope.get("schema_version") != 2:
+        fail("backup schema is unsupported")
+    if envelope.get("product_name") != PRODUCT_NAME:
+        fail("backup belongs to another product")
+    require_backup_string(envelope.get("build_version"), "backup build_version")
+    if require_backup_int(envelope.get("slot"), "backup slot") != slot:
+        fail("backup slot does not match the requested slot")
+    if envelope.get("canonical_target") != str(validate_target(target, create=False)):
+        fail("backup is bound to a different canonical target")
+    require_backup_string(envelope.get("source_setup_id"), "backup source_setup_id")
+    require_backup_optional_string(
+        envelope.get("source_profile_id"), "backup source_profile_id"
+    )
+    require_backup_optional_string(
+        envelope.get("source_legacy_setup_id"), "backup source_legacy_setup_id"
+    )
+    require_backup_int(envelope.get("created_at"), "backup created_at")
+    if not isinstance(envelope.get("files"), dict):
+        fail("backup files are invalid")
+
+
+def build_backup_restore_plan(target: Path, slot: int, envelope: dict[str, Any]) -> BackupRestorePlan:
+    validate_backup_envelope_scalars(target, slot, envelope)
+    files = envelope["files"]
+    decoded: dict[str, bytes] = {}
+    for relative, encoded in files.items():
+        if not isinstance(relative, str):
+            fail("backup file paths are invalid")
+        safe_target_path(target, relative)
+        decoded[relative] = decode_backup_payload(relative, encoded)
+    stamp_payload = decoded.get(STAMP_NAME)
+    if stamp_payload is None:
+        fail("backup stamp payload is missing")
+    stamp = parse_backup_stamp(target, stamp_payload)
+    expected_relatives = unique_relatives([*stamp_managed_relatives(stamp), STAMP_NAME])
+    if sorted(decoded) != expected_relatives:
+        fail("backup file paths do not match the backup stamp")
+    if envelope["source_setup_id"] != stamp["setup_id"]:
+        fail("backup source_setup_id does not match the backup stamp")
+    if envelope["source_profile_id"] != stamp_profile_id(stamp):
+        fail("backup source_profile_id does not match the backup stamp")
+    expected_legacy_setup_id = stamp["setup_id"] if is_legacy_stamp(stamp) else None
+    if envelope["source_legacy_setup_id"] != expected_legacy_setup_id:
+        fail("backup source_legacy_setup_id does not match the backup stamp")
+    legacy = stamp.get("schema_version") == LEGACY_STAMP_SCHEMA
+    for relative, expected in stamp["managed_files"].items():
+        digest = managed_digest_for_bytes(relative, decoded[relative], legacy=legacy)
+        if digest != expected:
+            fail("backup payload digest does not match the backup stamp")
+    try:
+        current_software = current_software_metadata(target)
+    except JunieCliSetupError as exc:
+        fail(f"backup target software is not restorable: {exc}")
+    if current_software != stamp["software"]:
+        fail("backup software does not match current target runtime")
+    return BackupRestorePlan(files=decoded, stamp=stamp, relatives=expected_relatives)
+
+
+def validate_restored_backup_state(target: Path, expected_stamp: dict[str, Any]) -> dict[str, Any]:
+    restored_stamp = read_stamp(target)
+    if restored_stamp != expected_stamp:
+        fail("restored stamp does not match the backup stamp")
+    drift = drift_for_stamp(target, restored_stamp)
+    if drift:
+        fail(f"restored target has drift: {', '.join(drift)}")
+    return restored_stamp
+
+
+def validate_snapshot_restored(target: Path, snapshot: dict[str, bytes | None]) -> None:
+    for relative, expected in snapshot.items():
+        current = read_existing_file(
+            safe_target_path(target, relative),
+            max_bytes=MANAGED_MAX_BYTES,
+            label=relative,
+        )
+        if current != expected:
+            fail("restore rollback did not restore the previous target state")
+
+
 def build_stamp(
     target: Path,
     setup_id: str,
@@ -2390,42 +2552,24 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
         require_private_directory(backup_pool(target) / str(slot), f"backup slot {slot}")
         envelope_path = backup_pool(target) / str(slot) / BACKUP_NAME
         envelope = read_json_file(envelope_path, max_bytes=METADATA_MAX_BYTES, label=BACKUP_NAME)
-        if envelope.get("product_name") != PRODUCT_NAME:
-            fail("backup belongs to another product")
-        if envelope.get("canonical_target") != str(validate_target(target, create=False)):
-            fail("backup is bound to a different canonical target")
-        files = envelope.get("files")
-        if not isinstance(files, dict):
-            fail("backup files are invalid")
+        plan = build_backup_restore_plan(target, slot, envelope)
         current_stamp = read_stamp(target)
         current_relatives = [] if current_stamp is None else stamp_managed_relatives(current_stamp)
-        envelope_relatives = [relative for relative in files if isinstance(relative, str)]
-        if len(envelope_relatives) != len(files):
-            fail("backup file paths are invalid")
-        for relative in envelope_relatives:
-            safe_target_path(target, relative)
-        restore_relatives = unique_relatives([*current_relatives, *envelope_relatives])
+        restore_relatives = unique_relatives([*current_relatives, *plan.relatives])
         snapshot = snapshot_files(target, restore_relatives)
         try:
             for relative in current_relatives:
-                if relative not in files:
+                if relative not in plan.files:
                     with contextlib.suppress(FileNotFoundError):
                         safe_target_path(target, relative).unlink()
-            for relative in unique_relatives([*envelope_relatives, STAMP_NAME]):
-                encoded = files.get(relative)
-                path = safe_target_path(target, relative)
-                if encoded is None:
-                    with contextlib.suppress(FileNotFoundError):
-                        path.unlink()
-                    continue
-                if not isinstance(encoded, str):
-                    fail("backup file payload is invalid")
-                atomic_write(path, base64.b64decode(encoded.encode("ascii")), target)
+            for relative in plan.relatives:
+                atomic_write(safe_target_path(target, relative), plan.files[relative], target)
             prune_empty_managed_dirs(target, restore_relatives)
+            restored_stamp = validate_restored_backup_state(target, plan.stamp)
         except BaseException:
             restore_snapshot(target, snapshot)
+            validate_snapshot_restored(target, snapshot)
             raise
-        restored_stamp = read_stamp(target)
         return {
             "setup_id": None if restored_stamp is None else stamp_setup_id(restored_stamp),
             "profile_id": None if restored_stamp is None else stamp_profile_id(restored_stamp),

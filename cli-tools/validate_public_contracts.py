@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -761,6 +763,120 @@ def validate_legacy_mapping_migration(manager: Any) -> None:
     with_fake_software(manager, run)
 
 
+def target_file_bytes(target: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    for path in sorted(target.rglob("*")):
+        relative = str(path.relative_to(target))
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            files[relative] = ("SYMLINK:" + os.readlink(path)).encode("utf-8")
+        elif stat.S_ISREG(info.st_mode):
+            files[relative] = path.read_bytes()
+    return files
+
+
+def write_backup_envelope(manager: Any, target: Path, envelope: dict[str, Any]) -> None:
+    path = manager.backup_pool(target) / "0" / manager.BACKUP_NAME
+    manager.atomic_write(path, manager.canonical_json(envelope), target)
+
+
+def restore_corruption_target(manager: Any, root: Path) -> Path:
+    target = root / "target"
+    setup = manager.load_setup(DEFAULT_SETUP_ID)
+    manager.write_setup(target, setup, manager.load_profile("safe"))
+    switched = manager.write_setup(
+        target,
+        setup,
+        manager.load_profile("full-auto"),
+        require_existing=True,
+    )
+    if switched["backup_slot"] != 0:
+        raise ValueError("restore regression did not create backup slot 0")
+    return manager.validate_target(target, create=False)
+
+
+def read_backup_envelope(manager: Any, target: Path) -> dict[str, Any]:
+    path = manager.backup_pool(target) / "0" / manager.BACKUP_NAME
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def expect_restore_failure_byte_identical(
+    manager: Any,
+    label: str,
+    mutate: Any,
+    *,
+    use_main: bool = False,
+) -> None:
+    def run() -> None:
+        with tempfile.TemporaryDirectory(prefix=f"nddev-junie-restore-{label}-") as raw:
+            target = restore_corruption_target(manager, Path(raw))
+            envelope = read_backup_envelope(manager, target)
+            mutate(envelope)
+            write_backup_envelope(manager, target, envelope)
+            before = target_file_bytes(target)
+            if use_main:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = manager.main(
+                        [
+                            "restore",
+                            "--backup",
+                            "0",
+                            "--target",
+                            str(target),
+                            "--json",
+                        ]
+                    )
+                if code != 2:
+                    raise ValueError(f"{label}: restore did not return rc 2")
+                payload = json.loads(stdout.getvalue())
+                if not isinstance(payload.get("error"), str) or not payload["error"]:
+                    raise ValueError(f"{label}: restore did not emit a JSON domain error")
+            else:
+                expect_manager_failure(label, lambda: manager.restore_backup(target, 0))
+            after = target_file_bytes(target)
+            if after != before:
+                raise ValueError(f"{label}: failed restore changed target bytes")
+
+    with_fake_software(manager, run)
+
+
+def validate_restore_backup_fail_closed(manager: Any) -> None:
+    def invalid_base64(envelope: dict[str, Any]) -> None:
+        envelope["files"]["AGENTS.md"] = "!!!!"
+
+    def non_ascii_payload(envelope: dict[str, Any]) -> None:
+        envelope["files"]["AGENTS.md"] = "snowman: \u2603"
+
+    def digest_mismatch(envelope: dict[str, Any]) -> None:
+        envelope["files"]["AGENTS.md"] = base64.b64encode(b"tampered\n").decode("ascii")
+
+    def invalid_path(envelope: dict[str, Any]) -> None:
+        envelope["files"]["../escape"] = base64.b64encode(b"x\n").decode("ascii")
+
+    expect_restore_failure_byte_identical(
+        manager,
+        "invalid backup base64",
+        invalid_base64,
+        use_main=True,
+    )
+    expect_restore_failure_byte_identical(
+        manager,
+        "non-ascii backup payload",
+        non_ascii_payload,
+    )
+    expect_restore_failure_byte_identical(
+        manager,
+        "backup digest mismatch",
+        digest_mismatch,
+    )
+    expect_restore_failure_byte_identical(
+        manager,
+        "invalid backup path",
+        invalid_path,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parse_args(argv)
     version = load_version()
@@ -821,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
     validate_profile_switch_lifecycle(manager)
     validate_launch_lock_concurrency(manager)
     validate_legacy_mapping_migration(manager)
+    validate_restore_backup_fail_closed(manager)
     validate_workflows()
     print("validate_public_contracts.py: PASS")
     return 0
