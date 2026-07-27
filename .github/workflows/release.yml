@@ -3,8 +3,29 @@ name: release
 on:
   push:
     tags:
-      - "v*"
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  publish:
+    name: Publish attested immutable release
+    permissions:
+      contents: write # Create the immutable release and upload exact assets.
+      id-token: write # Authenticate keyless signing through GitHub OIDC.
+      attestations: write # Publish build provenance for release assets.
+      artifact-metadata: write # Record artifact metadata for the published release.
     uses: NDDev-it-com/ci-workflows/.github/workflows/release-supply-chain.yml@2ccb80e96f5771b6a6b4eae63a4f47e232906dc7 # 0.12.0
+    with:
+      version: ${{ github.ref_name }}
+      package_name: nddev-junie-cli-app
+      archive_paths: >-
+        AGENTS.md LICENSE README.md VERSION .gds .github build cli-tools config
+        builder profiles setups references docs
+      runtime_paths: >-
+        AGENTS.md LICENSE README.md VERSION build cli-tools config builder
+        profiles setups references docs

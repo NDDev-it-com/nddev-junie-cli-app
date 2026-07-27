@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -36,6 +37,36 @@ REQUIRED_WORKFLOWS = {
     "secret-scan.yml": ".github/workflows/secret-scan.yml",
     "zizmor.yml": ".github/workflows/zizmor-sarif.yml",
 }
+RELEASE_ARCHIVE_PATHS = [
+    "AGENTS.md",
+    "LICENSE",
+    "README.md",
+    "VERSION",
+    ".gds",
+    ".github",
+    "build",
+    "cli-tools",
+    "config",
+    "builder",
+    "profiles",
+    "setups",
+    "references",
+    "docs",
+]
+RELEASE_RUNTIME_PATHS = [
+    "AGENTS.md",
+    "LICENSE",
+    "README.md",
+    "VERSION",
+    "build",
+    "cli-tools",
+    "config",
+    "builder",
+    "profiles",
+    "setups",
+    "references",
+    "docs",
+]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -117,6 +148,165 @@ def validate_workflows() -> None:
         text = path.read_text(encoding="utf-8")
         if text.count(expected) != 1:
             raise ValueError(f"{filename}: missing exact shared CI caller")
+
+
+def tracked_paths() -> set[str]:
+    completed = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return {
+        item.decode("utf-8")
+        for item in completed.stdout.split(b"\0")
+        if item
+    }
+
+
+def release_input_paths(value: str, label: str) -> list[str]:
+    paths = value.split()
+    if not paths:
+        raise ValueError(f"release workflow {label} must not be empty")
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"release workflow {label} contains duplicate paths")
+    for path in paths:
+        if path.startswith("/") or ".." in Path(path).parts:
+            raise ValueError(f"release workflow {label} contains an unsafe path: {path}")
+    return paths
+
+
+def parse_release_inputs(text: str) -> dict[str, str]:
+    lines = text.splitlines()
+    inputs: dict[str, str] = {}
+    index = 0
+    in_with = False
+    while index < len(lines):
+        line = lines[index]
+        if line == "    with:":
+            in_with = True
+            index += 1
+            continue
+        if not in_with:
+            index += 1
+            continue
+        if not line.startswith("      "):
+            break
+        stripped = line.strip()
+        if not stripped or ":" not in stripped:
+            index += 1
+            continue
+        key, value = stripped.split(":", 1)
+        value = value.strip()
+        if value == ">-":
+            index += 1
+            parts: list[str] = []
+            while index < len(lines) and lines[index].startswith("        "):
+                parts.append(lines[index].strip())
+                index += 1
+            inputs[key] = " ".join(part for part in parts if part)
+            continue
+        inputs[key] = value
+        index += 1
+    return inputs
+
+
+def path_is_tracked(path: str, tracked: set[str]) -> bool:
+    full = ROOT / path
+    if not full.exists():
+        return False
+    if full.is_file():
+        return path in tracked
+    if full.is_dir():
+        prefix = f"{path}/"
+        return any(item.startswith(prefix) for item in tracked)
+    return False
+
+
+def require_release_paths_tracked(paths: list[str], tracked: set[str], label: str) -> None:
+    missing = [path for path in paths if not path_is_tracked(path, tracked)]
+    if missing:
+        raise ValueError(
+            f"release workflow {label} paths must exist and be tracked: {', '.join(missing)}"
+        )
+
+
+def path_covered(required: str, roots: list[str]) -> bool:
+    return any(required == root or required.startswith(f"{root}/") for root in roots)
+
+
+def validate_release_runtime_closure(
+    runtime_paths: list[str],
+    contract: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    required = {
+        "AGENTS.md",
+        "LICENSE",
+        "README.md",
+        "VERSION",
+        "build",
+        "builder",
+        "cli-tools",
+        "config",
+        "docs",
+        "profiles",
+        "references",
+        "setups",
+        str(contract["manifest_ref"]),
+        str(contract["version_ref"]),
+        str(manifest["manager"]),
+        str(manifest["contract"]),
+        str(manifest["runtime_baseline"]),
+        str(contract["setup_system"]["catalog_root"]),
+        str(contract["permission_profiles"]["catalog_root"]),
+    }
+    missing = sorted(path for path in required if not path_covered(path, runtime_paths))
+    if missing:
+        raise ValueError(
+            "release workflow runtime_paths do not cover contract runtime paths: "
+            + ", ".join(missing)
+        )
+
+
+def validate_release_workflow(
+    version: str,
+    contract: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    path = ROOT / ".github" / "workflows" / "release.yml"
+    text = path.read_text(encoding="utf-8")
+    if '- "[0-9]+.[0-9]+.[0-9]+"' not in text:
+        raise ValueError("release workflow must use numeric stable release tags")
+    if "\npermissions: {}\n" not in text:
+        raise ValueError("release workflow must set top-level permissions to {}")
+    expected_permissions = {
+        "contents: write",
+        "id-token: write",
+        "attestations: write",
+        "artifact-metadata: write",
+    }
+    for permission in expected_permissions:
+        if text.count(permission) != 1:
+            raise ValueError(f"release workflow missing job permission: {permission}")
+    inputs = parse_release_inputs(text)
+    if inputs.get("version") != "${{ github.ref_name }}":
+        raise ValueError("release workflow must pass version from github.ref_name")
+    if inputs.get("package_name") != contract["product_name"]:
+        raise ValueError("release workflow package_name must match the product")
+    archive_paths = release_input_paths(inputs.get("archive_paths", ""), "archive_paths")
+    runtime_paths = release_input_paths(inputs.get("runtime_paths", ""), "runtime_paths")
+    if archive_paths != RELEASE_ARCHIVE_PATHS:
+        raise ValueError("release workflow archive_paths are not synchronized")
+    if runtime_paths != RELEASE_RUNTIME_PATHS:
+        raise ValueError("release workflow runtime_paths are not synchronized")
+    tracked = tracked_paths()
+    require_release_paths_tracked(archive_paths, tracked, "archive_paths")
+    require_release_paths_tracked(runtime_paths, tracked, "runtime_paths")
+    validate_release_runtime_closure(runtime_paths, contract, manifest)
+    if any(value == version for value in inputs.values()):
+        raise ValueError("release workflow must not hardcode the current build version")
 
 
 def validate_required_files() -> None:
@@ -939,6 +1129,7 @@ def main(argv: list[str] | None = None) -> int:
     validate_legacy_mapping_migration(manager)
     validate_restore_backup_fail_closed(manager)
     validate_workflows()
+    validate_release_workflow(version, contract, manifest)
     print("validate_public_contracts.py: PASS")
     return 0
 
