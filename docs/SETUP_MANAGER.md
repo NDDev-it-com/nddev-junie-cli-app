@@ -17,6 +17,7 @@ orthogonal profile selected as `safe` or `full-auto`.
 - `.nddev-junie-cli-runtime/home/.junie/allowlist.json`
 - target-owned Junie shim under the isolated runtime home
 - pinned Junie version directory under the isolated runtime data root
+- transient launch image under `.nddev-junie-cli-runtime/launch-image/`
 - `.nddev-junie-cli.lock`
 - `.nddev-junie-cli-backups/`
 - `NDDEV-JUNIE-CLI-SETUP.json`
@@ -62,18 +63,21 @@ drift, captures the target-owned shim and pinned Junie binary path, inode, size,
 and SHA256, and revalidates those identities immediately before child execution.
 Because macOS does not give this manager a portable `fexecve` or `/dev/fd`
 execution path, the handoff is a verified path handoff: open verified file
-descriptors are retained as evidence, the verified launcher and binary parent
-chains are write-protected through child completion, and the target-owned path is
-started with `Popen`. The child process gets an isolated `HOME`, `USERPROFILE`,
-`JUNIE_DATA`, `JUNIE_LOG_DIR`, JVM `user.home`, config, skill, agent, MCP,
-command, hook, extension cache, guidelines, cache, and temp scope under the
-managed target. Provider credential variables are stripped, and the manager fails
-closed if the account `~/.junie` metadata changes.
+descriptors are retained as evidence, a dedicated launch image is materialized at
+`.nddev-junie-cli-runtime/launch-image/junie`, only that dedicated launcher
+directory is write-protected through child completion, and the launch image path
+is started with `Popen`. The child process gets an isolated `HOME`,
+`USERPROFILE`, `JUNIE_DATA`, `JUNIE_LOG_DIR`, JVM `user.home`, config, skill,
+agent, MCP, command, hook, extension cache, guidelines, cache, and temp scope
+under the managed target. Those runtime `HOME`, `TMP`, XDG, data, log, project,
+and config/source directories remain writable for normal Junie execution.
+Provider credential variables are stripped, and the manager fails closed if the
+account `~/.junie` metadata changes.
 
-The protection blocks ordinary unlink/replace attempts while the manager holds
-the lock and runtime parent protections. It is not a sandbox against deliberate
-same-UID chmod or ancestor replacement outside the protected runtime parent
-chain.
+The protection blocks ordinary unlink/replace attempts inside the lock and
+launch-image directories while the manager holds them read/execute-only. It is
+not a sandbox against deliberate same-UID chmod or ancestor replacement outside
+those dedicated protected directories.
 
 Subprocesses receive a fixed minimal `PATH`; installer and hook interpreters are
 resolved to absolute trusted executables by the manager.

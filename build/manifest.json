@@ -20,8 +20,9 @@
     "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
     "launch_lock": "target-internal O_NOFOLLOW 0600 lock file is held with fcntl.flock; its parent is 0500 while held and crash-stale files are recovered by flock state",
     "pre_child_artifact_revalidation": "target-owned Junie shim and pinned Junie binary path, inode, size, and SHA256 are revalidated immediately before child execution",
-    "verified_path_handoff": "launch retains open verified fds as evidence, write-protects verified executable parent chains through child completion, then executes the target-owned path with Popen",
-    "same_uid_boundary": "ordinary unlink/replace is blocked while protected; deliberate same-UID chmod or ancestor tampering is outside this no-sandbox boundary"
+    "verified_path_handoff": "launch retains open verified fds as evidence, materializes a dedicated launch image at <target>/.nddev-junie-cli-runtime/launch-image/junie, write-protects only that dedicated launcher directory through child completion, then executes the launch image path with Popen",
+    "runtime_state_writable": "target root, runtime HOME, TMP, XDG, JUNIE_DATA, JUNIE_LOG_DIR, project, and config/source directories remain writable during launch handoff protection",
+    "same_uid_boundary": "ordinary unlink/replace inside protected lock and launch-image directories is blocked while protected; deliberate same-UID chmod or ancestor tampering is outside this no-sandbox boundary"
   },
   "nddev_builder_projection_version": "0.2.0",
   "public_validator": "cli-tools/validate_public_contracts.py"

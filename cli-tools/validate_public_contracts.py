@@ -934,6 +934,8 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
         safe = manager.load_profile("safe")
         full_auto = manager.load_profile("full-auto")
         lock = canonical / manager.LOCK_DIR_NAME
+        launch_image = manager.runtime_launch_image(canonical)
+        launch_image_bin = manager.runtime_launch_image_bin(canonical)
 
         def run() -> None:
             manager.write_setup(canonical, setup, safe)
@@ -967,19 +969,30 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
                 seen["child"] = True
                 if cwd != canonical:
                     raise ValueError("launch child cwd escaped target")
-                if Path(command[0]) != manager.runtime_bin(canonical):
-                    raise ValueError("launch did not execute the target-owned shim")
+                if Path(command[0]) != launch_image_bin:
+                    raise ValueError("launch did not execute the target-owned launch image")
                 if env["HOME"] != str(manager.runtime_home(canonical)):
                     raise ValueError("launch child HOME escaped runtime home")
                 if not lock.is_dir():
                     raise ValueError("child did not run under the target lock")
                 if stat.S_IMODE(lock.stat().st_mode) != manager.OWNER_READ_EXECUTE_DIRECTORY_MODE:
                     raise ValueError("lock parent was not write-protected")
+                if stat.S_IMODE(launch_image.stat().st_mode) != (
+                    manager.OWNER_READ_EXECUTE_DIRECTORY_MODE
+                ):
+                    raise ValueError("launch image directory was not write-protected")
                 expect_os_failure(
                     "child lock file unlink",
                     lambda: (lock / manager.LOCK_FILE_NAME).unlink(),
                 )
                 expect_os_failure("child lock parent rmdir", lambda: lock.rmdir())
+                expect_os_failure("child launcher unlink", lambda: launch_image_bin.unlink())
+                replacement = manager.runtime_tmp(canonical) / "replacement"
+                replacement.write_text("replacement\n", encoding="utf-8")
+                expect_os_failure(
+                    "child launcher replace",
+                    lambda: replacement.replace(launch_image_bin),
+                )
                 expect_manager_failure(
                     "mutation while launch lock held",
                     lambda: manager.write_setup(
@@ -1017,6 +1030,14 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
 
 def validate_verified_launcher_handoff(manager: Any) -> None:
     script = b"""#!/bin/sh
+printf 'home' > "$HOME/guard-home" || exit 31
+printf 'tmp' > "$TMPDIR/guard-tmp" || exit 32
+printf 'config' > "$XDG_CONFIG_HOME/guard-config" || exit 33
+printf 'cache' > "$XDG_CACHE_HOME/guard-cache" || exit 34
+printf 'state' > "$XDG_STATE_HOME/guard-state" || exit 35
+printf 'data' > "$JUNIE_DATA/guard-data" || exit 36
+printf 'log' > "$JUNIE_LOG_DIR/guard-log" || exit 37
+printf 'project' > "./guard-project" || exit 38
 rm "$0" 2>/dev/null && exit 40
 printf 'replace\n' > "$TMPDIR/replacement" || exit 41
 mv "$TMPDIR/replacement" "$0" 2>/dev/null && exit 42
@@ -1044,18 +1065,45 @@ exit 23
             if result != 23:
                 raise ValueError("verified launcher did not run under path protection")
             if manager.runtime_bin(canonical).read_bytes() != script:
-                raise ValueError("verified launcher path was replaced during launch")
-            for directory in (
+                raise ValueError("source shim was replaced during launch")
+            if manager.runtime_launch_image_bin(canonical).read_bytes() != script:
+                raise ValueError("launch image path was replaced during launch")
+            expected_writes = {
+                manager.runtime_home(canonical) / "guard-home": b"home",
+                manager.runtime_tmp(canonical) / "guard-tmp": b"tmp",
+                manager.runtime_home(canonical) / ".config" / "guard-config": b"config",
+                manager.runtime_home(canonical) / ".cache" / "guard-cache": b"cache",
+                manager.runtime_home(canonical) / ".local" / "state" / "guard-state": b"state",
+                manager.runtime_data(canonical) / "guard-data": b"data",
+                manager.runtime_data(canonical) / "logs" / "guard-log": b"log",
+                canonical / "guard-project": b"project",
+            }
+            for path, expected in expected_writes.items():
+                if path.read_bytes() != expected:
+                    raise ValueError(f"launched stub could not write runtime state: {path}")
+            writable_directories = (
                 manager.runtime_root(canonical),
                 manager.runtime_home(canonical),
                 manager.runtime_home(canonical) / ".local",
                 manager.runtime_home(canonical) / ".local" / "bin",
+                manager.runtime_home(canonical) / ".local" / "share",
                 manager.runtime_data(canonical),
                 manager.runtime_data(canonical) / "versions",
                 manager.runtime_data(canonical) / "versions" / "validator",
+                manager.runtime_data(canonical) / "logs",
+                manager.runtime_cache(canonical),
+                manager.runtime_tmp(canonical),
+                manager.runtime_home(canonical) / ".config",
+                manager.runtime_home(canonical) / ".cache",
+                manager.runtime_home(canonical) / ".local" / "state",
+            )
+            for directory in writable_directories:
+                if not (stat.S_IMODE(directory.stat().st_mode) & stat.S_IWUSR):
+                    raise ValueError(f"runtime directory was left unwritable: {directory}")
+            if stat.S_IMODE(manager.runtime_launch_image(canonical).stat().st_mode) != (
+                manager.OWNER_DIRECTORY_MODE
             ):
-                if stat.S_IMODE(directory.stat().st_mode) != manager.OWNER_DIRECTORY_MODE:
-                    raise ValueError("launch parent mode was not restored")
+                raise ValueError("launch image directory mode was not restored")
 
         with_fake_software(manager, run, metadata=metadata)
 
@@ -1321,8 +1369,15 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("contract must declare fcntl flock locking")
     if contract["safety"].get("launch_write_protects_verified_executable_paths") is not True:
         raise ValueError("contract must declare verified executable path protection")
+    if contract["safety"].get("launch_keeps_runtime_state_writable") is not True:
+        raise ValueError("contract must declare writable runtime state during launch")
     if contract["managed_state"].get("lock_file") != "<target>/.nddev-junie-cli.lock/lock":
         raise ValueError("contract must declare the target lock file")
+    if (
+        contract["managed_state"].get("launch_image")
+        != "<target>/.nddev-junie-cli-runtime/launch-image/junie"
+    ):
+        raise ValueError("contract must declare the target launch image")
     if contract["managed_state"].get("lock_file_mode") != "0600":
         raise ValueError("contract must declare target lock file mode")
     if contract["managed_state"].get("lock_parent_held_mode") != "0500":
@@ -1333,6 +1388,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("contract runtime_launch must describe artifact revalidation")
     if "verified_path_handoff" not in contract.get("runtime_launch", {}):
         raise ValueError("contract runtime_launch must describe verified path handoff")
+    if "runtime_state_writable" not in contract.get("runtime_launch", {}):
+        raise ValueError("contract runtime_launch must describe writable runtime state")
     if "tamper_boundary" not in contract.get("runtime_launch", {}):
         raise ValueError("contract runtime_launch must describe tamper boundary")
     if "launch_lock" not in manifest.get("runtime_isolation", {}):
@@ -1341,6 +1398,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("manifest runtime_isolation must describe artifact revalidation")
     if "verified_path_handoff" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe verified path handoff")
+    if "runtime_state_writable" not in manifest.get("runtime_isolation", {}):
+        raise ValueError("manifest runtime_isolation must describe writable runtime state")
     if "same_uid_boundary" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe same-UID boundary")
     if build.get("junie_cli_tested") != baseline["release"]["stable_version"]:

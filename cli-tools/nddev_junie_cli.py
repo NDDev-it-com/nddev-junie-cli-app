@@ -45,6 +45,8 @@ LEGACY_STAMP_SCHEMAS = (1, 2)
 LEGACY_STAMP_SCHEMA = 1
 RUNTIME_DIR_NAME = ".nddev-junie-cli-runtime"
 RUNTIME_RECEIPT_NAME = "NDDEV-JUNIE-CLI-RUNTIME.json"
+LAUNCH_IMAGE_DIR_NAME = "launch-image"
+LAUNCH_IMAGE_COMMAND_NAME = "junie"
 LOCK_DIR_NAME = ".nddev-junie-cli.lock"
 LOCK_FILE_NAME = "lock"
 BACKUP_DIR_NAME = ".nddev-junie-cli-backups"
@@ -213,6 +215,7 @@ class LaunchPlan:
     cwd: Path
     shim: LaunchFileSnapshot
     binary: LaunchFileSnapshot
+    launcher: LaunchFileSnapshot
 
 
 @dataclass
@@ -953,6 +956,14 @@ def runtime_bin(target: Path) -> Path:
     return runtime_home(target) / ".local" / "bin" / "junie"
 
 
+def runtime_launch_image(target: Path) -> Path:
+    return runtime_root(target) / LAUNCH_IMAGE_DIR_NAME
+
+
+def runtime_launch_image_bin(target: Path) -> Path:
+    return runtime_launch_image(target) / LAUNCH_IMAGE_COMMAND_NAME
+
+
 def runtime_cache(target: Path) -> Path:
     return runtime_root(target) / "cache"
 
@@ -1543,6 +1554,7 @@ def revalidate_launch_file_snapshot(target: Path, snapshot: LaunchFileSnapshot) 
 def revalidate_launch_artifacts(plan: LaunchPlan) -> None:
     revalidate_launch_file_snapshot(plan.cwd, plan.shim)
     revalidate_launch_file_snapshot(plan.cwd, plan.binary)
+    revalidate_launch_file_snapshot(plan.cwd, plan.launcher)
 
 
 def sha256_fd_bounded(fd: int, *, max_bytes: int, label: str) -> str:
@@ -1559,42 +1571,6 @@ def sha256_fd_bounded(fd: int, *, max_bytes: int, label: str) -> str:
         digest.update(chunk)
     os.lseek(fd, 0, os.SEEK_SET)
     return digest.hexdigest()
-
-
-def launch_parent_directories(target: Path, snapshot: LaunchFileSnapshot) -> list[Path]:
-    path = safe_target_path(target, snapshot.relative_path)
-    root = runtime_root(target)
-    directories: list[Path] = []
-    current = path.parent
-    while current != target and target in current.parents:
-        if current == root or root in current.parents:
-            directories.append(current)
-        current = current.parent
-    return sorted(set(directories), key=lambda item: len(item.parts))
-
-
-def launch_handoff_directories(plan: LaunchPlan) -> list[Path]:
-    directories: list[Path] = []
-    for snapshot in (plan.shim, plan.binary):
-        directories.extend(launch_parent_directories(plan.cwd, snapshot))
-    return sorted(set(directories), key=lambda item: len(item.parts))
-
-
-def set_launch_parent_modes(target: Path, paths: tuple[Path, ...], mode: int) -> None:
-    directories: set[Path] = set()
-    for path in paths:
-        root = runtime_root(target)
-        current = path.parent
-        while current != target and target in current.parents:
-            if current == root or root in current.parents:
-                directories.add(current)
-            current = current.parent
-    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-        fd, info = open_owned_directory_nofollow(directory, f"launch parent {directory}")
-        try:
-            os.fchmod(fd, mode)
-        finally:
-            os.close(fd)
 
 
 def open_verified_launch_file(target: Path, snapshot: LaunchFileSnapshot) -> int:
@@ -1644,6 +1620,83 @@ def open_verified_launch_file(target: Path, snapshot: LaunchFileSnapshot) -> int
         raise
 
 
+def read_launch_file_snapshot_bytes(target: Path, snapshot: LaunchFileSnapshot) -> bytes:
+    fd = open_verified_launch_file(target, snapshot)
+    data = bytearray()
+    try:
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > snapshot.max_bytes:
+                runtime_fail(
+                    f"{snapshot.label} is too large",
+                    code=f"{label_slug(snapshot.label)}_too_large",
+                    repairable=False,
+                )
+    finally:
+        os.close(fd)
+    result = bytes(data)
+    if len(result) != snapshot.size or sha256_bytes(result) != snapshot.sha256:
+        runtime_fail(
+            f"{snapshot.label} changed while materializing launch image",
+            code=f"{label_slug(snapshot.label)}_materialize_changed",
+            repairable=False,
+        )
+    return result
+
+
+def ensure_launch_image_directory(target: Path) -> None:
+    directory = runtime_launch_image(target)
+    ensure_private_directory(directory, target, "runtime launch image")
+    fd, info = open_directory_nofollow(directory, "runtime launch image")
+    try:
+        mode = stat.S_IMODE(info.st_mode)
+        if mode == OWNER_READ_EXECUTE_DIRECTORY_MODE:
+            os.fchmod(fd, OWNER_DIRECTORY_MODE)
+        elif mode != OWNER_DIRECTORY_MODE:
+            runtime_fail(
+                "runtime launch image mode must be 0700 or recovered 0500",
+                code="runtime_launch_image_mode",
+                repairable=False,
+            )
+    finally:
+        os.close(fd)
+
+
+def materialize_launch_image(target: Path, source: LaunchFileSnapshot) -> LaunchFileSnapshot:
+    data = read_launch_file_snapshot_bytes(target, source)
+    ensure_launch_image_directory(target)
+    launcher_path = runtime_launch_image_bin(target)
+    atomic_write(launcher_path, data, target, mode=OWNER_EXECUTABLE_MODE)
+    launcher = capture_launch_file_snapshot(
+        target,
+        launcher_path,
+        "Junie launch image",
+        max_bytes=MANAGED_MAX_BYTES,
+    )
+    if launcher.size != source.size or launcher.sha256 != source.sha256:
+        runtime_fail(
+            "Junie launch image does not match the verified shim",
+            code="junie_launch_image_digest",
+            repairable=False,
+        )
+    return launcher
+
+
+def launch_handoff_directories(plan: LaunchPlan) -> list[Path]:
+    launcher_path = safe_target_path(plan.cwd, plan.launcher.relative_path)
+    directory = runtime_launch_image(plan.cwd)
+    if launcher_path.parent != directory:
+        runtime_fail(
+            "Junie launch image escaped the dedicated launcher directory",
+            code="junie_launch_image_parent",
+            repairable=False,
+        )
+    return [directory]
+
+
 @contextlib.contextmanager
 def protected_launch_handoff(plan: LaunchPlan):
     protection = LaunchProtection(directories=[], file_fds=[])
@@ -1661,6 +1714,7 @@ def protected_launch_handoff(plan: LaunchPlan):
             os.fchmod(protected.fd, OWNER_READ_EXECUTE_DIRECTORY_MODE)
         protection.file_fds.append(open_verified_launch_file(plan.cwd, plan.shim))
         protection.file_fds.append(open_verified_launch_file(plan.cwd, plan.binary))
+        protection.file_fds.append(open_verified_launch_file(plan.cwd, plan.launcher))
         yield protection
     finally:
         for fd in reversed(protection.file_fds):
@@ -3059,11 +3113,6 @@ def build_launch_plan_locked(target: Path, child_args: list[str]) -> LaunchPlan:
         fail("Junie software metadata path is invalid")
     shim_path = safe_target_path(canonical, shim_relative)
     binary_path = safe_target_path(canonical, binary_relative)
-    set_launch_parent_modes(
-        canonical,
-        (shim_path, binary_path),
-        OWNER_DIRECTORY_MODE,
-    )
     ensure_private_directory(data / "logs", canonical, "runtime logs")
     ensure_private_directory(home / ".config", canonical, "runtime config home")
     ensure_private_directory(home / ".cache", canonical, "runtime XDG cache home")
@@ -3089,7 +3138,7 @@ def build_launch_plan_locked(target: Path, child_args: list[str]) -> LaunchPlan:
             "JUNIE_GUIDELINES_FILENAME": str((canonical / "AGENTS.md").resolve()),
         }
     )
-    command = [str(shim_path)]
+    command = [str(runtime_launch_image_bin(canonical))]
     if "--skip-update-check" not in child_args:
         command.append("--skip-update-check")
     command.extend(
@@ -3153,12 +3202,14 @@ def build_launch_plan_locked(target: Path, child_args: list[str]) -> LaunchPlan:
             code="junie_binary_changed",
             repairable=False,
         )
+    launcher = materialize_launch_image(canonical, shim)
     return LaunchPlan(
         command=command,
         child_env=child_env,
         cwd=canonical,
         shim=shim,
         binary=binary,
+        launcher=launcher,
     )
 
 

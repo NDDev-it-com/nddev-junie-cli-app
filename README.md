@@ -49,10 +49,13 @@ denied while the launched Junie process is running. The target-owned shim and
 pinned Junie binary identity are captured during launch preflight and revalidated
 immediately before child execution. Because macOS does not provide a portable
 `fexecve` or `/dev/fd` execution path for this handoff, the manager retains open
-verified file descriptors as evidence, write-protects the verified runtime parent
-chains through child completion, and starts the target-owned path with `Popen`.
-This blocks ordinary unlink/replace during launch, but it is not a sandbox
-against deliberate same-UID chmod or ancestor tampering.
+verified file descriptors as evidence, materializes a dedicated launch image at
+`.nddev-junie-cli-runtime/launch-image/junie`, write-protects only that
+dedicated launcher directory through child completion, and starts the launch
+image path with `Popen`. Runtime `HOME`, `TMP`, XDG, data, log, project, and
+config/source directories remain writable for the launched CLI. This blocks
+ordinary unlink/replace of the protected launcher during launch, but it is not a
+sandbox against deliberate same-UID chmod or ancestor tampering.
 
 ## Setups
 

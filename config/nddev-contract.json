@@ -21,6 +21,7 @@
     "preserve_other_state": true,
     "control_root": "explicit --target, also passed as Junie --project",
     "runtime_home": "<target>/.nddev-junie-cli-runtime/home",
+    "launch_image": "<target>/.nddev-junie-cli-runtime/launch-image/junie",
     "pathless_native_state": {
       "allowlist": "<target>/.nddev-junie-cli-runtime/home/.junie/allowlist.json"
     },
@@ -82,7 +83,8 @@
     "lock_uses_fcntl_flock": true,
     "lock_file_open_flags": "O_NOFOLLOW regular file with nonblocking fcntl.flock",
     "launch_write_protects_verified_executable_paths": true,
-    "same_uid_no_sandbox_boundary": "The manager blocks ordinary unlink/replace while it holds path protections, but it is not a sandbox against deliberate same-UID chmod or ancestor tampering."
+    "launch_keeps_runtime_state_writable": true,
+    "same_uid_no_sandbox_boundary": "The manager blocks ordinary unlink/replace inside the dedicated protected lock and launch-image directories while it holds path protections, but it is not a sandbox against deliberate same-UID chmod or ancestor tampering."
   },
   "software_lifecycle": {
     "installer_url": "https://junie.jetbrains.com/install.sh",
@@ -123,8 +125,9 @@
     "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
     "lock_scope": "target-internal lifecycle lock uses <target>/.nddev-junie-cli.lock/lock opened with O_NOFOLLOW mode 0600 and nonblocking fcntl.flock; the lock parent is 0500 while held and crash-stale lock files are recovered by flock state",
     "pre_child_artifact_revalidation": "target-owned Junie shim and pinned Junie binary path, inode, size, and SHA256 are captured during launch preflight and revalidated immediately before subprocess execution",
-    "verified_path_handoff": "macOS does not support this manager executing Junie through fexecve or /dev/fd, so launch retains open verified fds as evidence, write-protects the verified launcher and binary parent chains, immediately revalidates identity and digest, then starts the target-owned path with Popen",
-    "tamper_boundary": "This is a verified-path handoff, not a same-UID sandbox; deliberate same-UID chmod or ancestor replacement outside the protected runtime parent chain remains out of scope.",
+    "verified_path_handoff": "macOS does not support this manager executing Junie through fexecve or /dev/fd, so launch retains open verified fds as evidence, materializes a dedicated launch image from the verified target-owned shim at <target>/.nddev-junie-cli-runtime/launch-image/junie, write-protects only that dedicated launcher directory, immediately revalidates identity and digest, then starts the launch image path with Popen",
+    "runtime_state_writable": "The managed target, runtime HOME, TMP, XDG, JUNIE_DATA, JUNIE_LOG_DIR, project, and config/source directories are not made read-only by launch handoff protection.",
+    "tamper_boundary": "This is a verified-path handoff, not a same-UID sandbox; deliberate same-UID chmod or ancestor replacement outside the dedicated protected lock and launch-image directories remains out of scope.",
     "managed_scope_flags": [
       "--project",
       "-p",
