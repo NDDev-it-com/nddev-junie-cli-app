@@ -984,29 +984,35 @@ def validate_unsupported_host_preflight(manager: Any) -> None:
         manager.urllib.request.urlopen = original_urlopen
 
 
-def validate_target_observation_after_lexical_lock(manager: Any) -> None:
+def validate_target_observation_after_seeded_product_lock(manager: Any) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-junie-lock-order-") as raw:
         root = Path(raw)
         target = root / "missing-parent" / "target"
-        system_root = manager.bootstrap_lock_system_root()
-        product_root = manager.bootstrap_lock_product_root_path(system_root)
-        lexical_file = product_root / f"{manager.lexical_bootstrap_lock_digest(target)}.lock"
+        product_root = manager.bootstrap_lock_product_root_path(manager.bootstrap_lock_system_root())
+        product = manager.open_bootstrap_global_lock(create=True, exclusive=True)
+        manager.release_bootstrap_global_lock(product)
+        product_coordination_entered = {"value": False}
         original_resolver = manager.resolve_parent_allowing_missing
         original_stat_existing = manager.stat_existing
+        original_open_product = manager.open_bootstrap_global_lock
 
-        def lexical_ready() -> bool:
-            return lexical_file.exists()
+        def guarded_open_product(*args: Any, **kwargs: Any) -> Any:
+            handle = original_open_product(*args, **kwargs)
+            if handle is not None:
+                product_coordination_entered["value"] = True
+            return handle
 
         def guarded_resolver(path: Path) -> Path:
-            if path == target.parent and not lexical_ready():
-                raise AssertionError("target parent resolved before lexical bootstrap lock")
+            if path == target.parent and not product_coordination_entered["value"]:
+                raise AssertionError("target parent resolved before seeded product coordination")
             return original_resolver(path)
 
         def guarded_stat(path: Path, label: str) -> os.stat_result | None:
-            if label.startswith("target") and not lexical_ready():
-                raise AssertionError(f"{label} was inspected before lexical bootstrap lock")
+            if label.startswith("target") and not product_coordination_entered["value"]:
+                raise AssertionError(f"{label} was inspected before seeded product coordination")
             return original_stat_existing(path, label)
 
+        manager.open_bootstrap_global_lock = guarded_open_product
         manager.resolve_parent_allowing_missing = guarded_resolver
         manager.stat_existing = guarded_stat
         try:
@@ -1019,8 +1025,9 @@ def validate_target_observation_after_lexical_lock(manager: Any) -> None:
             if stderr.getvalue():
                 raise ValueError("status under lexical-order guard wrote stderr")
             if target.parent.exists():
-                raise ValueError("lexical-order status created the target parent")
+                raise ValueError("seeded product-coordination status created the target parent")
         finally:
+            manager.open_bootstrap_global_lock = original_open_product
             manager.resolve_parent_allowing_missing = original_resolver
             manager.stat_existing = original_stat_existing
             if product_root.exists():
@@ -1247,6 +1254,13 @@ def validate_production_source() -> None:
         raise ValueError("installer must use an absolute trusted shell, not PATH lookup")
     if '"PATH": os.environ' in source or "'PATH': os.environ" in source:
         raise ValueError("subprocess PATH must not inherit the ambient user PATH")
+    if "os.link" in source or "linkat" in source:
+        raise ValueError("bootstrap anchor publication must not use hard-link aliases")
+    publication_source = source.split("def atomic_rename_no_replace", 1)[-1].split(
+        "def lock_file_path", 1
+    )[0]
+    if "os.replace" in publication_source:
+        raise ValueError("bootstrap anchor publication must not replace final anchors")
 
 
 def validate_bootstrap_lock_adversarial(manager: Any) -> None:
@@ -1324,6 +1338,207 @@ def validate_bootstrap_lock_adversarial(manager: Any) -> None:
         binding = json.loads(lock_file.read_text(encoding="utf-8"))
         if binding != manager.bootstrap_lock_binding(canonical):
             raise ValueError("bootstrap lock binding changed after release")
+
+
+def validate_bootstrap_lock_atomic_publication(manager: Any) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-bootstrap-atomic-") as raw:
+        root = Path(raw)
+        product_root = manager.bootstrap_lock_product_root_path(
+            manager.bootstrap_lock_system_root()
+        )
+        product = manager.open_bootstrap_global_lock(create=True, exclusive=True)
+        manager.release_bootstrap_global_lock(product)
+        product_anchor = product_root / manager.BOOTSTRAP_GLOBAL_LOCK_NAME
+        product_anchor_before = exact_path_snapshot(product_anchor)
+        existing_target = root / "existing-target"
+        existing_target.mkdir(mode=0o700)
+        existing_canonical = manager.validate_target_identity_for_lock(existing_target)
+        existing_handle = manager.acquire_bootstrap_lock(existing_canonical)
+        manager.release_bootstrap_lock(existing_handle)
+        existing_marker = manager.bootstrap_lock_path(existing_canonical)
+        marker_before = exact_path_snapshot(existing_marker)
+
+        second_handle = manager.acquire_bootstrap_lock(existing_canonical)
+        manager.release_bootstrap_lock(second_handle)
+        if exact_path_snapshot(existing_marker) != marker_before:
+            raise ValueError("bootstrap acquire rewrote a pre-existing marker")
+
+        fault_cases: tuple[tuple[str, str], ...] = (
+            ("create", "os.open"),
+            ("fchmod", "os.fchmod"),
+            ("binding-write", "write_all_fd"),
+            ("fsync", "os.fsync"),
+            ("no-replace-publish", "atomic_rename_no_replace"),
+            ("parent-fsync", "fsync_directory"),
+        )
+        for label, target_name in fault_cases:
+            target = root / f"new-{label}"
+            target.mkdir(mode=0o700)
+            canonical = manager.validate_target_identity_for_lock(target)
+            marker = product_root / manager.bootstrap_lock_file_name(canonical)
+            marker_name = marker.name
+            before_root = exact_tree_snapshot(product_root)
+            injected = {"value": False}
+            if target_name == "os.open":
+                original = manager.os.open
+
+                def fail_open(path: Any, flags: int, mode: int = 0o777, *args: Any) -> int:
+                    if (
+                        Path(path).name.startswith(f".{marker_name}.nddev.tmp.")
+                        and not injected["value"]
+                    ):
+                        injected["value"] = True
+                        raise OSError("bootstrap marker create fault")
+                    return original(path, flags, mode, *args)
+
+                manager.os.open = fail_open
+            elif target_name == "os.fchmod":
+                original = manager.os.fchmod
+
+                def fail_fchmod(fd: int, mode: int) -> None:
+                    if not injected["value"]:
+                        injected["value"] = True
+                        raise OSError("bootstrap marker fchmod fault")
+                    original(fd, mode)
+
+                manager.os.fchmod = fail_fchmod
+            elif target_name == "write_all_fd":
+                original = manager.write_all_fd
+
+                def fail_binding_write(fd: int, data: bytes) -> None:
+                    if not injected["value"]:
+                        injected["value"] = True
+                        os.write(fd, data[: max(1, len(data) // 2)])
+                        raise OSError("bootstrap marker binding write fault")
+                    original(fd, data)
+
+                manager.write_all_fd = fail_binding_write
+            elif target_name == "os.fsync":
+                original = manager.os.fsync
+
+                def fail_fsync(fd: int) -> None:
+                    if not injected["value"]:
+                        injected["value"] = True
+                        raise OSError("bootstrap marker fsync fault")
+                    original(fd)
+
+                manager.os.fsync = fail_fsync
+            elif target_name == "atomic_rename_no_replace":
+                original = manager.atomic_rename_no_replace
+
+                def fail_publish(source: Path, destination: Path) -> None:
+                    if not injected["value"]:
+                        injected["value"] = True
+                        raise OSError("bootstrap marker no-replace publish fault")
+                    original(source, destination)
+
+                manager.atomic_rename_no_replace = fail_publish
+            else:
+                original = manager.fsync_directory
+
+                def fail_parent_fsync(path: Path) -> None:
+                    if path == product_root and not injected["value"]:
+                        injected["value"] = True
+                        raise OSError("bootstrap marker parent fsync fault")
+                    original(path)
+
+                manager.fsync_directory = fail_parent_fsync
+            try:
+                try:
+                    manager.acquire_bootstrap_lock(canonical)
+                except OSError:
+                    pass
+                except Exception as exc:
+                    if exc.__class__.__name__ != "JunieCliSetupError":
+                        raise ValueError(
+                            f"bootstrap {label} fault raised unexpected {exc!r}"
+                        ) from exc
+                else:
+                    raise ValueError(f"bootstrap {label} fault did not raise")
+            finally:
+                if target_name == "os.open":
+                    manager.os.open = original
+                elif target_name == "os.fchmod":
+                    manager.os.fchmod = original
+                elif target_name == "write_all_fd":
+                    manager.write_all_fd = original
+                elif target_name == "os.fsync":
+                    manager.os.fsync = original
+                elif target_name == "atomic_rename_no_replace":
+                    manager.atomic_rename_no_replace = original
+                else:
+                    manager.fsync_directory = original
+            if not injected["value"]:
+                raise ValueError(f"bootstrap {label} fault was not injected")
+            if target_name == "fsync_directory":
+                marker_fd = manager.open_existing_bootstrap_lock_file(marker)
+                try:
+                    manager.ensure_bootstrap_lock_binding(
+                        marker_fd,
+                        manager.bootstrap_lock_binding(canonical),
+                    )
+                finally:
+                    os.close(marker_fd)
+                if [path for path in product_root.rglob("*") if ".nddev.tmp." in path.name]:
+                    raise ValueError("bootstrap parent-fsync fault left temp residue")
+            elif exact_tree_snapshot(product_root) != before_root:
+                raise ValueError(f"bootstrap {label} fault changed product root graph")
+            if exact_path_snapshot(product_anchor) != product_anchor_before:
+                raise ValueError(f"bootstrap {label} fault changed product anchor")
+            if exact_path_snapshot(existing_marker) != marker_before:
+                raise ValueError(f"bootstrap {label} fault changed pre-existing marker")
+
+        blocked = manager.acquire_bootstrap_lock(existing_canonical)
+        try:
+            expect_manager_failure(
+                "bootstrap target lock acquisition",
+                lambda: manager.acquire_bootstrap_lock(existing_canonical),
+            )
+            if exact_path_snapshot(existing_marker) != marker_before:
+                raise ValueError("bootstrap lock acquisition failure changed marker identity")
+            other_target = root / "different-target"
+            other_target.mkdir(mode=0o700)
+            other_canonical = manager.validate_target_identity_for_lock(other_target)
+            other = manager.acquire_bootstrap_lock(other_canonical)
+            manager.release_bootstrap_lock(other)
+        finally:
+            manager.release_bootstrap_lock(blocked)
+
+        handoff_target = root / "handoff-target"
+        handoff_target.mkdir(mode=0o700)
+        handoff_canonical = manager.validate_target_identity_for_lock(handoff_target)
+        handoff_marker = product_root / manager.bootstrap_lock_file_name(handoff_canonical)
+        original_release_global = manager.release_bootstrap_global_lock
+        injected_handoff = {"value": False}
+
+        def fail_handoff_once(handle: Any) -> None:
+            original_release_global(handle)
+            if not injected_handoff["value"]:
+                injected_handoff["value"] = True
+                raise OSError("bootstrap handoff fault")
+
+        manager.release_bootstrap_global_lock = fail_handoff_once
+        try:
+            try:
+                manager.acquire_bootstrap_lock(handoff_canonical)
+            except OSError:
+                pass
+            else:
+                raise ValueError("bootstrap handoff fault did not raise")
+        finally:
+            manager.release_bootstrap_global_lock = original_release_global
+        if not injected_handoff["value"]:
+            raise ValueError("bootstrap handoff fault was not injected")
+        handoff_fd = manager.open_existing_bootstrap_lock_file(handoff_marker)
+        try:
+            manager.ensure_bootstrap_lock_binding(
+                handoff_fd,
+                manager.bootstrap_lock_binding(handoff_canonical),
+            )
+        finally:
+            os.close(handoff_fd)
+        if [path for path in product_root.rglob("*") if ".nddev.tmp." in path.name]:
+            raise ValueError("bootstrap handoff fault left temp residue")
 
 
 def validate_bootstrap_lock_persistent_handover(manager: Any) -> None:
@@ -1976,6 +2191,38 @@ def validate_software_remove_and_noop_lifecycle(manager: Any) -> None:
         if temporary_residue(target):
             raise ValueError("remove-cli post-remove fault left transaction residue")
 
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-software-remove-commit-fault-") as raw:
+        target = Path(raw) / "target"
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        safe = manager.load_profile("safe")
+        manager.write_setup(target, setup, safe)
+        install_fake_software_via_cli(manager, target)
+        before_fault = exact_tree_snapshot(target)
+        original_commit = manager.commit_runtime_remove
+        observed_removed = {"value": False}
+
+        def fail_after_runtime_entries_removed(transaction: Any) -> None:
+            if manager.software_state(target) != {"state": "absent"}:
+                raise ValueError("remove-cli commit fault did not observe absent software state")
+            if transaction.removed_container is None or not transaction.removed_container.exists():
+                raise ValueError("remove-cli commit fault did not retain moved runtime entries")
+            observed_removed["value"] = True
+            raise manager.JunieCliSetupError("runtime remove commit validator fault")
+
+        manager.commit_runtime_remove = fail_after_runtime_entries_removed
+        try:
+            expect_manager_failure(
+                "remove-cli runtime commit fault", lambda: manager.remove_cli(target)
+            )
+        finally:
+            manager.commit_runtime_remove = original_commit
+        if not observed_removed["value"]:
+            raise ValueError("remove-cli runtime commit fault was not injected")
+        if exact_tree_snapshot(target) != before_fault:
+            raise ValueError("remove-cli runtime commit fault changed target identity")
+        if temporary_residue(target):
+            raise ValueError("remove-cli runtime commit fault left transaction residue")
+
 
 def validate_failed_first_install_restores_parent(manager: Any) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-junie-first-install-fault-") as raw:
@@ -1983,6 +2230,7 @@ def validate_failed_first_install_restores_parent(manager: Any) -> None:
         parent.mkdir(mode=0o700)
         target = parent / "junie"
         before_parent = exact_tree_snapshot(parent)
+        product_root = manager.bootstrap_lock_product_root_path(manager.bootstrap_lock_system_root())
         setup = manager.load_setup(DEFAULT_SETUP_ID)
         safe = manager.load_profile("safe")
         original_atomic = manager.atomic_write
@@ -2010,6 +2258,31 @@ def validate_failed_first_install_restores_parent(manager: Any) -> None:
             raise ValueError("failed first setup install left the target directory")
         if exact_tree_snapshot(parent) != before_parent:
             raise ValueError("failed first setup install changed parent identity")
+        if product_root.exists():
+            residue = [path.name for path in product_root.rglob("*") if ".nddev.tmp." in path.name]
+            if residue:
+                raise ValueError("failed first setup install left bootstrap temp residue")
+            global_lock = product_root / manager.BOOTSTRAP_GLOBAL_LOCK_NAME
+            if global_lock.exists():
+                global_fd = manager.open_existing_bootstrap_lock_file(global_lock)
+                try:
+                    manager.ensure_bootstrap_lock_binding(
+                        global_fd,
+                        manager.bootstrap_global_lock_binding(),
+                    )
+                finally:
+                    os.close(global_fd)
+            canonical = manager.validate_target_identity_for_lock(target)
+            target_anchor = product_root / manager.bootstrap_lock_file_name(canonical)
+            if target_anchor.exists():
+                target_fd = manager.open_existing_bootstrap_lock_file(target_anchor)
+                try:
+                    manager.ensure_bootstrap_lock_binding(
+                        target_fd,
+                        manager.bootstrap_lock_binding(canonical),
+                    )
+                finally:
+                    os.close(target_fd)
 
 
 def validate_read_commands_leave_target_unchanged(manager: Any) -> None:
@@ -2034,6 +2307,18 @@ def validate_read_commands_leave_target_unchanged(manager: Any) -> None:
                     raise ValueError(
                         f"{command[0]} changed target lock artifacts or metadata "
                         f"(preexisting_lock={preexisting_lock})"
+                    )
+            product_root = manager.bootstrap_lock_product_root_path(
+                manager.bootstrap_lock_system_root()
+            )
+            before_bootstrap = exact_tree_snapshot(product_root)
+            missing = Path(raw) / f"missing-preexisting-{preexisting_lock}" / "target"
+            for command in commands:
+                manager_main_json(manager, [*command, "--target", str(missing)])
+                if exact_tree_snapshot(product_root) != before_bootstrap:
+                    raise ValueError(
+                        f"{command[0]} left newly-created bootstrap coordination artifacts "
+                        f"for a missing target (preexisting_lock={preexisting_lock})"
                     )
             if not preexisting_lock and (target / manager.LOCK_DIR_NAME).exists():
                 raise ValueError("read command left a newly-created target lock directory")
@@ -2762,22 +3047,45 @@ def main(argv: list[str] | None = None) -> int:
         != "<resolved fixed system temp>/nddev-junie-cli-app-bootstrap-locks-uid-<uid>"
     ):
         raise ValueError("contract must declare the bootstrap lock root")
+    if contract["managed_state"].get("bootstrap_product_anchor") != (
+        "<bootstrap_lock_root>/global.lock"
+    ):
+        raise ValueError("contract must declare the product bootstrap anchor")
     if (
-        contract["managed_state"].get("bootstrap_lock_file")
+        contract["managed_state"].get("bootstrap_target_anchor")
         != "sha256(product namespace plus canonical absolute target).lock"
     ):
-        raise ValueError("contract must declare the bootstrap lock file binding")
-    if (
-        contract["managed_state"].get("precanonical_bootstrap_lock_file")
-        != "sha256(product namespace plus lexical absolute target).lock"
-    ):
-        raise ValueError("contract must declare the pre-canonical bootstrap lock file binding")
+        raise ValueError("contract must declare the canonical target bootstrap anchor")
     if contract["managed_state"].get("bootstrap_lock_file_mode") != "0600":
         raise ValueError("contract must declare bootstrap lock file mode")
-    if contract["managed_state"].get("bootstrap_lock_persistent") is not True:
-        raise ValueError("contract must declare persistent bootstrap lock files")
+    if contract["managed_state"].get("bootstrap_product_anchor_persistent") is not True:
+        raise ValueError("contract must declare the persistent product anchor")
+    if contract["managed_state"].get("bootstrap_target_anchor_persistent") is not True:
+        raise ValueError("contract must declare persistent canonical target anchors")
+    publication_text = contract["managed_state"].get("bootstrap_anchor_publication", "")
+    for phrase in (
+        "fsynced temporary",
+        "native atomic no-replace rename",
+        "no hard-link alias",
+        "never truncated",
+        "replaced",
+    ):
+        if phrase not in publication_text:
+            raise ValueError("contract must declare no-replace bootstrap anchor publication")
+    coordination_text = contract["managed_state"].get("read_only_bootstrap_coordination", "")
+    for phrase in ("create no product", "cold no-anchor", "double-check", "seeded reads"):
+        if phrase not in coordination_text:
+            raise ValueError("contract must declare read-only bootstrap coordination semantics")
     if contract["managed_state"].get("target_lock_persistent") is not True:
         raise ValueError("contract must declare persistent target lock files")
+    if contract["safety"].get("bootstrap_binding_atomic_publication") is not True:
+        raise ValueError("contract must declare atomic bootstrap binding publication")
+    if contract["safety"].get("bootstrap_anchor_no_replace_publication") is not True:
+        raise ValueError("contract must declare no-replace bootstrap anchor publication")
+    if contract["safety"].get("bootstrap_anchor_monotonic") is not True:
+        raise ValueError("contract must declare monotonic bootstrap anchors")
+    if contract["safety"].get("read_only_bootstrap_no_create") is not True:
+        raise ValueError("contract must declare read-only no-create bootstrap coordination")
     if (
         contract["managed_state"].get("launch_image")
         != "<target>/.nddev-junie-cli-runtime/launch-image/junie"
@@ -2827,8 +3135,9 @@ def main(argv: list[str] | None = None) -> int:
         validate_manager_parse(manager)
         validate_json_argument_boundary(manager)
         validate_unsupported_host_preflight(manager)
-        validate_target_observation_after_lexical_lock(manager)
+        validate_target_observation_after_seeded_product_lock(manager)
         validate_bootstrap_lock_adversarial(manager)
+        validate_bootstrap_lock_atomic_publication(manager)
         validate_bootstrap_lock_persistent_handover(manager)
         validate_dual_lock_persistent_handover(manager)
         validate_adversarial_smokes(manager)
