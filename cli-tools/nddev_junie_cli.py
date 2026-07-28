@@ -2127,11 +2127,15 @@ def validate_cleanup_journal(target: Path) -> dict[str, Any] | None:
     journal_path = cleanup_journal_path(target)
     root_exists = lstat_exists(root)
     journal_exists = lstat_exists(journal_path)
-    temp_records = [
-        path.name
-        for path in target.iterdir()
-        if path.name.startswith(cleanup_journal_temp_prefix())
-    ] if lstat_exists(target) else []
+    temp_records = (
+        [
+            path.name
+            for path in target.iterdir()
+            if path.name.startswith(cleanup_journal_temp_prefix())
+        ]
+        if lstat_exists(target)
+        else []
+    )
     if temp_records:
         fail("cleanup journal has intermediate residue")
     if not root_exists and not journal_exists:
@@ -2222,9 +2226,7 @@ def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) ->
     if len(data) > CLEANUP_JOURNAL_MAX_BYTES:
         fail("cleanup journal is too large")
     ensure_real_parent(path, target)
-    temporary = path.with_name(
-        f"{cleanup_journal_temp_prefix()}{os.getpid()}.{time.time_ns()}"
-    )
+    temporary = path.with_name(f"{cleanup_journal_temp_prefix()}{os.getpid()}.{time.time_ns()}")
     parent_before = backup_directory_snapshot(path.parent)
     fd = -1
     published = False
@@ -2236,6 +2238,19 @@ def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) ->
         )
         os.fchmod(fd, OWNER_FILE_MODE)
         write_all_fd(fd, data)
+        info = os.fstat(fd)
+        if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+            fail("cleanup journal publication failed mode verification")
+        os.lseek(fd, 0, os.SEEK_SET)
+        current = bytearray()
+        while len(current) <= len(data):
+            chunk = os.read(fd, min(1024 * 1024, len(data) + 1 - len(current)))
+            if not chunk:
+                break
+            current.extend(chunk)
+        if bytes(current) != data:
+            fail("cleanup journal publication failed content verification")
+        os.lseek(fd, 0, os.SEEK_END)
         os.fsync(fd)
         os.close(fd)
         fd = -1
@@ -2249,11 +2264,14 @@ def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) ->
         )
         if info is None or stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
             fail("cleanup journal publication failed mode verification")
-        if read_existing_file(
-            path,
-            max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
-            label=CLEANUP_JOURNAL_NAME,
-        ) != data:
+        if (
+            read_existing_file(
+                path,
+                max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+                label=CLEANUP_JOURNAL_NAME,
+            )
+            != data
+        ):
             fail("cleanup journal publication failed content verification")
     except BaseException as exc:
         if fd >= 0:
@@ -4178,7 +4196,10 @@ def commit_software_transaction(
         "software-runtime-replacement",
         [
             (transaction.previous_root, "previous runtime root"),
-            (None if snapshot is None else snapshot.preserve_dir, "managed transaction preserve directory"),
+            (
+                None if snapshot is None else snapshot.preserve_dir,
+                "managed transaction preserve directory",
+            ),
         ],
     )
     if promotion is None:
@@ -4261,7 +4282,10 @@ def commit_runtime_remove(
         [
             (transaction.removed_root, "removed runtime root"),
             (transaction.removed_container, "removed runtime entries"),
-            (None if snapshot is None else snapshot.preserve_dir, "managed transaction preserve directory"),
+            (
+                None if snapshot is None else snapshot.preserve_dir,
+                "managed transaction preserve directory",
+            ),
         ],
     )
     if promotion is None:
@@ -5591,6 +5615,7 @@ def software_result_payload(
     software: dict[str, Any],
     *,
     cleanup_pending_result: bool = False,
+    cleanup_drained: bool = False,
 ) -> dict[str, Any]:
     cleanup = cleanup_state(target)
     return {
@@ -5605,6 +5630,7 @@ def software_result_payload(
         },
         "target": str(validate_target(target, create=False)),
         "cleanup_pending": cleanup_pending_result or cleanup["pending"],
+        "cleanup_drained": cleanup_drained,
         "cleanup": cleanup["metadata"],
     }
 
@@ -5627,7 +5653,7 @@ def write_stamp_software_state(
 def install_or_update_cli(target: Path, *, repair: bool, command: str) -> dict[str, Any]:
     with target_lock(target, create_parent=False) as directory_transaction:
         target = validate_target(target, create=False, transaction=directory_transaction)
-        drain_cleanup_before_mutation(target)
+        cleanup_drained = drain_cleanup_before_mutation(target)
         current = require_managed_stamp_for_software(target, command)
         if not repair and "software" in drift_for_stamp(target, current):
             fail(
@@ -5638,7 +5664,13 @@ def install_or_update_cli(target: Path, *, repair: bool, command: str) -> dict[s
             with contextlib.suppress(JunieCliSetupError):
                 metadata = current_software_metadata(target)
                 if current_software == metadata:
-                    return software_result_payload(target, command, False, metadata)
+                    return software_result_payload(
+                        target,
+                        command,
+                        False,
+                        metadata,
+                        cleanup_drained=cleanup_drained,
+                    )
         snapshot: TransactionSnapshot | None = None
         software_tx: SoftwareTransaction | None = None
         cleanup_pending_result = False
@@ -5662,6 +5694,7 @@ def install_or_update_cli(target: Path, *, repair: bool, command: str) -> dict[s
             software_tx.changed,
             desired_stamp["software"],
             cleanup_pending_result=cleanup_pending_result,
+            cleanup_drained=cleanup_drained,
         )
 
 
@@ -5675,9 +5708,10 @@ def remove_cli(target: Path) -> dict[str, Any]:
                 "software": {"state": "absent"},
                 "target": str(target),
                 "cleanup_pending": False,
+                "cleanup_drained": False,
                 "cleanup": cleanup_pending_summary_from_journal(target, None),
             }
-        drain_cleanup_before_mutation(target)
+        cleanup_drained = drain_cleanup_before_mutation(target)
         current = read_stamp(target)
         if current is not None:
             unexpected = [item for item in drift_for_stamp(target, current) if item != "software"]
@@ -5686,7 +5720,13 @@ def remove_cli(target: Path) -> dict[str, Any]:
             if current.get("software") == {"state": "absent"} and software_state(target) == {
                 "state": "absent"
             }:
-                return software_result_payload(target, "remove-cli", False, {"state": "absent"})
+                return software_result_payload(
+                    target,
+                    "remove-cli",
+                    False,
+                    {"state": "absent"},
+                    cleanup_drained=cleanup_drained,
+                )
         snapshot: TransactionSnapshot | None = None
         runtime_tx: RuntimeRemoveTransaction | None = None
         cleanup_pending_result = False
@@ -5713,6 +5753,7 @@ def remove_cli(target: Path) -> dict[str, Any]:
             runtime_tx.changed if runtime_tx is not None else False,
             {"state": "absent"},
             cleanup_pending_result=cleanup_pending_result,
+            cleanup_drained=cleanup_drained,
         )
 
 
@@ -6050,6 +6091,8 @@ def launch(target: Path, child_args: list[str]) -> int:
         fail(f"{override} is managed by the target launch environment")
     current_platform_id()
     with target_lock(target, create_parent=False):
+        target = validate_target(target, create=False)
+        drain_cleanup_before_mutation(target)
         plan = build_launch_plan_locked(target, child_args)
         live_before = snapshot_live_junie_home()
         with protected_launch_handoff(plan):
