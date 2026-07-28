@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "observed_at": "2026-07-27",
+  "observed_at": "2026-07-28",
   "product": {
     "vendor": "JetBrains",
     "name": "Junie CLI",
@@ -8,10 +8,10 @@
   },
   "release": {
     "channel": "release",
-    "stable_version": "2383.10",
-    "marketing_version": "26.7.20",
+    "stable_version": "2470.4",
+    "marketing_version": "26.7.27",
     "eap_status_note": "Official headless documentation states Junie CLI is currently EAP; NDDev pins the release channel artifact listed in update-info.jsonl.",
-    "exact_version": "2383.10",
+    "exact_version": "2470.4",
     "supported_platforms": [
       "macos-arm64",
       "macos-x64",
@@ -25,7 +25,10 @@
       "ubuntu-glibc-x64": "linux-amd64"
     },
     "unsupported_official_artifact_platforms": {
-      "windows": ["windows-aarch64", "windows-amd64"]
+      "windows": [
+        "windows-aarch64",
+        "windows-amd64"
+      ]
     },
     "ubuntu_support": {
       "distribution_detection": "platform.freedesktop_os_release ID=ubuntu",
@@ -48,60 +51,60 @@
     "update_info": "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
     "exact_artifacts": {
       "linux-aarch64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-linux-aarch64.zip",
-        "sha256": "913da134b99d5fe4415fd79c7339bfff30c3449b3714fec1b2cb6a692d810b74",
-        "size": 271996807
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-linux-aarch64.zip",
+        "sha256": "976c6f974598bb34197f434dd041cfbb1cd663d95702ee3260bcb07815a0f630",
+        "size": 269351924
       },
       "linux-amd64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-linux-amd64.zip",
-        "sha256": "e8a4b9bd19a754bcc0d67d21ceeca08a07e72bcd52da04f9d848a7eaf393b6e1",
-        "size": 272602042
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-linux-amd64.zip",
+        "sha256": "661dba7d55e097ae0eb62ff2475b4e9fe7a59d8e25560d8c1981aad85901b60c",
+        "size": 269957159
       },
       "macos-aarch64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-aarch64.zip",
-        "sha256": "e7eccdc74046963eee1628ec6ff0952645c0bc79554bbbb22c614347d95cf7db",
-        "size": 269469124
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-macos-aarch64.zip",
+        "sha256": "2b0c86dad5402d89a2a9931c0d018e7ceea246a037412a503601931cd353209b",
+        "size": 266474468
       },
       "macos-amd64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-amd64.zip",
-        "sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0",
-        "size": 270606128
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-macos-amd64.zip",
+        "sha256": "503a6136a459d8fdb684710b2745b6d114909e619a1043de316ddb9b124c91a8",
+        "size": 267611567
       },
       "windows-aarch64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-aarch64.zip",
-        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
-        "size": 301279985
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-windows-aarch64.zip",
+        "sha256": "298e84e1c3f7df4ddc2ae4347ef6a81452def3b2ae986cf95db3350a2a801ad0",
+        "size": 298645215
       },
       "windows-amd64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-amd64.zip",
-        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
-        "size": 267185689
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-windows-amd64.zip",
+        "sha256": "e5f81a9d442106ce169b8efb92a57b9aa195c2dfcd9d6ff95b1fa324f992d4b5",
+        "size": 264550919
       }
     },
     "exact_artifact_hashes": {
       "linux-aarch64": {
-        "sha256": "913da134b99d5fe4415fd79c7339bfff30c3449b3714fec1b2cb6a692d810b74",
-        "size": 271996807
+        "sha256": "976c6f974598bb34197f434dd041cfbb1cd663d95702ee3260bcb07815a0f630",
+        "size": 269351924
       },
       "linux-amd64": {
-        "sha256": "e8a4b9bd19a754bcc0d67d21ceeca08a07e72bcd52da04f9d848a7eaf393b6e1",
-        "size": 272602042
+        "sha256": "661dba7d55e097ae0eb62ff2475b4e9fe7a59d8e25560d8c1981aad85901b60c",
+        "size": 269957159
       },
       "macos-aarch64": {
-        "sha256": "e7eccdc74046963eee1628ec6ff0952645c0bc79554bbbb22c614347d95cf7db",
-        "size": 269469124
+        "sha256": "2b0c86dad5402d89a2a9931c0d018e7ceea246a037412a503601931cd353209b",
+        "size": 266474468
       },
       "macos-amd64": {
-        "sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0",
-        "size": 270606128
+        "sha256": "503a6136a459d8fdb684710b2745b6d114909e619a1043de316ddb9b124c91a8",
+        "size": 267611567
       },
       "windows-aarch64": {
-        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
-        "size": 301279985
+        "sha256": "298e84e1c3f7df4ddc2ae4347ef6a81452def3b2ae986cf95db3350a2a801ad0",
+        "size": 298645215
       },
       "windows-amd64": {
-        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
-        "size": 267185689
+        "sha256": "e5f81a9d442106ce169b8efb92a57b9aa195c2dfcd9d6ff95b1fa324f992d4b5",
+        "size": 264550919
       }
     }
   },
@@ -141,14 +144,18 @@
     "extensions_default_location_flag": "--extensions-default-location"
   },
   "software_lifecycle": {
-    "managed_install": "official install.sh is verified by pinned SHA256, executed only in isolated staging HOME with JUNIE_VERSION=2383.10, then persisted under the explicit target runtime",
+    "managed_install": "official install.sh is verified by pinned SHA256, executed only in isolated staging HOME with JUNIE_VERSION=2470.4, then persisted under the explicit target runtime",
     "install_only_absent": true,
     "update_repairs_safe_partial": true,
     "status_executes_target_binary": false
   },
   "permission_model": {
     "approval_file": "~/.junie/allowlist.json",
-    "brave_levels": ["Off", "Auto", "On"],
+    "brave_levels": [
+      "Off",
+      "Auto",
+      "On"
+    ],
     "safe": "Brave Off; ask by default with empty allow rules",
     "full_auto": "Brave On; all sensitive actions may run without approval according to official Brave mode behavior",
     "unsupported": {

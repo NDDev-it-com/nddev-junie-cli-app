@@ -3,10 +3,15 @@
   "product_name": "nddev-junie-cli-app",
   "build_version": "0.2.0",
   "junie_cli_channel": "release",
-  "junie_cli_tested": "2383.10",
-  "setup_ids": ["nddev-builder"],
+  "junie_cli_tested": "2470.4",
+  "setup_ids": [
+    "nddev-builder"
+  ],
   "default_setup_id": "nddev-builder",
-  "profile_ids": ["safe", "full-auto"],
+  "profile_ids": [
+    "safe",
+    "full-auto"
+  ],
   "default_profile_id": "full-auto",
   "supported_platforms": [
     "macos-arm64",
@@ -43,7 +48,10 @@
     "unsupported-architecture": "unsupported"
   },
   "unsupported_official_artifact_platforms": {
-    "windows": ["windows-aarch64", "windows-amd64"]
+    "windows": [
+      "windows-aarch64",
+      "windows-amd64"
+    ]
   },
   "manager": "cli-tools/nddev_junie_cli.py",
   "contract": "config/nddev-contract.json",

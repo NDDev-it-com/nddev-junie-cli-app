@@ -61,12 +61,12 @@ UNSUPPORTED_OFFICIAL_ARTIFACT_PLATFORMS = {
 }
 WINDOWS_OFFICIAL_ARTIFACT_OBSERVATIONS = {
     "windows-aarch64": {
-        "size": 301279985,
-        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
+        "size": 298645215,
+        "sha256": "298e84e1c3f7df4ddc2ae4347ef6a81452def3b2ae986cf95db3350a2a801ad0",
     },
     "windows-amd64": {
-        "size": 267185689,
-        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
+        "size": 264550919,
+        "sha256": "e5f81a9d442106ce169b8efb92a57b9aa195c2dfcd9d6ff95b1fa324f992d4b5",
     },
 }
 ARTIFACT_PLATFORM_MAP = {
