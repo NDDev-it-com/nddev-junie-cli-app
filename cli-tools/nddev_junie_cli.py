@@ -70,11 +70,61 @@ RUNTIME_DIR_NAME = ".nddev-junie-cli-runtime"
 RUNTIME_RECEIPT_NAME = "NDDEV-JUNIE-CLI-RUNTIME.json"
 CLEANUP_DIR_NAME = ".nddev-junie-cli-cleanup"
 CLEANUP_JOURNAL_NAME = "NDDEV-JUNIE-CLI-CLEANUP.json"
+CLEANUP_STAGE_NAME = "NDDEV-JUNIE-CLI-CLEANUP-STAGE.json"
 CLEANUP_SCHEMA = 1
+CLEANUP_STAGE_SCHEMA = 1
 CLEANUP_MAX_PAYLOADS = 3
+CLEANUP_STAGE_SOURCE_ANCHOR = "canonical_target"
+CLEANUP_STAGE_DESTINATION_ANCHOR = "cleanup_parent"
+CLEANUP_STAGE_TARGET_KIND = "canonical-target-directory"
+CLEANUP_STAGE_SOURCE_PARENT_KIND = "cleanup-source-parent-directory"
+CLEANUP_STAGE_SOURCE_KIND = "cleanup-source-directory"
+CLEANUP_STAGE_DESTINATION_PARENT_KIND = "cleanup-tombstone-parent-directory"
+CLEANUP_STAGE_DESTINATION_KIND = "cleanup-tombstone-payload-directory"
+CLEANUP_STAGE_DIRECTORY_IDENTITY_KEYS = frozenset({"kind", "uid", "mode", "dev", "ino"})
+CLEANUP_STAGE_KEYS = frozenset(
+    {
+        "schema_version",
+        "product_name",
+        "build_version",
+        "canonical_target",
+        "canonical_target_sha256",
+        "cleanup_parent",
+        "stage_relative",
+        "journal_relative",
+        "max_payloads",
+        "target_kind",
+        "target_identity",
+        "reason",
+        "journal_size",
+        "journal_sha256",
+        "journal",
+        "entries",
+    }
+)
+CLEANUP_STAGE_ENTRY_KEYS = frozenset(
+    {
+        "name",
+        "label",
+        "source_anchor",
+        "source_relative",
+        "source_parent_anchor",
+        "source_parent_relative",
+        "source_parent_kind",
+        "source_parent_identity",
+        "source_kind",
+        "destination_anchor",
+        "destination_relative",
+        "destination_parent_anchor",
+        "destination_parent_relative",
+        "destination_parent_kind",
+        "destination_kind",
+    }
+)
 CLEANUP_DIGEST_MAX_ENTRIES = 20_000
 CLEANUP_DIGEST_MAX_BYTES = 4 * 1024 * 1024 * 1024
 CLEANUP_JOURNAL_MAX_BYTES = 16 * 1024 * 1024
+CLEANUP_STAGE_MAX_BYTES = 2 * CLEANUP_JOURNAL_MAX_BYTES
 LAUNCH_IMAGE_DIR_NAME = "launch-image"
 LAUNCH_IMAGE_COMMAND_NAME = "junie"
 LOCK_DIR_NAME = ".nddev-junie-cli.lock"
@@ -252,14 +302,18 @@ class RuntimeRemoveTransaction:
 class CleanupPromotion:
     target: Path
     journal_path: Path
+    stage_path: Path
     journal: dict[str, Any]
+    stage: dict[str, Any]
     originals: dict[str, Path]
     promoted: list[str]
     target_directory: DirectorySnapshot
     root_directory: DirectorySnapshot
     journal_snapshot: FileSnapshot
+    stage_snapshot: FileSnapshot
     journal_published: bool = False
     journal_durable: bool = False
+    stage_published: bool = False
 
 
 @dataclass
@@ -1827,12 +1881,39 @@ def cleanup_journal_path(target: Path) -> Path:
     return target / CLEANUP_JOURNAL_NAME
 
 
+def cleanup_stage_path(target: Path) -> Path:
+    return target / CLEANUP_STAGE_NAME
+
+
 def cleanup_payload_name(index: int) -> str:
     return f"payload-{index}"
 
 
 def cleanup_journal_temp_prefix() -> str:
     return f".{CLEANUP_JOURNAL_NAME}.nddev.tmp."
+
+
+def cleanup_stage_temp_prefix() -> str:
+    return f".{CLEANUP_STAGE_NAME}.nddev.tmp."
+
+
+def cleanup_stage_directory_identity(path: Path, label: str) -> dict[str, Any]:
+    info = require_private_directory(path, label)
+    return {
+        "kind": "directory",
+        "uid": info.st_uid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+    }
+
+
+def validate_cleanup_stage_directory_identity(path: Path, label: str, expected: object) -> None:
+    if not isinstance(expected, dict) or set(expected) != CLEANUP_STAGE_DIRECTORY_IDENTITY_KEYS:
+        fail(f"{label} identity binding is invalid")
+    current = cleanup_stage_directory_identity(path, label)
+    if current != expected:
+        fail(f"{label} identity changed")
 
 
 def cleanup_object_metadata(path: Path, root: Path, label: str) -> tuple[dict[str, Any], int]:
@@ -2097,6 +2178,103 @@ def cleanup_pending_payload(
     }
 
 
+def build_cleanup_journal_projection(
+    target: Path,
+    reason: str,
+    pending: list[tuple[Path, str]],
+) -> tuple[dict[str, Any], bytes]:
+    entries = []
+    target_info = require_private_directory(target, "managed target")
+    for index, (path, label) in enumerate(pending):
+        if path == target or target not in path.parents:
+            fail("cleanup tombstone source escaped managed target")
+        info = require_private_directory(path, label)
+        if info.st_dev != target_info.st_dev:
+            fail("cleanup tombstone source must be on the managed target filesystem")
+        entries.append(
+            {
+                "name": cleanup_payload_name(index),
+                "label": label,
+                "metadata": cleanup_payload_metadata(path, label),
+            }
+        )
+    journal = cleanup_pending_payload(target, reason, entries)
+    data = canonical_json(journal)
+    if len(data) > CLEANUP_JOURNAL_MAX_BYTES:
+        fail("cleanup journal is too large")
+    return journal, data
+
+
+def cleanup_stage_payload(
+    target: Path,
+    reason: str,
+    pending: list[tuple[Path, str]],
+    journal: dict[str, Any],
+    journal_data: bytes,
+) -> dict[str, Any]:
+    canonical = validate_target(target, create=False)
+    entries = []
+    for index, (path, label) in enumerate(pending):
+        name = cleanup_payload_name(index)
+        source_parent_relative = (
+            "." if path.parent == target else relative_to_target(target, path.parent)
+        )
+        entries.append(
+            {
+                "name": name,
+                "label": label,
+                "source_anchor": CLEANUP_STAGE_SOURCE_ANCHOR,
+                "source_relative": relative_to_target(target, path),
+                "source_parent_anchor": CLEANUP_STAGE_SOURCE_ANCHOR,
+                "source_parent_relative": source_parent_relative,
+                "source_parent_kind": CLEANUP_STAGE_SOURCE_PARENT_KIND,
+                "source_parent_identity": cleanup_stage_directory_identity(
+                    path.parent,
+                    f"{label} parent",
+                ),
+                "source_kind": CLEANUP_STAGE_SOURCE_KIND,
+                "destination_anchor": CLEANUP_STAGE_DESTINATION_ANCHOR,
+                "destination_relative": name,
+                "destination_parent_anchor": CLEANUP_STAGE_DESTINATION_ANCHOR,
+                "destination_parent_relative": ".",
+                "destination_parent_kind": CLEANUP_STAGE_DESTINATION_PARENT_KIND,
+                "destination_kind": CLEANUP_STAGE_DESTINATION_KIND,
+            }
+        )
+    return {
+        "schema_version": CLEANUP_STAGE_SCHEMA,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "canonical_target": str(canonical),
+        "canonical_target_sha256": sha256_bytes(str(canonical).encode("utf-8")),
+        "cleanup_parent": CLEANUP_DIR_NAME,
+        "stage_relative": CLEANUP_STAGE_NAME,
+        "journal_relative": CLEANUP_JOURNAL_NAME,
+        "max_payloads": CLEANUP_MAX_PAYLOADS,
+        "target_kind": CLEANUP_STAGE_TARGET_KIND,
+        "target_identity": cleanup_stage_directory_identity(target, "managed target"),
+        "reason": reason,
+        "journal_size": len(journal_data),
+        "journal_sha256": sha256_bytes(journal_data),
+        "journal": journal,
+        "entries": entries,
+    }
+
+
+def build_cleanup_stage_projection(
+    target: Path,
+    reason: str,
+    pending: list[tuple[Path, str]],
+    journal: dict[str, Any],
+    journal_data: bytes,
+) -> tuple[dict[str, Any], bytes]:
+    stage = cleanup_stage_payload(target, reason, pending, journal, journal_data)
+    data = canonical_json(stage)
+    if len(data) > CLEANUP_STAGE_MAX_BYTES:
+        fail("cleanup promotion stage is too large")
+    return stage, data
+
+
 def cleanup_pending_summary_from_journal(
     target: Path,
     journal: dict[str, Any] | None,
@@ -2122,40 +2300,14 @@ def cleanup_pending_summary_from_journal(
     }
 
 
-def validate_cleanup_journal(target: Path) -> dict[str, Any] | None:
+def validate_cleanup_journal_document(
+    target: Path,
+    payload: dict[str, Any],
+    *,
+    root_exists: bool,
+    require_complete: bool,
+) -> dict[str, Any]:
     root = cleanup_root(target)
-    journal_path = cleanup_journal_path(target)
-    root_exists = lstat_exists(root)
-    journal_exists = lstat_exists(journal_path)
-    temp_records = (
-        [
-            path.name
-            for path in target.iterdir()
-            if path.name.startswith(cleanup_journal_temp_prefix())
-        ]
-        if lstat_exists(target)
-        else []
-    )
-    if temp_records:
-        fail("cleanup journal has intermediate residue")
-    if not root_exists and not journal_exists:
-        return None
-    if not journal_exists:
-        fail("cleanup tombstone is unjournaled")
-    journal_info = require_existing_managed_file(
-        journal_path,
-        CLEANUP_JOURNAL_NAME,
-        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
-    )
-    if journal_info is None:
-        fail("cleanup journal is missing")
-    if stat.S_IMODE(journal_info.st_mode) != OWNER_FILE_MODE:
-        fail("cleanup journal mode must be 0600")
-    payload = read_json_file(
-        journal_path,
-        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
-        label=CLEANUP_JOURNAL_NAME,
-    )
     if payload.get("schema_version") != CLEANUP_SCHEMA:
         fail("cleanup journal schema is unsupported")
     if payload.get("product_name") != PRODUCT_NAME:
@@ -2197,15 +2349,65 @@ def validate_cleanup_journal(target: Path) -> dict[str, Any] | None:
                 payload_path,
                 label,
                 metadata,
-                require_complete=False,
+                require_complete=require_complete,
             )
+        elif require_complete:
+            fail("cleanup tombstone payload is missing")
     if root_exists:
         require_private_directory(root, "cleanup tombstone")
         actual = sorted(path.name for path in root.iterdir())
         unknown = sorted(set(actual) - names)
         if unknown:
             fail("cleanup tombstone contains unknown entries")
+        if require_complete and actual != sorted(names):
+            fail("cleanup tombstone object graph is incomplete")
     return payload
+
+
+def validate_cleanup_journal(target: Path, *, allow_stage: bool = False) -> dict[str, Any] | None:
+    root = cleanup_root(target)
+    journal_path = cleanup_journal_path(target)
+    stage_path = cleanup_stage_path(target)
+    root_exists = lstat_exists(root)
+    journal_exists = lstat_exists(journal_path)
+    temp_records = (
+        [
+            path.name
+            for path in target.iterdir()
+            if path.name.startswith(cleanup_journal_temp_prefix())
+            or path.name.startswith(cleanup_stage_temp_prefix())
+        ]
+        if lstat_exists(target)
+        else []
+    )
+    if temp_records:
+        fail("cleanup journal has intermediate residue")
+    if not allow_stage and lstat_exists(stage_path):
+        fail("cleanup promotion stage requires mutation recovery")
+    if not root_exists and not journal_exists:
+        return None
+    if not journal_exists:
+        fail("cleanup tombstone is unjournaled")
+    journal_info = require_existing_managed_file(
+        journal_path,
+        CLEANUP_JOURNAL_NAME,
+        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+    )
+    if journal_info is None:
+        fail("cleanup journal is missing")
+    if stat.S_IMODE(journal_info.st_mode) != OWNER_FILE_MODE:
+        fail("cleanup journal mode must be 0600")
+    payload = read_json_file(
+        journal_path,
+        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+        label=CLEANUP_JOURNAL_NAME,
+    )
+    return validate_cleanup_journal_document(
+        target,
+        payload,
+        root_exists=root_exists,
+        require_complete=False,
+    )
 
 
 def cleanup_state(target: Path) -> dict[str, Any]:
@@ -2222,6 +2424,254 @@ def cleanup_pending(target: Path) -> bool:
     return bool(cleanup_state(target)["pending"])
 
 
+def validate_complete_cleanup_journal(target: Path, journal: dict[str, Any]) -> None:
+    root = cleanup_root(target)
+    if not lstat_exists(root):
+        fail("cleanup tombstone is missing")
+    entries = journal.get("entries")
+    if not isinstance(entries, list) or not entries:
+        fail("cleanup journal entries are invalid or over bound")
+    names: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            fail("cleanup journal entry is invalid")
+        name = entry.get("name")
+        label = entry.get("label")
+        metadata = entry.get("metadata")
+        if (
+            not isinstance(name, str)
+            or not isinstance(label, str)
+            or not isinstance(metadata, dict)
+        ):
+            fail("cleanup journal entry is invalid")
+        names.add(name)
+        payload = root / name
+        if not lstat_exists(payload):
+            fail("cleanup tombstone payload is missing")
+        validate_cleanup_payload_graph(payload, label, metadata, require_complete=True)
+    require_private_directory(root, "cleanup tombstone")
+    actual = sorted(path.name for path in root.iterdir())
+    if actual != sorted(names):
+        fail("cleanup tombstone contains unknown entries")
+
+
+def validate_published_cleanup_journal(
+    path: Path,
+    data: bytes,
+    target: Path,
+    *,
+    allow_stage: bool = False,
+) -> None:
+    info = require_existing_managed_file(
+        path,
+        CLEANUP_JOURNAL_NAME,
+        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+    )
+    if info is None or stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("cleanup journal publication failed mode verification")
+    if (
+        read_existing_file(
+            path,
+            max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+            label=CLEANUP_JOURNAL_NAME,
+        )
+        != data
+    ):
+        fail("cleanup journal publication failed content verification")
+    journal = validate_cleanup_journal(target, allow_stage=allow_stage)
+    if journal is None:
+        fail("cleanup journal publication failed final validation")
+    if canonical_json(journal) != data:
+        fail("cleanup journal publication failed canonical verification")
+    validate_complete_cleanup_journal(target, journal)
+
+
+def validate_cleanup_stage(target: Path) -> dict[str, Any] | None:
+    path = cleanup_stage_path(target)
+    if not lstat_exists(path):
+        return None
+    info = require_existing_managed_file(
+        path,
+        CLEANUP_STAGE_NAME,
+        max_bytes=CLEANUP_STAGE_MAX_BYTES,
+    )
+    if info is None or stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("cleanup promotion stage mode must be 0600")
+    data = read_existing_file(path, max_bytes=CLEANUP_STAGE_MAX_BYTES, label=CLEANUP_STAGE_NAME)
+    if data is None:
+        fail("cleanup promotion stage is missing")
+    try:
+        stage = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"cleanup promotion stage is invalid JSON: {exc}")
+    if not isinstance(stage, dict):
+        fail("cleanup promotion stage must contain a JSON object")
+    if canonical_json(stage) != data:
+        fail("cleanup promotion stage canonical binding is invalid")
+    if set(stage) != CLEANUP_STAGE_KEYS:
+        fail("cleanup promotion stage field set is invalid")
+    if stage.get("schema_version") != CLEANUP_STAGE_SCHEMA:
+        fail("cleanup promotion stage schema is unsupported")
+    if stage.get("product_name") != PRODUCT_NAME:
+        fail("cleanup promotion stage belongs to another product")
+    canonical = str(validate_target(target, create=False))
+    if stage.get("canonical_target") != canonical:
+        fail("cleanup promotion stage is bound to a different target")
+    if stage.get("canonical_target_sha256") != sha256_bytes(canonical.encode("utf-8")):
+        fail("cleanup promotion stage target digest is invalid")
+    if stage.get("cleanup_parent") != CLEANUP_DIR_NAME:
+        fail("cleanup promotion stage parent binding is invalid")
+    if stage.get("stage_relative") != CLEANUP_STAGE_NAME:
+        fail("cleanup promotion stage path binding is invalid")
+    if stage.get("journal_relative") != CLEANUP_JOURNAL_NAME:
+        fail("cleanup promotion stage journal binding is invalid")
+    if stage.get("max_payloads") != CLEANUP_MAX_PAYLOADS:
+        fail("cleanup promotion stage bound is invalid")
+    if stage.get("target_kind") != CLEANUP_STAGE_TARGET_KIND:
+        fail("cleanup promotion stage target kind binding is invalid")
+    validate_cleanup_stage_directory_identity(
+        target,
+        "cleanup promotion stage target",
+        stage.get("target_identity"),
+    )
+    reason = stage.get("reason")
+    if not isinstance(reason, str) or not reason:
+        fail("cleanup promotion stage reason is invalid")
+    journal = stage.get("journal")
+    if not isinstance(journal, dict):
+        fail("cleanup promotion stage journal is invalid")
+    journal_data = canonical_json(journal)
+    if stage.get("journal_size") != len(journal_data):
+        fail("cleanup promotion stage journal size binding is invalid")
+    if stage.get("journal_sha256") != sha256_bytes(journal_data):
+        fail("cleanup promotion stage journal digest is invalid")
+    entries = stage.get("entries")
+    journal_entries = journal.get("entries")
+    if (
+        not isinstance(entries, list)
+        or not isinstance(journal_entries, list)
+        or not entries
+        or len(entries) != len(journal_entries)
+        or len(entries) > CLEANUP_MAX_PAYLOADS
+    ):
+        fail("cleanup promotion stage entries are invalid or over bound")
+    validate_cleanup_journal_document(
+        target,
+        journal,
+        root_exists=lstat_exists(cleanup_root(target)),
+        require_complete=False,
+    )
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            fail("cleanup promotion stage entry is invalid")
+        if set(entry) != CLEANUP_STAGE_ENTRY_KEYS:
+            fail("cleanup promotion stage entry field set is invalid")
+        name = entry.get("name")
+        label = entry.get("label")
+        source_anchor = entry.get("source_anchor")
+        source_relative = entry.get("source_relative")
+        source_parent_anchor = entry.get("source_parent_anchor")
+        source_parent_relative = entry.get("source_parent_relative")
+        source_parent_kind = entry.get("source_parent_kind")
+        source_parent_identity = entry.get("source_parent_identity")
+        source_kind = entry.get("source_kind")
+        destination_anchor = entry.get("destination_anchor")
+        destination_relative = entry.get("destination_relative")
+        destination_parent_anchor = entry.get("destination_parent_anchor")
+        destination_parent_relative = entry.get("destination_parent_relative")
+        destination_parent_kind = entry.get("destination_parent_kind")
+        destination_kind = entry.get("destination_kind")
+        journal_entry = journal_entries[index]
+        if (
+            name != cleanup_payload_name(index)
+            or not isinstance(journal_entry, dict)
+            or journal_entry.get("name") != name
+        ):
+            fail("cleanup promotion stage payload binding is invalid")
+        if not isinstance(label, str) or label != journal_entry.get("label"):
+            fail("cleanup promotion stage label binding is invalid")
+        if source_anchor != CLEANUP_STAGE_SOURCE_ANCHOR:
+            fail("cleanup promotion stage source anchor binding is invalid")
+        if not isinstance(source_relative, str):
+            fail("cleanup promotion stage source path binding is invalid")
+        if source_kind != CLEANUP_STAGE_SOURCE_KIND:
+            fail("cleanup promotion stage source kind binding is invalid")
+        if destination_anchor != CLEANUP_STAGE_DESTINATION_ANCHOR:
+            fail("cleanup promotion stage destination anchor binding is invalid")
+        if destination_relative != name:
+            fail("cleanup promotion stage destination path binding is invalid")
+        if destination_kind != CLEANUP_STAGE_DESTINATION_KIND:
+            fail("cleanup promotion stage destination kind binding is invalid")
+        original = safe_target_path(target, source_relative)
+        if original == target or target not in original.parents:
+            fail("cleanup promotion stage source path escaped managed target")
+        if source_parent_anchor != CLEANUP_STAGE_SOURCE_ANCHOR:
+            fail("cleanup promotion stage source parent anchor binding is invalid")
+        if not isinstance(source_parent_relative, str):
+            fail("cleanup promotion stage source parent path binding is invalid")
+        source_parent = (
+            target
+            if source_parent_relative == "."
+            else safe_target_path(target, source_parent_relative)
+        )
+        if source_parent != original.parent:
+            fail("cleanup promotion stage source parent path binding is invalid")
+        if source_parent_kind != CLEANUP_STAGE_SOURCE_PARENT_KIND:
+            fail("cleanup promotion stage source parent kind binding is invalid")
+        validate_cleanup_stage_directory_identity(
+            source_parent,
+            "cleanup promotion stage source parent",
+            source_parent_identity,
+        )
+        destination = safe_target_path(cleanup_root(target), destination_relative)
+        if destination.parent != cleanup_root(target):
+            fail("cleanup promotion stage destination path escaped cleanup parent")
+        if destination_parent_anchor != CLEANUP_STAGE_DESTINATION_ANCHOR:
+            fail("cleanup promotion stage destination parent anchor binding is invalid")
+        if destination_parent_relative != ".":
+            fail("cleanup promotion stage destination parent path binding is invalid")
+        if destination_parent_kind != CLEANUP_STAGE_DESTINATION_PARENT_KIND:
+            fail("cleanup promotion stage destination parent kind binding is invalid")
+    return stage
+
+
+def publish_cleanup_stage_no_replace(path: Path, data: bytes, target: Path) -> None:
+    if len(data) > CLEANUP_STAGE_MAX_BYTES:
+        fail("cleanup promotion stage is too large")
+    ensure_real_parent(path, target)
+    temporary = path.with_name(f"{cleanup_stage_temp_prefix()}{os.getpid()}.{time.time_ns()}")
+    parent_before = backup_directory_snapshot(path.parent)
+    fd = -1
+    published = False
+    try:
+        fd = os.open(
+            temporary,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow_flag(),
+            OWNER_FILE_MODE,
+        )
+        os.fchmod(fd, OWNER_FILE_MODE)
+        write_all_fd(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        atomic_rename_no_replace(temporary, path)
+        published = True
+        validate_cleanup_stage(target)
+        fsync_directory(path.parent)
+        validate_cleanup_stage(target)
+    except BaseException:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            unlink_path_if_exists(temporary)
+        if published:
+            with contextlib.suppress(BaseException):
+                unlink_path_if_exists(path)
+        restore_backup_directory_metadata(path.parent, parent_before)
+        raise
+
+
 def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) -> None:
     if len(data) > CLEANUP_JOURNAL_MAX_BYTES:
         fail("cleanup journal is too large")
@@ -2230,6 +2680,7 @@ def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) ->
     parent_before = backup_directory_snapshot(path.parent)
     fd = -1
     published = False
+    final_validated = False
     try:
         fd = os.open(
             temporary,
@@ -2256,23 +2707,10 @@ def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) ->
         fd = -1
         atomic_rename_no_replace(temporary, path)
         published = True
+        validate_published_cleanup_journal(path, data, target, allow_stage=True)
+        final_validated = True
         fsync_directory(path.parent)
-        info = require_existing_managed_file(
-            path,
-            CLEANUP_JOURNAL_NAME,
-            max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
-        )
-        if info is None or stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
-            fail("cleanup journal publication failed mode verification")
-        if (
-            read_existing_file(
-                path,
-                max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
-                label=CLEANUP_JOURNAL_NAME,
-            )
-            != data
-        ):
-            fail("cleanup journal publication failed content verification")
+        validate_published_cleanup_journal(path, data, target, allow_stage=True)
     except BaseException as exc:
         if fd >= 0:
             with contextlib.suppress(OSError):
@@ -2280,6 +2718,10 @@ def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) ->
         with contextlib.suppress(FileNotFoundError):
             unlink_path_if_exists(temporary)
         if not published:
+            restore_backup_directory_metadata(path.parent, parent_before)
+        elif not final_validated:
+            with contextlib.suppress(BaseException):
+                unlink_path_if_exists(path)
             restore_backup_directory_metadata(path.parent, parent_before)
         else:
             raise CleanupJournalPublicationError(
@@ -2296,6 +2738,12 @@ def rollback_cleanup_promotion(promotion: CleanupPromotion) -> None:
             unlink_path(promotion.journal_path)
         except BaseException as exc:
             last_error = exc
+    if lstat_exists(promotion.stage_path):
+        try:
+            unlink_path(promotion.stage_path)
+        except BaseException as exc:
+            if last_error is None:
+                last_error = exc
     for name in reversed(promotion.promoted):
         path = root / name
         original = promotion.originals[name]
@@ -2322,6 +2770,11 @@ def rollback_cleanup_promotion(promotion: CleanupPromotion) -> None:
             promotion.journal_snapshot,
             promotion.target,
         )
+    restore_atomic_write_snapshot(
+        promotion.stage_path,
+        promotion.stage_snapshot,
+        promotion.target,
+    )
     if last_error is not None:
         raise last_error
 
@@ -2340,22 +2793,33 @@ def promote_cleanup_items(
         fail("cleanup tombstone already exists")
     root = cleanup_root(target)
     journal_path = cleanup_journal_path(target)
+    stage_path = cleanup_stage_path(target)
+    if lstat_exists(stage_path):
+        fail("cleanup promotion stage already exists")
+    journal, journal_data = build_cleanup_journal_projection(target, reason, pending)
+    stage, stage_data = build_cleanup_stage_projection(
+        target, reason, pending, journal, journal_data
+    )
     promotion = CleanupPromotion(
         target=target,
         journal_path=journal_path,
-        journal={},
+        stage_path=stage_path,
+        journal=journal,
+        stage=stage,
         originals={},
         promoted=[],
         target_directory=backup_directory_snapshot(target),
         root_directory=backup_directory_snapshot(root),
         journal_snapshot=file_snapshot_for_atomic_write(journal_path),
+        stage_snapshot=file_snapshot_for_atomic_write(stage_path),
     )
     try:
+        publish_cleanup_stage_no_replace(stage_path, stage_data, target)
+        promotion.stage_published = True
         root.mkdir(mode=OWNER_DIRECTORY_MODE)
         fsync_directory(target)
         require_private_directory(root, "cleanup tombstone")
-        for index, (path, label) in enumerate(pending):
-            require_private_directory(path, label)
+        for index, (path, _label) in enumerate(pending):
             name = cleanup_payload_name(index)
             destination = root / name
             promotion.originals[name] = path
@@ -2363,32 +2827,34 @@ def promote_cleanup_items(
             promotion.promoted.append(name)
             fsync_directory(path.parent)
             fsync_directory(root)
-        entries = []
+        moved_entries = []
         for index, (path, label) in enumerate(pending):
             name = cleanup_payload_name(index)
-            entries.append(
+            moved_entries.append(
                 {
                     "name": name,
                     "label": label,
                     "metadata": cleanup_payload_metadata(root / name, label),
                 }
             )
-        promotion.journal = cleanup_pending_payload(target, reason, entries)
-        publish_cleanup_journal_no_replace(
-            journal_path,
-            canonical_json(promotion.journal),
-            target,
-        )
+        moved_journal = cleanup_pending_payload(target, reason, moved_entries)
+        if canonical_json(moved_journal) != journal_data:
+            fail("cleanup journal projection changed after tombstone promotion")
+        promotion.journal = moved_journal
+        publish_cleanup_journal_no_replace(journal_path, journal_data, target)
         promotion.journal_published = True
+        if lstat_exists(stage_path):
+            unlink_path(stage_path)
+            fsync_directory(target)
         promotion.journal_durable = True
         return promotion
     except CleanupJournalPublicationError:
-        promotion.journal_published = lstat_exists(journal_path)
+        promotion.journal_published = True
+        if lstat_exists(stage_path):
+            unlink_path(stage_path)
+            fsync_directory(target)
         promotion.journal_durable = False
-        if promotion.journal_published:
-            return promotion
-        rollback_cleanup_promotion(promotion)
-        raise
+        return promotion
     except BaseException:
         rollback_cleanup_promotion(promotion)
         raise
@@ -2408,6 +2874,105 @@ def unlink_cleanup_journal_with_restore(target: Path, journal: dict[str, Any]) -
                     target,
                 )
         raise
+
+
+def remove_cleanup_stage(target: Path) -> None:
+    path = cleanup_stage_path(target)
+    if lstat_exists(path):
+        unlink_path(path)
+        fsync_directory(target)
+
+
+def cleanup_publication_temp_aliases(target: Path) -> list[Path]:
+    if not lstat_exists(target):
+        return []
+    return [
+        path
+        for path in target.iterdir()
+        if path.name.startswith(cleanup_journal_temp_prefix())
+        or path.name.startswith(cleanup_stage_temp_prefix())
+    ]
+
+
+def recover_cleanup_publication_temp_aliases(target: Path) -> bool:
+    aliases = cleanup_publication_temp_aliases(target)
+    if not aliases:
+        return False
+    if len(aliases) > 1:
+        fail("cleanup publication has multiple intermediate aliases")
+    alias = aliases[0]
+    info = require_existing_managed_file(
+        alias,
+        "cleanup publication temp alias",
+        max_bytes=CLEANUP_STAGE_MAX_BYTES,
+    )
+    if info is None or stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("cleanup publication temp alias is invalid")
+    unlink_path(alias)
+    fsync_directory(target)
+    return True
+
+
+def recover_cleanup_promotion_stage(target: Path) -> bool:
+    recovered_temp = recover_cleanup_publication_temp_aliases(target)
+    stage = validate_cleanup_stage(target)
+    if stage is None:
+        return recovered_temp
+    journal = stage["journal"]
+    journal_data = canonical_json(journal)
+    journal_path = cleanup_journal_path(target)
+    if lstat_exists(journal_path):
+        validate_published_cleanup_journal(
+            journal_path,
+            journal_data,
+            target,
+            allow_stage=True,
+        )
+        remove_cleanup_stage(target)
+        return True
+    root = cleanup_root(target)
+    if not lstat_exists(root):
+        root.mkdir(mode=OWNER_DIRECTORY_MODE)
+        fsync_directory(target)
+    require_private_directory(root, "cleanup tombstone")
+    journal_entries = journal["entries"]
+    for index, stage_entry in enumerate(stage["entries"]):
+        journal_entry = journal_entries[index]
+        name = stage_entry["name"]
+        label = stage_entry["label"]
+        metadata = journal_entry["metadata"]
+        original = safe_target_path(target, stage_entry["source_relative"])
+        payload = safe_target_path(root, stage_entry["destination_relative"])
+        original_exists = lstat_exists(original)
+        payload_exists = lstat_exists(payload)
+        if original_exists and payload_exists:
+            fail("cleanup promotion stage has duplicate source and tombstone payload")
+        if not original_exists and not payload_exists:
+            fail("cleanup promotion stage source and tombstone payload are both missing")
+        if original_exists:
+            validate_cleanup_payload_graph(original, label, metadata, require_complete=True)
+            original.rename(payload)
+            fsync_directory(original.parent)
+            fsync_directory(root)
+        else:
+            validate_cleanup_payload_graph(payload, label, metadata, require_complete=True)
+    moved_entries = []
+    for entry in journal_entries:
+        name = entry["name"]
+        label = entry["label"]
+        moved_entries.append(
+            {
+                "name": name,
+                "label": label,
+                "metadata": cleanup_payload_metadata(root / name, label),
+            }
+        )
+    moved_journal = cleanup_pending_payload(target, stage["reason"], moved_entries)
+    if canonical_json(moved_journal) != journal_data:
+        fail("cleanup promotion stage changed after recovery")
+    publish_cleanup_journal_no_replace(journal_path, journal_data, target)
+    remove_cleanup_stage(target)
+    return True
 
 
 def cleanup_present_relatives(path: Path, label: str, metadata: dict[str, Any]) -> set[str]:
@@ -2500,7 +3065,8 @@ def drain_cleanup_journal(target: Path, *, pending_on_failure: bool) -> bool:
 
 
 def drain_cleanup_before_mutation(target: Path) -> bool:
-    had_pending = cleanup_pending(target)
+    recovered_stage = recover_cleanup_promotion_stage(target)
+    had_pending = recovered_stage or cleanup_pending(target)
     drain_cleanup_journal(target, pending_on_failure=False)
     return had_pending
 

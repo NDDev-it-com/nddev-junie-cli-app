@@ -988,7 +988,9 @@ def validate_target_observation_after_seeded_product_lock(manager: Any) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-junie-lock-order-") as raw:
         root = Path(raw)
         target = root / "missing-parent" / "target"
-        product_root = manager.bootstrap_lock_product_root_path(manager.bootstrap_lock_system_root())
+        product_root = manager.bootstrap_lock_product_root_path(
+            manager.bootstrap_lock_system_root()
+        )
         product = manager.open_bootstrap_global_lock(create=True, exclusive=True)
         manager.release_bootstrap_global_lock(product)
         product_coordination_entered = {"value": False}
@@ -2202,13 +2204,16 @@ def validate_software_remove_and_noop_lifecycle(manager: Any) -> None:
         if temporary_residue(target):
             raise ValueError("remove-cli post-remove fault left transaction residue")
 
+
 def validate_failed_first_install_restores_parent(manager: Any) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-junie-first-install-fault-") as raw:
         parent = Path(raw) / "targets"
         parent.mkdir(mode=0o700)
         target = parent / "junie"
         before_parent = exact_tree_snapshot(parent)
-        product_root = manager.bootstrap_lock_product_root_path(manager.bootstrap_lock_system_root())
+        product_root = manager.bootstrap_lock_product_root_path(
+            manager.bootstrap_lock_system_root()
+        )
         setup = manager.load_setup(DEFAULT_SETUP_ID)
         safe = manager.load_profile("safe")
         original_atomic = manager.atomic_write
@@ -3061,11 +3066,14 @@ def main(argv: list[str] | None = None) -> int:
     cleanup_expected = {
         "cleanup_directory": "<target>/.nddev-junie-cli-cleanup",
         "cleanup_journal": "<target>/NDDEV-JUNIE-CLI-CLEANUP.json",
+        "cleanup_stage": "<target>/NDDEV-JUNIE-CLI-CLEANUP-STAGE.json",
         "cleanup_journal_schema": manager.CLEANUP_SCHEMA,
+        "cleanup_stage_schema": manager.CLEANUP_STAGE_SCHEMA,
         "cleanup_journal_max_payloads": manager.CLEANUP_MAX_PAYLOADS,
         "cleanup_journal_max_entries": manager.CLEANUP_DIGEST_MAX_ENTRIES,
         "cleanup_journal_max_bytes": manager.CLEANUP_DIGEST_MAX_BYTES,
         "cleanup_journal_max_journal_bytes": manager.CLEANUP_JOURNAL_MAX_BYTES,
+        "cleanup_stage_max_bytes": manager.CLEANUP_STAGE_MAX_BYTES,
     }
     for key, expected in cleanup_expected.items():
         if contract["managed_state"].get(key) != expected:
@@ -3074,8 +3082,12 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("manifest cleanup journal directory does not match manager constant")
     if cleanup_manifest.get("journal") != manager.CLEANUP_JOURNAL_NAME:
         raise ValueError("manifest cleanup journal name does not match manager constant")
+    if cleanup_manifest.get("stage") != manager.CLEANUP_STAGE_NAME:
+        raise ValueError("manifest cleanup stage name does not match manager constant")
     if cleanup_manifest.get("schema") != manager.CLEANUP_SCHEMA:
         raise ValueError("manifest cleanup journal schema does not match manager constant")
+    if cleanup_manifest.get("stage_schema") != manager.CLEANUP_STAGE_SCHEMA:
+        raise ValueError("manifest cleanup stage schema does not match manager constant")
     if cleanup_manifest.get("max_payloads") != manager.CLEANUP_MAX_PAYLOADS:
         raise ValueError("manifest cleanup max_payloads does not match manager constant")
     if cleanup_manifest.get("max_entries") != manager.CLEANUP_DIGEST_MAX_ENTRIES:
@@ -3084,6 +3096,36 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("manifest cleanup max_bytes does not match manager constant")
     if cleanup_manifest.get("max_journal_bytes") != manager.CLEANUP_JOURNAL_MAX_BYTES:
         raise ValueError("manifest cleanup max_journal_bytes does not match manager constant")
+    if cleanup_manifest.get("max_stage_bytes") != manager.CLEANUP_STAGE_MAX_BYTES:
+        raise ValueError("manifest cleanup max_stage_bytes does not match manager constant")
+    stage_binding = cleanup_manifest.get("stage_binding", {})
+    if stage_binding.get("source_anchor") != manager.CLEANUP_STAGE_SOURCE_ANCHOR:
+        raise ValueError("manifest cleanup stage source anchor does not match manager constant")
+    if stage_binding.get("source_parent_kind") != manager.CLEANUP_STAGE_SOURCE_PARENT_KIND:
+        raise ValueError(
+            "manifest cleanup stage source parent kind does not match manager constant"
+        )
+    if stage_binding.get("source_kind") != manager.CLEANUP_STAGE_SOURCE_KIND:
+        raise ValueError("manifest cleanup stage source kind does not match manager constant")
+    if stage_binding.get("destination_anchor") != manager.CLEANUP_STAGE_DESTINATION_ANCHOR:
+        raise ValueError(
+            "manifest cleanup stage destination anchor does not match manager constant"
+        )
+    if (
+        stage_binding.get("destination_parent_kind")
+        != manager.CLEANUP_STAGE_DESTINATION_PARENT_KIND
+    ):
+        raise ValueError(
+            "manifest cleanup stage destination parent kind does not match manager constant"
+        )
+    if stage_binding.get("destination_kind") != manager.CLEANUP_STAGE_DESTINATION_KIND:
+        raise ValueError("manifest cleanup stage destination kind does not match manager constant")
+    if "bounded relative" not in contract["managed_state"].get("cleanup_stage_binding", ""):
+        raise ValueError("contract must declare bounded relative cleanup stage bindings")
+    if "source_parent_identity" not in contract["managed_state"].get("cleanup_stage_binding", ""):
+        raise ValueError("contract must declare cleanup stage source parent identity binding")
+    if stage_binding.get("target_kind") != manager.CLEANUP_STAGE_TARGET_KIND:
+        raise ValueError("manifest cleanup stage target kind does not match manager constant")
     cleanup_publication = contract["managed_state"].get("cleanup_journal_publication", "")
     for phrase in (
         "complete immutable",
