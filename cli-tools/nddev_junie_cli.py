@@ -84,6 +84,8 @@ UPDATE_INFO_MAX_BYTES = 8 * 1024 * 1024
 SOFTWARE_FILE_MAX_BYTES = 1024 * 1024 * 1024
 INSTALL_TIMEOUT_SECONDS = 900
 PROBE_TIMEOUT_SECONDS = 30
+OS_RELEASE_MAX_BYTES = 128 * 1024
+OS_RELEASE_PATHS = (Path("/etc/os-release"), Path("/usr/lib/os-release"))
 BASE_CONTROL_MANAGED_PATHS = (
     "config.json",
     "AGENTS.md",
@@ -202,8 +204,9 @@ class TransactionSnapshot:
 class SoftwareTransaction:
     metadata: dict[str, Any]
     changed: bool
-    previous_home: Path | None = None
-    new_home: Path | None = None
+    previous_root: Path | None = None
+    new_root: Path | None = None
+    previous_directories: dict[str, DirectorySnapshot] | None = None
 
 
 @dataclass
@@ -464,16 +467,60 @@ def update_info_source(baseline: dict[str, Any]) -> str:
     return baseline["release"]["update_info"]
 
 
+def parse_os_release_text(data: bytes, *, label: str) -> dict[str, str]:
+    if len(data) > OS_RELEASE_MAX_BYTES:
+        fail(f"{label} is too large")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"{label} is not UTF-8: {exc}")
+    result: dict[str, str] = {}
+    for line_number, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, value = stripped.partition("=")
+        if separator != "=" or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            fail(f"{label} line {line_number} is not valid os-release metadata")
+        try:
+            parts = shlex.split(value, comments=True, posix=True)
+        except ValueError as exc:
+            fail(f"{label} line {line_number} has invalid quoting: {exc}")
+        if len(parts) != 1:
+            fail(f"{label} line {line_number} must contain exactly one value")
+        result[key] = parts[0]
+    return result
+
+
+def read_os_release_file(paths: tuple[Path, ...] | None = None) -> dict[str, str]:
+    paths = OS_RELEASE_PATHS if paths is None else paths
+    errors: list[str] = []
+    for path in paths:
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(OS_RELEASE_MAX_BYTES + 1)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        return parse_os_release_text(data, label=str(path))
+    details = "; ".join(errors)
+    if details:
+        fail(f"cannot read Linux distribution metadata: {details}")
+    fail("Linux distribution detection requires /etc/os-release metadata")
+
+
 def linux_os_release(os_release: dict[str, str] | None = None) -> dict[str, str]:
     if os_release is not None:
         return {str(key): str(value) for key, value in os_release.items()}
     reader = getattr(platform, "freedesktop_os_release", None)
-    if reader is None:
-        fail("Linux distribution detection requires freedesktop_os_release metadata")
-    try:
-        return {str(key): str(value) for key, value in reader().items()}
-    except OSError as exc:
-        fail(f"cannot read Linux distribution metadata: {exc}")
+    if reader is not None:
+        try:
+            return {str(key): str(value) for key, value in reader().items()}
+        except OSError as exc:
+            fail(f"cannot read Linux distribution metadata: {exc}")
+    return read_os_release_file()
 
 
 def require_glibc_linux(libc: tuple[str, str] | None = None) -> None:
@@ -996,12 +1043,24 @@ def ensure_bootstrap_lock_product_root() -> Path:
     return root
 
 
+def bootstrap_lock_digest_for(namespace: str, identity: str) -> str:
+    return sha256_bytes(f"{PRODUCT_NAME}\0{namespace}\0{identity}".encode("utf-8"))
+
+
 def bootstrap_lock_digest(canonical: Path) -> str:
-    return sha256_bytes(f"{PRODUCT_NAME}\0target-lifecycle\0{canonical}".encode("utf-8"))
+    return bootstrap_lock_digest_for("target-lifecycle", str(canonical))
+
+
+def lexical_bootstrap_lock_digest(target: Path) -> str:
+    return bootstrap_lock_digest_for("target-lifecycle-precanonical", str(target))
 
 
 def bootstrap_lock_path(canonical: Path) -> Path:
     return ensure_bootstrap_lock_product_root() / f"{bootstrap_lock_digest(canonical)}.lock"
+
+
+def lexical_bootstrap_lock_path(target: Path) -> Path:
+    return ensure_bootstrap_lock_product_root() / f"{lexical_bootstrap_lock_digest(target)}.lock"
 
 
 def bootstrap_lock_binding(canonical: Path) -> dict[str, Any]:
@@ -1015,6 +1074,21 @@ def bootstrap_lock_binding(canonical: Path) -> dict[str, Any]:
         "namespace": "target-lifecycle",
         "canonical_target": str(canonical),
         "canonical_target_sha256": digest,
+        "uid": uid,
+    }
+
+
+def lexical_bootstrap_lock_binding(target: Path) -> dict[str, Any]:
+    uid = current_user_id()
+    if uid is None:
+        fail("bootstrap lock requires a POSIX current user id")
+    digest = lexical_bootstrap_lock_digest(target)
+    return {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "namespace": "target-lifecycle-precanonical",
+        "lexical_target": str(target),
+        "lexical_target_sha256": digest,
         "uid": uid,
     }
 
@@ -1095,9 +1169,7 @@ def ensure_bootstrap_lock_binding(fd: int, binding: dict[str, Any]) -> None:
         fail("bootstrap lock binding does not match the canonical target")
 
 
-def acquire_bootstrap_lock(canonical: Path) -> BootstrapLockHandle:
-    binding = bootstrap_lock_binding(canonical)
-    path = bootstrap_lock_path(canonical)
+def acquire_bootstrap_lock_at(path: Path, binding: dict[str, Any]) -> BootstrapLockHandle:
     fd = open_bootstrap_lock_file(path)
     try:
         try:
@@ -1113,6 +1185,19 @@ def acquire_bootstrap_lock(canonical: Path) -> BootstrapLockHandle:
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
         raise
+
+
+def acquire_bootstrap_lock(canonical: Path) -> BootstrapLockHandle:
+    return acquire_bootstrap_lock_at(
+        bootstrap_lock_path(canonical), bootstrap_lock_binding(canonical)
+    )
+
+
+def acquire_lexical_bootstrap_lock(target: Path) -> BootstrapLockHandle:
+    return acquire_bootstrap_lock_at(
+        lexical_bootstrap_lock_path(target),
+        lexical_bootstrap_lock_binding(target),
+    )
 
 
 def release_bootstrap_lock(handle: BootstrapLockHandle) -> None:
@@ -1213,9 +1298,10 @@ def release_target_lock(handle: TargetLockHandle, *, cleanup_artifacts: bool) ->
         os.close(handle.lock_fd)
     with contextlib.suppress(OSError):
         os.close(handle.directory_fd)
-    if cleanup_artifacts:
+    if cleanup_artifacts and handle.created_lock_file:
         with contextlib.suppress(OSError):
             unlink_path_if_exists(handle.lock_file)
+    if cleanup_artifacts and handle.created_directory:
         with contextlib.suppress(OSError):
             rmdir_path(handle.directory)
 
@@ -1300,15 +1386,18 @@ def runtime_receipt_path(target: Path) -> Path:
 @contextlib.contextmanager
 def target_lock(target: Path, *, create_parent: bool = False, allow_missing: bool = False):
     transaction = DirectoryTransaction([])
-    canonical_identity = validate_target_identity_for_lock(target)
-    bootstrap_handle = acquire_bootstrap_lock(canonical_identity)
+    lexical_handle = acquire_lexical_bootstrap_lock(target)
+    bootstrap_handle: BootstrapLockHandle | None = None
     lock_handle: TargetLockHandle | None = None
-    target_created_by_operation = False
+    canonical: Path | None = None
+    target_directory_before_lock: DirectorySnapshot | None = None
+    lock_directory_before_lock: DirectorySnapshot | None = None
     failed = False
     try:
+        canonical_identity = validate_target_identity_for_lock(target)
+        bootstrap_handle = acquire_bootstrap_lock(canonical_identity)
         if create_parent:
             canonical = validate_target(target, create=True, transaction=transaction)
-            target_created_by_operation = canonical in transaction.created
         else:
             canonical = validate_target(target, create=False)
             if not lstat_exists(canonical):
@@ -1318,10 +1407,12 @@ def target_lock(target: Path, *, create_parent: bool = False, allow_missing: boo
                 fail("target is missing")
         if canonical != canonical_identity:
             fail("target canonical identity changed after acquiring bootstrap lock")
+        target_directory_before_lock = backup_directory_snapshot(canonical)
+        lock_directory_before_lock = backup_directory_snapshot(lock_path(canonical))
         lock_handle = acquire_target_lock(
             canonical,
             transaction,
-            cleanup_created_artifacts_on_failure=target_created_by_operation,
+            cleanup_created_artifacts_on_failure=True,
         )
         yield transaction
     except BaseException:
@@ -1331,11 +1422,16 @@ def target_lock(target: Path, *, create_parent: bool = False, allow_missing: boo
         if lock_handle is not None:
             release_target_lock(
                 lock_handle,
-                cleanup_artifacts=failed and target_created_by_operation,
+                cleanup_artifacts=failed,
             )
+        if failed and canonical is not None:
+            restore_backup_directory_metadata(lock_path(canonical), lock_directory_before_lock)
+            restore_backup_directory_metadata(canonical, target_directory_before_lock)
         if failed:
             transaction.cleanup()
-        release_bootstrap_lock(bootstrap_handle)
+        if bootstrap_handle is not None:
+            release_bootstrap_lock(bootstrap_handle)
+        release_bootstrap_lock(lexical_handle)
 
 
 def safe_target_path(target: Path, relative: str) -> Path:
@@ -2690,6 +2786,57 @@ def restore_managed_runtime_home_state(new_home: Path | None, previous_home: Pat
     fsync_directory(destination.parent)
 
 
+def restore_managed_runtime_root_state(new_root: Path | None, previous_root: Path | None) -> None:
+    if new_root is None or previous_root is None:
+        return
+    source_home = new_root / "home"
+    previous_home = previous_root / "home"
+    if lstat_exists(source_home) and lstat_exists(previous_home):
+        restore_managed_runtime_home_state(source_home, previous_home)
+
+
+def runtime_directory_snapshot_map(target: Path) -> dict[str, DirectorySnapshot]:
+    root = runtime_root(target)
+    if not lstat_exists(root):
+        return {}
+    snapshots: dict[str, DirectorySnapshot] = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        relative = path.relative_to(target).as_posix()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            continue
+        snapshots[relative] = DirectorySnapshot(
+            exists=True,
+            mode=stat.S_IMODE(info.st_mode),
+            mtime_ns=info.st_mtime_ns,
+            device=info.st_dev,
+            inode=info.st_ino,
+        )
+    return snapshots
+
+
+def restore_runtime_directory_metadata(
+    target: Path, snapshots: dict[str, DirectorySnapshot] | None
+) -> None:
+    for relative, item in sorted(
+        (snapshots or {}).items(), key=lambda entry: len(Path(entry[0]).parts), reverse=True
+    ):
+        path = safe_target_path(target, relative)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            continue
+        if item.mode is not None and stat.S_IMODE(info.st_mode) != item.mode:
+            chmod_private_directory(path, item.mode, f"runtime directory {relative}")
+        if item.mtime_ns is not None:
+            os.utime(path, ns=(info.st_atime_ns, item.mtime_ns), follow_symlinks=False)
+
+
 def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransaction:
     current = software_state(target)
     if current["state"] == "installed":
@@ -2706,29 +2853,27 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
     root_info = stat_existing(root, "runtime root")
     if root_info is not None:
         runtime_private_directory(root, target, "runtime root", repairable=False)
-    home_info = stat_existing(runtime_home(target), "runtime home")
-    if home_info is not None:
-        runtime_private_directory(runtime_home(target), target, "runtime home", repairable=False)
-    if root_info is None:
-        root.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True)
-        runtime_private_directory(root, target, "runtime root", repairable=False)
-    stage = root / f".install-stage.{os.getpid()}.{time.time_ns()}"
-    old_home = root / f".home-old.{os.getpid()}.{time.time_ns()}"
+    previous_directories = runtime_directory_snapshot_map(target) if root_info is not None else {}
+    stage = target / f".{RUNTIME_DIR_NAME}.install-stage.{os.getpid()}.{time.time_ns()}"
+    old_root = target / f".{RUNTIME_DIR_NAME}.old.{os.getpid()}.{time.time_ns()}"
     stage.mkdir(mode=OWNER_DIRECTORY_MODE)
-    previous_home: Path | None = None
+    fsync_directory(target)
+    previous_root: Path | None = None
+    published_new_root = False
     try:
         install_result = install_software_to_stage(stage, baseline)
         staged_home = stage / "home"
-        if lstat_exists(runtime_home(target)):
-            runtime_private_directory(
-                runtime_home(target), target, "runtime home", repairable=False
-            )
-            runtime_home(target).rename(old_home)
-            fsync_directory(root)
-            previous_home = old_home
-            move_managed_runtime_home_state(previous_home, staged_home)
-        staged_home.rename(runtime_home(target))
-        fsync_directory(root)
+        if root_info is not None:
+            root.rename(old_root)
+            fsync_directory(target)
+            previous_root = old_root
+            previous_home = previous_root / "home"
+            if lstat_exists(previous_home):
+                runtime_private_directory(previous_home, target, "runtime home", repairable=False)
+                move_managed_runtime_home_state(previous_home, staged_home)
+        stage.rename(root)
+        published_new_root = True
+        fsync_directory(target)
         ensure_current_symlink(target, baseline["release"]["exact_version"])
         ensure_private_directory(runtime_root(target), target, "runtime root")
         ensure_private_directory(runtime_home(target), target, "runtime home")
@@ -2741,43 +2886,48 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
         )
         metadata = current_software_metadata(target)
     except BaseException:
-        with contextlib.suppress(FileNotFoundError):
-            if lstat_exists(runtime_home(target)) and previous_home is not None:
-                safe_rmtree_private_directory_fsynced(runtime_home(target), "runtime home")
-        if previous_home is not None and lstat_exists(previous_home):
-            previous_home.rename(runtime_home(target))
-            fsync_directory(root)
+        if published_new_root:
+            restore_managed_runtime_root_state(root, previous_root)
+        if published_new_root and lstat_exists(root):
+            safe_rmtree_private_directory_fsynced(root, "new runtime root")
+        if previous_root is not None and lstat_exists(previous_root):
+            previous_root.rename(root)
+            fsync_directory(target)
+            restore_runtime_directory_metadata(target, previous_directories)
         safe_rmtree_private_directory_if_exists(stage, "software install stage")
-        prune_empty_runtime_dirs(target)
+        if previous_root is None:
+            prune_empty_runtime_dirs(target)
         raise
     safe_rmtree_private_directory_if_exists(stage, "software install stage")
     return SoftwareTransaction(
         metadata=metadata,
         changed=True,
-        previous_home=previous_home,
-        new_home=runtime_home(target),
+        previous_root=previous_root,
+        new_root=root,
+        previous_directories=previous_directories,
     )
 
 
 def commit_software_transaction(transaction: SoftwareTransaction) -> None:
-    if transaction.previous_home is not None and lstat_exists(transaction.previous_home):
-        with contextlib.suppress(OSError):
-            safe_rmtree_private_directory_fsynced(
-                transaction.previous_home,
-                "previous runtime home",
-            )
+    if transaction.previous_root is not None and lstat_exists(transaction.previous_root):
+        safe_rmtree_private_directory_fsynced(
+            transaction.previous_root,
+            "previous runtime root",
+        )
 
 
 def rollback_software_transaction(target: Path, transaction: SoftwareTransaction) -> None:
     if not transaction.changed:
         return
-    restore_managed_runtime_home_state(transaction.new_home, transaction.previous_home)
-    if transaction.new_home is not None and lstat_exists(transaction.new_home):
-        safe_rmtree_private_directory_fsynced(transaction.new_home, "new runtime home")
-    if transaction.previous_home is not None and lstat_exists(transaction.previous_home):
-        transaction.previous_home.rename(runtime_home(target))
-        fsync_directory(runtime_root(target))
-    prune_empty_runtime_dirs(target)
+    restore_managed_runtime_root_state(transaction.new_root, transaction.previous_root)
+    if transaction.new_root is not None and lstat_exists(transaction.new_root):
+        safe_rmtree_private_directory_fsynced(transaction.new_root, "new runtime root")
+    if transaction.previous_root is not None and lstat_exists(transaction.previous_root):
+        transaction.previous_root.rename(runtime_root(target))
+        fsync_directory(target)
+        restore_runtime_directory_metadata(target, transaction.previous_directories)
+    else:
+        prune_empty_runtime_dirs(target)
 
 
 def begin_runtime_remove(target: Path) -> RuntimeRemoveTransaction:
@@ -3038,6 +3188,31 @@ def restore_directory_metadata(target: Path, snapshot: TransactionSnapshot) -> N
             os.utime(path, ns=(info.st_atime_ns, item.mtime_ns), follow_symlinks=False)
 
 
+def validate_directory_snapshot_restored(target: Path, snapshot: TransactionSnapshot) -> None:
+    for relative, item in snapshot.directories.items():
+        path = target if relative == "." else safe_target_path(target, relative)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if item.exists:
+                fail("transaction rollback did not restore directory presence")
+            continue
+        if not item.exists:
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                fail("transaction rollback did not restore directory absence")
+            continue
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            fail("transaction rollback did not restore directory kind")
+        if item.mode is not None and stat.S_IMODE(info.st_mode) != item.mode:
+            fail("transaction rollback did not restore directory mode")
+        if item.device is not None and info.st_dev != item.device:
+            fail("transaction rollback did not restore directory device")
+        if item.inode is not None and info.st_ino != item.inode:
+            fail("transaction rollback did not restore directory inode")
+        if item.mtime_ns is not None and info.st_mtime_ns != item.mtime_ns:
+            fail("transaction rollback did not restore directory mtime")
+
+
 def ensure_preserve_dir(target: Path, preserve_dir: Path | None) -> Path:
     if preserve_dir is not None:
         return preserve_dir
@@ -3085,6 +3260,8 @@ def capture_transaction_snapshot(
         target_mode = stat.S_IMODE(require_real_directory(target, "target").st_mode)
     all_relatives = unique_relatives([*relatives, STAMP_NAME])
     directories = transaction_directory_snapshot(target, all_relatives)
+    if not target_existed:
+        directories["."] = DirectorySnapshot(exists=False)
     preserve_dir: Path | None = None
     snapshot = TransactionSnapshot(
         target_existed=target_existed,
@@ -3140,9 +3317,9 @@ def apply_transaction_snapshot_once(target: Path, snapshot: TransactionSnapshot)
             fsync_directory(item.preserved_path.parent)
         else:
             atomic_write(path, item.data, target, mode=item.mode)
+    cleanup_transaction_preserve_dir(snapshot)
     prune_empty_managed_dirs(target, list(snapshot.files))
     restore_directory_metadata(target, snapshot)
-    cleanup_transaction_preserve_dir(snapshot)
     if snapshot.target_existed and snapshot.target_mode is not None:
         with contextlib.suppress(FileNotFoundError):
             chmod_private_directory(target, snapshot.target_mode, "target")
@@ -3159,6 +3336,8 @@ def validate_transaction_snapshot_restored(target: Path, snapshot: TransactionSn
                 fail("transaction rollback did not restore the target mode")
     elif not target_contains_only_lock_artifacts(target):
         fail("transaction rollback did not remove the created target")
+    if snapshot.target_existed:
+        validate_directory_snapshot_restored(target, snapshot)
     for relative, item in snapshot.files.items():
         path = safe_target_path(target, relative)
         info = require_existing_managed_file(path, relative, max_bytes=MANAGED_MAX_BYTES)
@@ -3890,8 +4069,8 @@ def write_setup_locked(
         atomic_write(stamp_path(target), canonical_json(desired_stamp), target)
         commit_backup_transaction(backup_tx)
         validate_desired_setup_postcondition(target, desired_stamp, backup_tx)
-        cleanup_transaction_preserve_dir(snapshot)
         cleanup_backup_transaction(backup_tx)
+        cleanup_transaction_preserve_dir(snapshot)
     except BaseException:
         rollback_backup_transaction(backup_tx)
         prune_empty_runtime_dirs(target)
@@ -3927,6 +4106,8 @@ def write_setup(
 
 
 def update_setup(target: Path, setup_id: str | None, profile_id: str | None) -> dict[str, Any]:
+    if setup_id is not None or profile_id is not None:
+        fail("update preserves the installed setup/profile identity; use switch to change profile")
     with target_lock(target, create_parent=False) as directory_transaction:
         target = validate_target(target, create=False)
         if not lstat_exists(target):
@@ -3936,8 +4117,8 @@ def update_setup(target: Path, setup_id: str | None, profile_id: str | None) -> 
             fail("update requires an already managed target")
         if is_legacy_stamp(current):
             fail("legacy managed target must be migrated before update")
-        setup = load_setup(setup_id or current["setup_id"])
-        profile = load_profile(profile_id or current["profile_id"])
+        setup = load_setup(current["setup_id"])
+        profile = load_profile(current["profile_id"])
         return write_setup_locked(
             target,
             setup,
@@ -4480,8 +4661,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     switch.add_argument("--target", required=True)
     switch.add_argument("--json", action="store_true")
     update = subparsers.add_parser("update")
-    update.add_argument("--setup")
-    update.add_argument("--profile")
     update.add_argument("--target", required=True)
     update.add_argument("--json", action="store_true")
     migrate = subparsers.add_parser("migrate")
@@ -4557,7 +4736,7 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.command == "update":
         target = require_absolute_target(args.target)
-        emit(update_setup(target, args.setup, args.profile), as_json=args.json)
+        emit(update_setup(target, None, None), as_json=args.json)
         return 0
     if args.command == "migrate":
         target = require_absolute_target(args.target)

@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -712,6 +713,30 @@ def validate_platform_detection(manager: Any) -> None:
         "unsupported arch": {"system": "Darwin", "machine": "armv7l"},
     }.items():
         expect_platform_failure(manager, label, **kwargs)
+    reader_marker = object()
+    original_reader = getattr(manager.platform, "freedesktop_os_release", reader_marker)
+    original_paths = manager.OS_RELEASE_PATHS
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-os-release-") as raw:
+        os_release = Path(raw) / "os-release"
+        os_release.write_text(
+            'NAME="Ubuntu Server"\nID=ubuntu\nVERSION_ID="24.04"\n',
+            encoding="utf-8",
+        )
+        manager.OS_RELEASE_PATHS = (os_release,)
+        with contextlib.suppress(AttributeError):
+            delattr(manager.platform, "freedesktop_os_release")
+        try:
+            detected = manager.current_host_id(
+                system="Linux",
+                machine="x86_64",
+                libc=("glibc", "2.39"),
+            )
+        finally:
+            manager.OS_RELEASE_PATHS = original_paths
+            if original_reader is not reader_marker:
+                manager.platform.freedesktop_os_release = original_reader
+        if detected != "ubuntu-glibc-x64":
+            raise ValueError("Python 3.9 os-release fallback did not accept Ubuntu/glibc x64")
 
 
 def validate_generated_files(manager: Any, version: str) -> None:
@@ -798,6 +823,7 @@ def validate_builder_projection_invariant(manager: Any) -> None:
 def validate_manager_parse(manager: Any) -> None:
     manager.parse_args(["plan", "--target", "/tmp/target"])
     manager.parse_args(["install", "--target", "/tmp/target"])
+    manager.parse_args(["update", "--target", "/tmp/target"])
     manager.parse_args(
         ["switch", "--setup", "nddev-builder", "--profile", "safe", "--target", "/tmp/target"]
     )
@@ -817,6 +843,14 @@ def validate_json_argument_boundary(manager: Any) -> None:
         "invalid choice": ["does-not-exist", "--json"],
         "missing target": ["status", "--json"],
         "bad backup": ["restore", "--backup", "bad", "--target", "/tmp/target", "--json"],
+        "update identity override": [
+            "update",
+            "--profile",
+            "safe",
+            "--target",
+            "/tmp/target",
+            "--json",
+        ],
     }.items():
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -937,6 +971,49 @@ def validate_unsupported_host_preflight(manager: Any) -> None:
             manager.platform.freedesktop_os_release = original_os_release
         manager.platform.libc_ver = original_libc
         manager.urllib.request.urlopen = original_urlopen
+
+
+def validate_target_observation_after_lexical_lock(manager: Any) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-lock-order-") as raw:
+        root = Path(raw)
+        target = root / "missing-parent" / "target"
+        system_root = manager.bootstrap_lock_system_root()
+        product_root = manager.bootstrap_lock_product_root_path(system_root)
+        lexical_file = product_root / f"{manager.lexical_bootstrap_lock_digest(target)}.lock"
+        original_resolver = manager.resolve_parent_allowing_missing
+        original_stat_existing = manager.stat_existing
+
+        def lexical_ready() -> bool:
+            return lexical_file.exists()
+
+        def guarded_resolver(path: Path) -> Path:
+            if path == target.parent and not lexical_ready():
+                raise AssertionError("target parent resolved before lexical bootstrap lock")
+            return original_resolver(path)
+
+        def guarded_stat(path: Path, label: str) -> os.stat_result | None:
+            if label.startswith("target") and not lexical_ready():
+                raise AssertionError(f"{label} was inspected before lexical bootstrap lock")
+            return original_stat_existing(path, label)
+
+        manager.resolve_parent_allowing_missing = guarded_resolver
+        manager.stat_existing = guarded_stat
+        try:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = manager.main(["status", "--target", str(target), "--json"])
+            if code != 0:
+                raise ValueError(f"status under lexical-order guard failed: {stdout.getvalue()}")
+            if stderr.getvalue():
+                raise ValueError("status under lexical-order guard wrote stderr")
+            if target.parent.exists():
+                raise ValueError("lexical-order status created the target parent")
+        finally:
+            manager.resolve_parent_allowing_missing = original_resolver
+            manager.stat_existing = original_stat_existing
+            if product_root.exists():
+                shutil.rmtree(product_root)
 
 
 def expect_manager_failure(label: str, callback: Any) -> None:
@@ -1760,6 +1837,10 @@ def validate_profile_switch_lifecycle(manager: Any) -> None:
             raise ValueError("identical update changed target inode, mtime, mode, or bytes")
         if exact_tree_snapshot(manager.backup_pool(target)) != before_backup:
             raise ValueError("identical update changed the backup pool")
+        expect_manager_failure(
+            "update profile override rejected",
+            lambda: manager.update_setup(target, None, "full-auto"),
+        )
 
         software = install_fake_software_via_cli(manager, target)
         if software["software"].get("state") != "installed":
@@ -2211,8 +2292,10 @@ def exact_tree_snapshot(
     if not root.exists():
         return ((".", "absent", 0, 0, 0, None),)
     rows: list[tuple[str, str, int, int, int, bytes | str | None]] = []
-    for path in sorted(root.rglob("*")):
+    for path in [root, *sorted(root.rglob("*"))]:
         relative = path.relative_to(root).as_posix()
+        if relative == "":
+            relative = "."
         info = path.lstat()
         mode = stat.S_IMODE(info.st_mode)
         metadata = (mode, info.st_ino, info.st_mtime_ns)
@@ -2471,6 +2554,11 @@ def main(argv: list[str] | None = None) -> int:
         != "sha256(product namespace plus canonical absolute target).lock"
     ):
         raise ValueError("contract must declare the bootstrap lock file binding")
+    if (
+        contract["managed_state"].get("precanonical_bootstrap_lock_file")
+        != "sha256(product namespace plus lexical absolute target).lock"
+    ):
+        raise ValueError("contract must declare the pre-canonical bootstrap lock file binding")
     if contract["managed_state"].get("bootstrap_lock_file_mode") != "0600":
         raise ValueError("contract must declare bootstrap lock file mode")
     if contract["managed_state"].get("bootstrap_lock_persistent") is not True:
@@ -2526,6 +2614,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_manager_parse(manager)
         validate_json_argument_boundary(manager)
         validate_unsupported_host_preflight(manager)
+        validate_target_observation_after_lexical_lock(manager)
         validate_bootstrap_lock_adversarial(manager)
         validate_bootstrap_lock_persistent_handover(manager)
         validate_dual_lock_persistent_handover(manager)

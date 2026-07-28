@@ -55,7 +55,7 @@
     "java": "target-owned JVM user.home and java.io.tmpdir",
     "default_locations": "disabled through official Junie CLI flags and environment variables",
     "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
-    "launch_lock": "persistent external bootstrap O_NOFOLLOW 0600 flock under resolved fixed system temp is acquired before target creation/inspection and released last; persistent target-internal O_NOFOLLOW 0600 lock file is acquired second, its parent is 0500 while held and restored to 0700 on release",
+    "launch_lock": "persistent lexical external bootstrap O_NOFOLLOW 0600 flock under resolved fixed system temp is acquired before parent/canonical target inspection, canonical-target external bootstrap flock is acquired second, and persistent target-internal O_NOFOLLOW 0600 lock file is acquired third; target lock parent is 0500 while held and restored to 0700 on release",
     "pre_child_artifact_revalidation": "target-owned Junie shim and pinned Junie binary path, inode, size, and SHA256 are revalidated immediately before child execution",
     "verified_path_handoff": "launch retains open verified fds as evidence, materializes a dedicated launch image at <target>/.nddev-junie-cli-runtime/launch-image/junie, write-protects only that dedicated launcher directory through child completion, then executes the launch image path with Popen",
     "runtime_state_writable": "target root, runtime HOME, TMP, XDG, JUNIE_DATA, JUNIE_LOG_DIR, project, and config/source directories remain writable during launch handoff protection",
