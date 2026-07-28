@@ -61,6 +61,18 @@
     "runtime_state_writable": "target root, runtime HOME, TMP, XDG, JUNIE_DATA, JUNIE_LOG_DIR, project, and config/source directories remain writable during launch handoff protection",
     "same_uid_boundary": "ordinary target-local internal lock rename/unlink replacement is blocked by the external bootstrap lock and ordinary unlink/replace inside protected lock and launch-image directories is blocked while protected; deliberate same-UID bootstrap-root or ancestor tampering is outside this no-sandbox boundary"
   },
+  "cleanup_journal": {
+    "directory": ".nddev-junie-cli-cleanup",
+    "journal": "NDDEV-JUNIE-CLI-CLEANUP.json",
+    "schema": 1,
+    "max_payloads": 3,
+    "max_entries": 20000,
+    "max_bytes": 4294967296,
+    "max_journal_bytes": 16777216,
+    "publication": "native atomic no-replace rename of a complete fsynced immutable journal",
+    "read_only": "expose cleanup_pending and fail closed on malformed or incomplete pending state without recovery",
+    "mutation": "later target-bound mutations drain exact journaled tombstones before active changes"
+  },
   "nddev_builder_projection_version": "0.2.0",
   "public_validator": "cli-tools/validate_public_contracts.py"
 }

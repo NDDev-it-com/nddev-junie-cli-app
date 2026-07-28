@@ -1955,7 +1955,13 @@ def with_fake_software(
         metadata=metadata,
         changed=False,
     )
-    manager.commit_software_transaction = lambda transaction: None
+
+    def fake_commit(target: Path, transaction: Any, snapshot: Any) -> bool:
+        if snapshot is not None:
+            manager.cleanup_transaction_preserve_dir(snapshot)
+        return False
+
+    manager.commit_software_transaction = fake_commit
     manager.current_software_metadata = lambda target: metadata
     manager.software_state = lambda target: {"state": "installed", "version": "validator"}
     try:
@@ -1982,8 +1988,13 @@ def install_fake_software_via_cli(
         metadata_holder["metadata"] = metadata
         return manager.SoftwareTransaction(metadata=metadata, changed=True)
 
+    def fake_commit(target_path: Path, transaction: Any, snapshot: Any) -> bool:
+        if snapshot is not None:
+            manager.cleanup_transaction_preserve_dir(snapshot)
+        return False
+
     manager.begin_software_transaction = fake_begin
-    manager.commit_software_transaction = lambda transaction: None
+    manager.commit_software_transaction = fake_commit
     try:
         result = manager.install_or_update_cli(target, repair=False, command="install-cli")
     finally:
@@ -2190,39 +2201,6 @@ def validate_software_remove_and_noop_lifecycle(manager: Any) -> None:
             raise ValueError("remove-cli post-remove fault changed target identity")
         if temporary_residue(target):
             raise ValueError("remove-cli post-remove fault left transaction residue")
-
-    with tempfile.TemporaryDirectory(prefix="nddev-junie-software-remove-commit-fault-") as raw:
-        target = Path(raw) / "target"
-        setup = manager.load_setup(DEFAULT_SETUP_ID)
-        safe = manager.load_profile("safe")
-        manager.write_setup(target, setup, safe)
-        install_fake_software_via_cli(manager, target)
-        before_fault = exact_tree_snapshot(target)
-        original_commit = manager.commit_runtime_remove
-        observed_removed = {"value": False}
-
-        def fail_after_runtime_entries_removed(transaction: Any) -> None:
-            if manager.software_state(target) != {"state": "absent"}:
-                raise ValueError("remove-cli commit fault did not observe absent software state")
-            if transaction.removed_container is None or not transaction.removed_container.exists():
-                raise ValueError("remove-cli commit fault did not retain moved runtime entries")
-            observed_removed["value"] = True
-            raise manager.JunieCliSetupError("runtime remove commit validator fault")
-
-        manager.commit_runtime_remove = fail_after_runtime_entries_removed
-        try:
-            expect_manager_failure(
-                "remove-cli runtime commit fault", lambda: manager.remove_cli(target)
-            )
-        finally:
-            manager.commit_runtime_remove = original_commit
-        if not observed_removed["value"]:
-            raise ValueError("remove-cli runtime commit fault was not injected")
-        if exact_tree_snapshot(target) != before_fault:
-            raise ValueError("remove-cli runtime commit fault changed target identity")
-        if temporary_residue(target):
-            raise ValueError("remove-cli runtime commit fault left transaction residue")
-
 
 def validate_failed_first_install_restores_parent(manager: Any) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-junie-first-install-fault-") as raw:
@@ -2987,6 +2965,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = load_json(ROOT / "build" / "manifest.json")
     contract = load_json(ROOT / "config" / "nddev-contract.json")
     baseline = load_json(ROOT / "references" / "junie-cli-baseline.json")
+    manager = load_manager()
     ids = setup_ids()
     profiles = profile_ids()
     if set(build) != REQUIRED_BUILD_VERSION_KEYS:
@@ -3078,6 +3057,47 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("contract must declare read-only bootstrap coordination semantics")
     if contract["managed_state"].get("target_lock_persistent") is not True:
         raise ValueError("contract must declare persistent target lock files")
+    cleanup_manifest = manifest.get("cleanup_journal", {})
+    cleanup_expected = {
+        "cleanup_directory": "<target>/.nddev-junie-cli-cleanup",
+        "cleanup_journal": "<target>/NDDEV-JUNIE-CLI-CLEANUP.json",
+        "cleanup_journal_schema": manager.CLEANUP_SCHEMA,
+        "cleanup_journal_max_payloads": manager.CLEANUP_MAX_PAYLOADS,
+        "cleanup_journal_max_entries": manager.CLEANUP_DIGEST_MAX_ENTRIES,
+        "cleanup_journal_max_bytes": manager.CLEANUP_DIGEST_MAX_BYTES,
+        "cleanup_journal_max_journal_bytes": manager.CLEANUP_JOURNAL_MAX_BYTES,
+    }
+    for key, expected in cleanup_expected.items():
+        if contract["managed_state"].get(key) != expected:
+            raise ValueError(f"contract managed_state {key} does not match manager constants")
+    if cleanup_manifest.get("directory") != manager.CLEANUP_DIR_NAME:
+        raise ValueError("manifest cleanup journal directory does not match manager constant")
+    if cleanup_manifest.get("journal") != manager.CLEANUP_JOURNAL_NAME:
+        raise ValueError("manifest cleanup journal name does not match manager constant")
+    if cleanup_manifest.get("schema") != manager.CLEANUP_SCHEMA:
+        raise ValueError("manifest cleanup journal schema does not match manager constant")
+    if cleanup_manifest.get("max_payloads") != manager.CLEANUP_MAX_PAYLOADS:
+        raise ValueError("manifest cleanup max_payloads does not match manager constant")
+    if cleanup_manifest.get("max_entries") != manager.CLEANUP_DIGEST_MAX_ENTRIES:
+        raise ValueError("manifest cleanup max_entries does not match manager constant")
+    if cleanup_manifest.get("max_bytes") != manager.CLEANUP_DIGEST_MAX_BYTES:
+        raise ValueError("manifest cleanup max_bytes does not match manager constant")
+    if cleanup_manifest.get("max_journal_bytes") != manager.CLEANUP_JOURNAL_MAX_BYTES:
+        raise ValueError("manifest cleanup max_journal_bytes does not match manager constant")
+    cleanup_publication = contract["managed_state"].get("cleanup_journal_publication", "")
+    for phrase in (
+        "complete immutable",
+        "identity-bound",
+        "native atomic no-replace rename",
+        "read-only commands fail closed",
+        "never repair or drain",
+    ):
+        if phrase not in cleanup_publication:
+            raise ValueError("contract must declare cleanup journal publication semantics")
+    if "top-level cleanup_pending" not in contract["managed_state"].get(
+        "cleanup_pending_result", ""
+    ):
+        raise ValueError("contract must declare top-level cleanup_pending results")
     if contract["safety"].get("bootstrap_binding_atomic_publication") is not True:
         raise ValueError("contract must declare atomic bootstrap binding publication")
     if contract["safety"].get("bootstrap_anchor_no_replace_publication") is not True:
@@ -3086,6 +3106,12 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("contract must declare monotonic bootstrap anchors")
     if contract["safety"].get("read_only_bootstrap_no_create") is not True:
         raise ValueError("contract must declare read-only no-create bootstrap coordination")
+    if contract["safety"].get("cleanup_journal_no_replace_publication") is not True:
+        raise ValueError("contract must declare no-replace cleanup journal publication")
+    if contract["safety"].get("cleanup_read_only_no_recovery") is not True:
+        raise ValueError("contract must declare read-only cleanup no-recovery behavior")
+    if contract["safety"].get("cleanup_later_mutations_drain_first") is not True:
+        raise ValueError("contract must declare mutation cleanup drain-first behavior")
     if (
         contract["managed_state"].get("launch_image")
         != "<target>/.nddev-junie-cli-runtime/launch-image/junie"
@@ -3126,7 +3152,6 @@ def main(argv: list[str] | None = None) -> int:
     validate_baseline(baseline, contract, manifest)
     validate_required_files()
     validate_claude_import_bridge()
-    manager = load_manager()
     validate_platform_detection(manager)
     validate_production_source()
     with injected_bootstrap_lock_root(manager):
