@@ -65,8 +65,10 @@
     "directory": ".nddev-junie-cli-cleanup",
     "journal": "NDDEV-JUNIE-CLI-CLEANUP.json",
     "stage": "NDDEV-JUNIE-CLI-CLEANUP-STAGE.json",
+    "drain": "NDDEV-JUNIE-CLI-CLEANUP-DRAIN.json",
     "schema": 1,
     "stage_schema": 1,
+    "drain_schema": 1,
     "max_payloads": 3,
     "max_entries": 20000,
     "max_bytes": 4294967296,
@@ -81,9 +83,9 @@
       "destination_parent_kind": "cleanup-tombstone-parent-directory",
       "destination_kind": "cleanup-tombstone-payload-directory"
     },
-    "publication": "native atomic no-replace rename of a complete fsynced immutable journal after durable promotion stage with bounded relative move intent",
-    "read_only": "expose cleanup_pending and fail closed on malformed, staged, or incomplete pending state without recovery",
-    "mutation": "later target-bound mutations recover staged promotions and drain exact journaled tombstones before active changes"
+    "publication": "native atomic no-replace rename of a complete fsynced immutable journal after durable promotion stage with bounded relative move intent; immutable drain intent is published before recursive deletion; final-visible stage-retirement faults preserve valid pending cleanup",
+    "read_only": "expose cleanup_pending for valid final journal/tombstones or bounded drain intent even when stage retirement residue remains; fail closed on malformed, standalone staged, missing, or incomplete pending state without recovery",
+    "mutation": "later target-bound mutations recover staged promotions and drain exact journaled tombstones or resume bounded drain intent before active changes"
   },
   "nddev_builder_projection_version": "0.2.0",
   "public_validator": "cli-tools/validate_public_contracts.py"

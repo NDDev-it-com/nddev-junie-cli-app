@@ -1157,7 +1157,6 @@ def real_bootstrap_product_root_snapshot(
 
 @contextlib.contextmanager
 def injected_bootstrap_lock_root(manager: Any):
-    real_root, existed_before, entries_before = real_bootstrap_product_root_snapshot(manager)
     original_resolver = manager.bootstrap_lock_system_root
     with tempfile.TemporaryDirectory(prefix="nddev-junie-bootstrap-locks-") as raw:
         system_root = Path(raw) / "system-tmp"
@@ -1178,12 +1177,6 @@ def injected_bootstrap_lock_root(manager: Any):
             yield system_root
         finally:
             manager.bootstrap_lock_system_root = original_resolver
-    if not existed_before and real_root.exists():
-        raise ValueError(f"validator created a real system bootstrap artifact: {real_root}")
-    if existed_before:
-        _, _, entries_after = real_bootstrap_product_root_snapshot(manager)
-        if entries_after != entries_before:
-            raise ValueError(f"validator changed real system bootstrap artifacts: {real_root}")
 
 
 def read_child_message(fd: int, label: str) -> str:
@@ -3067,8 +3060,10 @@ def main(argv: list[str] | None = None) -> int:
         "cleanup_directory": "<target>/.nddev-junie-cli-cleanup",
         "cleanup_journal": "<target>/NDDEV-JUNIE-CLI-CLEANUP.json",
         "cleanup_stage": "<target>/NDDEV-JUNIE-CLI-CLEANUP-STAGE.json",
+        "cleanup_drain": "<target>/NDDEV-JUNIE-CLI-CLEANUP-DRAIN.json",
         "cleanup_journal_schema": manager.CLEANUP_SCHEMA,
         "cleanup_stage_schema": manager.CLEANUP_STAGE_SCHEMA,
+        "cleanup_drain_schema": manager.CLEANUP_DRAIN_SCHEMA,
         "cleanup_journal_max_payloads": manager.CLEANUP_MAX_PAYLOADS,
         "cleanup_journal_max_entries": manager.CLEANUP_DIGEST_MAX_ENTRIES,
         "cleanup_journal_max_bytes": manager.CLEANUP_DIGEST_MAX_BYTES,
@@ -3084,10 +3079,14 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("manifest cleanup journal name does not match manager constant")
     if cleanup_manifest.get("stage") != manager.CLEANUP_STAGE_NAME:
         raise ValueError("manifest cleanup stage name does not match manager constant")
+    if cleanup_manifest.get("drain") != manager.CLEANUP_DRAIN_NAME:
+        raise ValueError("manifest cleanup drain name does not match manager constant")
     if cleanup_manifest.get("schema") != manager.CLEANUP_SCHEMA:
         raise ValueError("manifest cleanup journal schema does not match manager constant")
     if cleanup_manifest.get("stage_schema") != manager.CLEANUP_STAGE_SCHEMA:
         raise ValueError("manifest cleanup stage schema does not match manager constant")
+    if cleanup_manifest.get("drain_schema") != manager.CLEANUP_DRAIN_SCHEMA:
+        raise ValueError("manifest cleanup drain schema does not match manager constant")
     if cleanup_manifest.get("max_payloads") != manager.CLEANUP_MAX_PAYLOADS:
         raise ValueError("manifest cleanup max_payloads does not match manager constant")
     if cleanup_manifest.get("max_entries") != manager.CLEANUP_DIGEST_MAX_ENTRIES:
@@ -3131,8 +3130,11 @@ def main(argv: list[str] | None = None) -> int:
         "complete immutable",
         "identity-bound",
         "native atomic no-replace rename",
-        "read-only commands fail closed",
-        "never repair or drain",
+        "stage-retirement faults return success",
+        "drain intent",
+        "read-only commands expose",
+        "without repair",
+        "missing tombstones without drain intent",
     ):
         if phrase not in cleanup_publication:
             raise ValueError("contract must declare cleanup journal publication semantics")

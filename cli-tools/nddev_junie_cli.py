@@ -71,8 +71,10 @@ RUNTIME_RECEIPT_NAME = "NDDEV-JUNIE-CLI-RUNTIME.json"
 CLEANUP_DIR_NAME = ".nddev-junie-cli-cleanup"
 CLEANUP_JOURNAL_NAME = "NDDEV-JUNIE-CLI-CLEANUP.json"
 CLEANUP_STAGE_NAME = "NDDEV-JUNIE-CLI-CLEANUP-STAGE.json"
+CLEANUP_DRAIN_NAME = "NDDEV-JUNIE-CLI-CLEANUP-DRAIN.json"
 CLEANUP_SCHEMA = 1
 CLEANUP_STAGE_SCHEMA = 1
+CLEANUP_DRAIN_SCHEMA = 1
 CLEANUP_MAX_PAYLOADS = 3
 CLEANUP_STAGE_SOURCE_ANCHOR = "canonical_target"
 CLEANUP_STAGE_DESTINATION_ANCHOR = "cleanup_parent"
@@ -82,6 +84,22 @@ CLEANUP_STAGE_SOURCE_KIND = "cleanup-source-directory"
 CLEANUP_STAGE_DESTINATION_PARENT_KIND = "cleanup-tombstone-parent-directory"
 CLEANUP_STAGE_DESTINATION_KIND = "cleanup-tombstone-payload-directory"
 CLEANUP_STAGE_DIRECTORY_IDENTITY_KEYS = frozenset({"kind", "uid", "mode", "dev", "ino"})
+CLEANUP_DRAIN_KEYS = frozenset(
+    {
+        "schema_version",
+        "product_name",
+        "build_version",
+        "canonical_target",
+        "canonical_target_sha256",
+        "cleanup_parent",
+        "journal_relative",
+        "drain_relative",
+        "max_payloads",
+        "journal_size",
+        "journal_sha256",
+        "journal",
+    }
+)
 CLEANUP_STAGE_KEYS = frozenset(
     {
         "schema_version",
@@ -1885,6 +1903,10 @@ def cleanup_stage_path(target: Path) -> Path:
     return target / CLEANUP_STAGE_NAME
 
 
+def cleanup_drain_path(target: Path) -> Path:
+    return target / CLEANUP_DRAIN_NAME
+
+
 def cleanup_payload_name(index: int) -> str:
     return f"payload-{index}"
 
@@ -1895,6 +1917,10 @@ def cleanup_journal_temp_prefix() -> str:
 
 def cleanup_stage_temp_prefix() -> str:
     return f".{CLEANUP_STAGE_NAME}.nddev.tmp."
+
+
+def cleanup_drain_temp_prefix() -> str:
+    return f".{CLEANUP_DRAIN_NAME}.nddev.tmp."
 
 
 def cleanup_stage_directory_identity(path: Path, label: str) -> dict[str, Any]:
@@ -2275,6 +2301,38 @@ def build_cleanup_stage_projection(
     return stage, data
 
 
+def cleanup_drain_payload(
+    target: Path, journal: dict[str, Any], journal_data: bytes
+) -> dict[str, Any]:
+    canonical = validate_target(target, create=False)
+    return {
+        "schema_version": CLEANUP_DRAIN_SCHEMA,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "canonical_target": str(canonical),
+        "canonical_target_sha256": sha256_bytes(str(canonical).encode("utf-8")),
+        "cleanup_parent": CLEANUP_DIR_NAME,
+        "journal_relative": CLEANUP_JOURNAL_NAME,
+        "drain_relative": CLEANUP_DRAIN_NAME,
+        "max_payloads": CLEANUP_MAX_PAYLOADS,
+        "journal_size": len(journal_data),
+        "journal_sha256": sha256_bytes(journal_data),
+        "journal": journal,
+    }
+
+
+def build_cleanup_drain_projection(
+    target: Path,
+    journal: dict[str, Any],
+) -> tuple[dict[str, Any], bytes]:
+    journal_data = canonical_json(journal)
+    payload = cleanup_drain_payload(target, journal, journal_data)
+    data = canonical_json(payload)
+    if len(data) > CLEANUP_STAGE_MAX_BYTES:
+        fail("cleanup drain intent is too large")
+    return payload, data
+
+
 def cleanup_pending_summary_from_journal(
     target: Path,
     journal: dict[str, Any] | None,
@@ -2376,16 +2434,25 @@ def validate_cleanup_journal(target: Path, *, allow_stage: bool = False) -> dict
             for path in target.iterdir()
             if path.name.startswith(cleanup_journal_temp_prefix())
             or path.name.startswith(cleanup_stage_temp_prefix())
+            or path.name.startswith(cleanup_drain_temp_prefix())
         ]
         if lstat_exists(target)
         else []
     )
     if temp_records:
         fail("cleanup journal has intermediate residue")
-    if not allow_stage and lstat_exists(stage_path):
-        fail("cleanup promotion stage requires mutation recovery")
+    stage_exists = lstat_exists(stage_path)
+    drain = validate_cleanup_drain_intent(target)
+    if drain is not None:
+        return drain["journal"]
     if not root_exists and not journal_exists:
+        if stage_exists:
+            fail("cleanup promotion stage requires mutation recovery")
         return None
+    if journal_exists and not root_exists:
+        fail("cleanup tombstone is missing")
+    if not allow_stage and stage_exists and not journal_exists:
+        fail("cleanup promotion stage requires mutation recovery")
     if not journal_exists:
         fail("cleanup tombstone is unjournaled")
     journal_info = require_existing_managed_file(
@@ -2402,12 +2469,16 @@ def validate_cleanup_journal(target: Path, *, allow_stage: bool = False) -> dict
         max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
         label=CLEANUP_JOURNAL_NAME,
     )
-    return validate_cleanup_journal_document(
+    journal = validate_cleanup_journal_document(
         target,
         payload,
         root_exists=root_exists,
-        require_complete=False,
+        require_complete=True,
     )
+    if not allow_stage and stage_exists:
+        validate_cleanup_stage(target)
+        validate_complete_cleanup_journal(target, journal)
+    return journal
 
 
 def cleanup_state(target: Path) -> dict[str, Any]:
@@ -2484,6 +2555,73 @@ def validate_published_cleanup_journal(
     if canonical_json(journal) != data:
         fail("cleanup journal publication failed canonical verification")
     validate_complete_cleanup_journal(target, journal)
+
+
+def validate_cleanup_drain_intent(target: Path) -> dict[str, Any] | None:
+    path = cleanup_drain_path(target)
+    if not lstat_exists(path):
+        return None
+    info = require_existing_managed_file(
+        path,
+        CLEANUP_DRAIN_NAME,
+        max_bytes=CLEANUP_STAGE_MAX_BYTES,
+    )
+    if info is None or stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("cleanup drain intent mode must be 0600")
+    data = read_existing_file(path, max_bytes=CLEANUP_STAGE_MAX_BYTES, label=CLEANUP_DRAIN_NAME)
+    if data is None:
+        fail("cleanup drain intent is missing")
+    try:
+        intent = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"cleanup drain intent is invalid JSON: {exc}")
+    if not isinstance(intent, dict):
+        fail("cleanup drain intent must contain a JSON object")
+    if canonical_json(intent) != data:
+        fail("cleanup drain intent canonical binding is invalid")
+    if set(intent) != CLEANUP_DRAIN_KEYS:
+        fail("cleanup drain intent field set is invalid")
+    if intent.get("schema_version") != CLEANUP_DRAIN_SCHEMA:
+        fail("cleanup drain intent schema is unsupported")
+    if intent.get("product_name") != PRODUCT_NAME:
+        fail("cleanup drain intent belongs to another product")
+    canonical = str(validate_target(target, create=False))
+    if intent.get("canonical_target") != canonical:
+        fail("cleanup drain intent is bound to a different target")
+    if intent.get("canonical_target_sha256") != sha256_bytes(canonical.encode("utf-8")):
+        fail("cleanup drain intent target digest is invalid")
+    if intent.get("cleanup_parent") != CLEANUP_DIR_NAME:
+        fail("cleanup drain intent parent binding is invalid")
+    if intent.get("journal_relative") != CLEANUP_JOURNAL_NAME:
+        fail("cleanup drain intent journal binding is invalid")
+    if intent.get("drain_relative") != CLEANUP_DRAIN_NAME:
+        fail("cleanup drain intent path binding is invalid")
+    if intent.get("max_payloads") != CLEANUP_MAX_PAYLOADS:
+        fail("cleanup drain intent bound is invalid")
+    journal = intent.get("journal")
+    if not isinstance(journal, dict):
+        fail("cleanup drain intent journal is invalid")
+    journal_data = canonical_json(journal)
+    if intent.get("journal_size") != len(journal_data):
+        fail("cleanup drain intent journal size binding is invalid")
+    if intent.get("journal_sha256") != sha256_bytes(journal_data):
+        fail("cleanup drain intent journal digest is invalid")
+    journal_path = cleanup_journal_path(target)
+    if lstat_exists(journal_path):
+        current_journal = read_existing_file(
+            journal_path,
+            max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+            label=CLEANUP_JOURNAL_NAME,
+        )
+        if current_journal != journal_data:
+            fail("cleanup drain intent journal does not match the published journal")
+    validate_cleanup_journal_document(
+        target,
+        journal,
+        root_exists=lstat_exists(cleanup_root(target)),
+        require_complete=False,
+    )
+    return intent
 
 
 def validate_cleanup_stage(target: Path) -> dict[str, Any] | None:
@@ -2672,6 +2810,42 @@ def publish_cleanup_stage_no_replace(path: Path, data: bytes, target: Path) -> N
         raise
 
 
+def publish_cleanup_drain_intent_no_replace(path: Path, data: bytes, target: Path) -> None:
+    if len(data) > CLEANUP_STAGE_MAX_BYTES:
+        fail("cleanup drain intent is too large")
+    ensure_real_parent(path, target)
+    temporary = path.with_name(f"{cleanup_drain_temp_prefix()}{os.getpid()}.{time.time_ns()}")
+    parent_before = backup_directory_snapshot(path.parent)
+    fd = -1
+    published = False
+    try:
+        fd = os.open(
+            temporary,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow_flag(),
+            OWNER_FILE_MODE,
+        )
+        os.fchmod(fd, OWNER_FILE_MODE)
+        write_all_fd(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        atomic_rename_no_replace(temporary, path)
+        published = True
+        validate_cleanup_drain_intent(target)
+        fsync_directory(path.parent)
+        validate_cleanup_drain_intent(target)
+    except BaseException:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            unlink_path_if_exists(temporary)
+        if published:
+            raise
+        restore_backup_directory_metadata(path.parent, parent_before)
+        raise
+
+
 def publish_cleanup_journal_no_replace(path: Path, data: bytes, target: Path) -> None:
     if len(data) > CLEANUP_JOURNAL_MAX_BYTES:
         fail("cleanup journal is too large")
@@ -2843,19 +3017,29 @@ def promote_cleanup_items(
         promotion.journal = moved_journal
         publish_cleanup_journal_no_replace(journal_path, journal_data, target)
         promotion.journal_published = True
-        if lstat_exists(stage_path):
-            unlink_path(stage_path)
-            fsync_directory(target)
+        try:
+            if lstat_exists(stage_path):
+                unlink_path(stage_path)
+                fsync_directory(target)
+        except BaseException:
+            promotion.journal_durable = False
+            return promotion
         promotion.journal_durable = True
         return promotion
     except CleanupJournalPublicationError:
         promotion.journal_published = True
-        if lstat_exists(stage_path):
-            unlink_path(stage_path)
-            fsync_directory(target)
+        try:
+            if lstat_exists(stage_path):
+                unlink_path(stage_path)
+                fsync_directory(target)
+        except BaseException:
+            pass
         promotion.journal_durable = False
         return promotion
     except BaseException:
+        if promotion.journal_published:
+            promotion.journal_durable = False
+            return promotion
         rollback_cleanup_promotion(promotion)
         raise
 
@@ -2891,6 +3075,7 @@ def cleanup_publication_temp_aliases(target: Path) -> list[Path]:
         for path in target.iterdir()
         if path.name.startswith(cleanup_journal_temp_prefix())
         or path.name.startswith(cleanup_stage_temp_prefix())
+        or path.name.startswith(cleanup_drain_temp_prefix())
     ]
 
 
@@ -3041,9 +3226,21 @@ def delete_cleanup_payload_bottom_up(payload: Path, label: str, metadata: dict[s
 def drain_cleanup_journal(target: Path, *, pending_on_failure: bool) -> bool:
     root = cleanup_root(target)
     try:
-        journal = validate_cleanup_journal(target)
-        if journal is None:
-            return False
+        recovered_temp = recover_cleanup_publication_temp_aliases(target)
+        drain_intent = validate_cleanup_drain_intent(target)
+        if drain_intent is None:
+            journal = validate_cleanup_journal(target)
+            if journal is None:
+                return recovered_temp
+            validate_complete_cleanup_journal(target, journal)
+            _intent, intent_data = build_cleanup_drain_projection(target, journal)
+            publish_cleanup_drain_intent_no_replace(
+                cleanup_drain_path(target),
+                intent_data,
+                target,
+            )
+        else:
+            journal = drain_intent["journal"]
         for entry in journal["entries"]:
             payload = root / entry["name"]
             if not lstat_exists(payload):
@@ -3056,7 +3253,10 @@ def drain_cleanup_journal(target: Path, *, pending_on_failure: bool) -> bool:
             if remaining:
                 fail("cleanup tombstone contains unknown entries")
             rmdir_path(root)
-        unlink_cleanup_journal_with_restore(target, journal)
+        if lstat_exists(cleanup_journal_path(target)):
+            unlink_cleanup_journal_with_restore(target, journal)
+        if lstat_exists(cleanup_drain_path(target)):
+            unlink_path(cleanup_drain_path(target))
         return False
     except BaseException:
         if pending_on_failure:
