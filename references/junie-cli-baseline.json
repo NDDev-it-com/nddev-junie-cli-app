@@ -24,6 +24,9 @@
       "ubuntu-glibc-arm64": "linux-aarch64",
       "ubuntu-glibc-x64": "linux-amd64"
     },
+    "unsupported_official_artifact_platforms": {
+      "windows": ["windows-aarch64", "windows-amd64"]
+    },
     "ubuntu_support": {
       "distribution_detection": "platform.freedesktop_os_release ID=ubuntu",
       "desktop_server_model": "Ubuntu Desktop and Server share ID=ubuntu plus glibc host detection.",
@@ -63,6 +66,16 @@
         "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-macos-amd64.zip",
         "sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0",
         "size": 270606128
+      },
+      "windows-aarch64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-aarch64.zip",
+        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
+        "size": 301279985
+      },
+      "windows-amd64": {
+        "download_url": "https://github.com/JetBrains/junie/releases/download/2383.10/junie-release-2383.10-windows-amd64.zip",
+        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
+        "size": 267185689
       }
     },
     "exact_artifact_hashes": {
@@ -81,6 +94,14 @@
       "macos-amd64": {
         "sha256": "c8f86fd383be44ab3ddee78d86c73d12f0cecd80fe1bdcc67c178cbabf625bb0",
         "size": 270606128
+      },
+      "windows-aarch64": {
+        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
+        "size": 301279985
+      },
+      "windows-amd64": {
+        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
+        "size": 267185689
       }
     }
   },

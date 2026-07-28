@@ -25,12 +25,21 @@ python3 cli-tools/nddev_junie_cli.py migrate --setup nddev-builder --profile ful
 python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py remove --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py software-status --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py install-cli --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py update-cli --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py remove-cli --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target -- --version
 ```
 
 `plan` is side-effect-free and reports the stable `changed` managed-path set
 that the corresponding `install`, `switch`, `update`, or `migrate` mutation
 would write or remove.
+
+Setup commands manage projected Junie configuration, builder content, stamps,
+locks, and backups. The target-owned Junie CLI runtime is managed only through
+the `*-cli` software commands, so setup `install` never substitutes for software
+installation.
 
 ## Junie CLI Baseline
 
@@ -57,9 +66,10 @@ the code-owned sources above.
 
 NDDev supports Junie CLI on `macos-arm64`, `macos-x64`,
 `ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. Official JetBrains artifact keys
-and URLs remain named `macos-*` and `linux-*`; the public support contract maps
-those official keys to NDDev product host ids in `config/nddev-contract.json`
-and `references/junie-cli-baseline.json`.
+and URLs remain vendor-owned observations. The pinned update-info release also
+contains official Windows artifacts, which NDDev records as official but
+unsupported; product support remains exactly the four macOS and Ubuntu host ids
+above.
 
 Linux distribution detection uses structured OS metadata and accepts Ubuntu
 Desktop or Server through the same `ID=ubuntu` plus glibc host check. JetBrains

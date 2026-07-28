@@ -46,6 +46,7 @@
     "status_command": "python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json",
     "plan_command": "python3 cli-tools/nddev_junie_cli.py plan --setup nddev-builder --profile full-auto --target /absolute/target --json",
     "install_command": "python3 cli-tools/nddev_junie_cli.py install --setup nddev-builder --profile full-auto --target /absolute/target --json",
+    "update_command": "python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json",
     "switch_command": "python3 cli-tools/nddev_junie_cli.py switch --setup nddev-builder --profile safe --target /absolute/target --json",
     "migrate_command": "python3 cli-tools/nddev_junie_cli.py migrate --setup nddev-builder --profile full-auto --target /absolute/target --json",
     "restore_command": "python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json",
@@ -102,7 +103,10 @@
     "update_info": "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
     "install_only_absent": true,
     "update_repairs_safe_partial": true,
-    "update_command": "python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json",
+    "status_command": "python3 cli-tools/nddev_junie_cli.py software-status --target /absolute/target --json",
+    "install_command": "python3 cli-tools/nddev_junie_cli.py install-cli --target /absolute/target --json",
+    "update_command": "python3 cli-tools/nddev_junie_cli.py update-cli --target /absolute/target --json",
+    "remove_command": "python3 cli-tools/nddev_junie_cli.py remove-cli --target /absolute/target --json",
     "installer_execution_home": "isolated staging HOME",
     "source_overrides": false,
     "test_environment_overrides": false,
@@ -127,7 +131,9 @@
       "linux-aarch64",
       "linux-amd64",
       "macos-aarch64",
-      "macos-amd64"
+      "macos-amd64",
+      "windows-aarch64",
+      "windows-amd64"
     ],
     "artifact_platform_map": {
       "macos-arm64": "macos-aarch64",
@@ -144,10 +150,13 @@
       "binary_abi": "glibc"
     },
     "unsupported_platforms": {
-      "windows": "unsupported",
+      "windows": "Rejected before target inspection, network, staging, or runtime mutation even though official windows-* artifacts exist.",
       "non-ubuntu-linux": "Rejected before network, staging, or runtime mutation even when an official linux-* artifact exists.",
       "linux-musl": "unsupported because the official Junie linux-* artifact is treated as glibc-bound",
       "unsupported-architecture": "Only arm64/aarch64 and x64/amd64 are supported."
+    },
+    "unsupported_official_artifact_platforms": {
+      "windows": ["windows-aarch64", "windows-amd64"]
     }
   },
   "runtime_launch": {

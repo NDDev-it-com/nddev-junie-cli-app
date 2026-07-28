@@ -40,8 +40,23 @@ OFFICIAL_ARTIFACT_PLATFORM_ORDER = [
     "linux-amd64",
     "macos-aarch64",
     "macos-amd64",
+    "windows-aarch64",
+    "windows-amd64",
 ]
 OFFICIAL_ARTIFACT_PLATFORMS = set(OFFICIAL_ARTIFACT_PLATFORM_ORDER)
+UNSUPPORTED_OFFICIAL_ARTIFACT_PLATFORMS = {
+    "windows": ["windows-aarch64", "windows-amd64"],
+}
+WINDOWS_OFFICIAL_ARTIFACT_OBSERVATIONS = {
+    "windows-aarch64": {
+        "size": 301279985,
+        "sha256": "51e69bfadd097f657a58a47a9757626fc9627b312451e2ff25643d310c601e28",
+    },
+    "windows-amd64": {
+        "size": 267185689,
+        "sha256": "bddf9833c15a8fe2e9afba43315e7a1333a49d01cefd4e5c93822170d40de07d",
+    },
+}
 ARTIFACT_PLATFORM_MAP = {
     "macos-arm64": "macos-aarch64",
     "macos-x64": "macos-amd64",
@@ -571,10 +586,19 @@ def validate_supported_platform_scope(
         raise ValueError("Ubuntu binary ABI policy must be glibc")
     if any(str(platform_id).startswith("linux-") for platform_id in runtime["supported_platforms"]):
         raise ValueError("public supported-platform contract must not expose generic Linux")
+    for label, owner in (
+        ("baseline release", release),
+        ("contract runtime_compatibility", runtime),
+        ("manifest", manifest),
+    ):
+        if owner.get("unsupported_official_artifact_platforms") != (
+            UNSUPPORTED_OFFICIAL_ARTIFACT_PLATFORMS
+        ):
+            raise ValueError(f"{label}: unsupported official artifact map is not synchronized")
     if set(release["exact_artifacts"]) != OFFICIAL_ARTIFACT_PLATFORMS:
-        raise ValueError("baseline must preserve only official macOS/linux artifact keys")
+        raise ValueError("baseline must preserve every official artifact key")
     if set(release["exact_artifact_hashes"]) != OFFICIAL_ARTIFACT_PLATFORMS:
-        raise ValueError("baseline exact hashes must preserve only official artifact keys")
+        raise ValueError("baseline exact hashes must preserve every official artifact key")
 
 
 def validate_baseline(
@@ -589,8 +613,12 @@ def validate_baseline(
         hashes = baseline["release"]["exact_artifact_hashes"][platform_id]
         if artifact["sha256"] != hashes["sha256"] or artifact["size"] != hashes["size"]:
             raise ValueError(f"{platform_id}: exact artifact hash metadata differs")
-        if not (platform_id.startswith("linux-") or platform_id.startswith("macos-")):
-            raise ValueError("unsupported platform artifact is out of scope")
+        if platform_id not in OFFICIAL_ARTIFACT_PLATFORMS:
+            raise ValueError("unknown official artifact platform is out of scope")
+        if platform_id in WINDOWS_OFFICIAL_ARTIFACT_OBSERVATIONS:
+            expected = WINDOWS_OFFICIAL_ARTIFACT_OBSERVATIONS[platform_id]
+            if artifact["sha256"] != expected["sha256"] or artifact["size"] != expected["size"]:
+                raise ValueError(f"{platform_id}: official Windows observation differs")
         if not str(artifact["download_url"]).startswith("https://github.com/JetBrains/junie/"):
             raise ValueError(f"{platform_id}: exact artifact URL must be official")
     lifecycle = contract["software_lifecycle"]
@@ -777,7 +805,138 @@ def validate_manager_parse(manager: Any) -> None:
     manager.parse_args(
         ["migrate", "--setup", "nddev-builder", "--profile", "full-auto", "--target", "/tmp/target"]
     )
+    manager.parse_args(["software-status", "--target", "/tmp/target"])
+    manager.parse_args(["install-cli", "--target", "/tmp/target"])
+    manager.parse_args(["update-cli", "--target", "/tmp/target"])
+    manager.parse_args(["remove-cli", "--target", "/tmp/target"])
     manager.parse_args(["launch", "--target", "/tmp/target", "--", "--version"])
+
+
+def validate_json_argument_boundary(manager: Any) -> None:
+    for label, argv in {
+        "invalid choice": ["does-not-exist", "--json"],
+        "missing target": ["status", "--json"],
+        "bad backup": ["restore", "--backup", "bad", "--target", "/tmp/target", "--json"],
+    }.items():
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = manager.main(argv)
+        if code != 2:
+            raise ValueError(f"{label}: expected rc 2, got {code}")
+        if stderr.getvalue():
+            raise ValueError(f"{label}: JSON parse boundary wrote usage stderr")
+        lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
+        if len(lines) != 1:
+            raise ValueError(f"{label}: expected exactly one JSON error line")
+        payload = json.loads(lines[0])
+        if sorted(payload) != ["error"] or not isinstance(payload["error"], str):
+            raise ValueError(f"{label}: JSON error payload is invalid")
+
+
+def validate_unsupported_host_preflight(manager: Any) -> None:
+    commands = {
+        "status": ["status", "--target"],
+        "plan": ["plan", "--target"],
+        "install": ["install", "--target"],
+        "switch": ["switch", "--profile", "safe", "--target"],
+        "update": ["update", "--target"],
+        "migrate": ["migrate", "--target"],
+        "restore": ["restore", "--backup", "0", "--target"],
+        "remove": ["remove", "--target"],
+        "software-status": ["software-status", "--target"],
+        "install-cli": ["install-cli", "--target"],
+        "update-cli": ["update-cli", "--target"],
+        "remove-cli": ["remove-cli", "--target"],
+        "launch": ["launch", "--target"],
+    }
+    unsupported = {
+        "windows": {
+            "system": "Windows",
+            "machine": "AMD64",
+            "os_release": {},
+            "libc": ("", ""),
+        },
+        "debian": {
+            "system": "Linux",
+            "machine": "x86_64",
+            "os_release": {"ID": "debian"},
+            "libc": ("glibc", "2.36"),
+        },
+        "alpine": {
+            "system": "Linux",
+            "machine": "x86_64",
+            "os_release": {"ID": "alpine"},
+            "libc": ("musl", "1.2.5"),
+        },
+    }
+    original_system = manager.platform.system
+    original_machine = manager.platform.machine
+    original_os_release = getattr(manager.platform, "freedesktop_os_release", None)
+    original_libc = manager.platform.libc_ver
+    original_urlopen = manager.urllib.request.urlopen
+    try:
+        for platform_label, model in unsupported.items():
+            manager.platform.system = lambda model=model: model["system"]
+            manager.platform.machine = lambda model=model: model["machine"]
+            manager.platform.freedesktop_os_release = lambda model=model: dict(model["os_release"])
+            manager.platform.libc_ver = lambda model=model: model["libc"]
+            network_calls: list[str] = []
+
+            def blocked_urlopen(*args: Any, **kwargs: Any) -> Any:
+                network_calls.append(repr(args[0] if args else ""))
+                raise AssertionError("unsupported host reached network")
+
+            manager.urllib.request.urlopen = blocked_urlopen
+            for command_label, prefix in commands.items():
+                with tempfile.TemporaryDirectory(
+                    prefix=f"nddev-junie-unsupported-{platform_label}-{command_label}-"
+                ) as raw:
+                    root = Path(raw)
+                    target = root / "missing-parent" / "target"
+                    argv = [*prefix, str(target), "--json"]
+                    if command_label == "launch":
+                        argv.extend(["--", "--version"])
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    product_root = manager.bootstrap_lock_product_root_path(
+                        manager.bootstrap_lock_system_root()
+                    )
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        code = manager.main(argv)
+                    if code != 2:
+                        raise ValueError(
+                            f"{platform_label} {command_label}: expected preflight rc 2"
+                        )
+                    if stderr.getvalue():
+                        raise ValueError(
+                            f"{platform_label} {command_label}: preflight wrote stderr"
+                        )
+                    payload = json.loads(stdout.getvalue())
+                    if sorted(payload) != ["error"]:
+                        raise ValueError(
+                            f"{platform_label} {command_label}: invalid JSON error payload"
+                        )
+                    if target.parent.exists():
+                        raise ValueError(
+                            f"{platform_label} {command_label}: target parent was inspected/created"
+                        )
+                    if product_root.exists():
+                        raise ValueError(
+                            f"{platform_label} {command_label}: bootstrap lock root was created"
+                        )
+            if network_calls:
+                raise ValueError(f"{platform_label}: unsupported preflight reached network")
+    finally:
+        manager.platform.system = original_system
+        manager.platform.machine = original_machine
+        if original_os_release is None:
+            with contextlib.suppress(AttributeError):
+                delattr(manager.platform, "freedesktop_os_release")
+        else:
+            manager.platform.freedesktop_os_release = original_os_release
+        manager.platform.libc_ver = original_libc
+        manager.urllib.request.urlopen = original_urlopen
 
 
 def expect_manager_failure(label: str, callback: Any) -> None:
@@ -1469,16 +1628,49 @@ def with_fake_software(
         manager.software_state = original_state
 
 
+def install_fake_software_via_cli(
+    manager: Any,
+    target: Path,
+    *,
+    shim_bytes: bytes = b"#!/bin/sh\nexit 0\n",
+) -> dict[str, Any]:
+    metadata_holder: dict[str, Any] = {}
+    original_begin = manager.begin_software_transaction
+    original_commit = manager.commit_software_transaction
+
+    def fake_begin(target_path: Path, *, repair: bool) -> Any:
+        metadata = fake_launch_runtime_metadata(manager, target_path, shim_bytes=shim_bytes)
+        metadata_holder["metadata"] = metadata
+        return manager.SoftwareTransaction(metadata=metadata, changed=True)
+
+    manager.begin_software_transaction = fake_begin
+    manager.commit_software_transaction = lambda transaction: None
+    try:
+        result = manager.install_or_update_cli(target, repair=False, command="install-cli")
+    finally:
+        manager.begin_software_transaction = original_begin
+        manager.commit_software_transaction = original_commit
+    if not metadata_holder:
+        raise ValueError("fake software transaction did not run")
+    return result
+
+
 def fake_launch_runtime_metadata(
     manager: Any,
     target: Path,
     *,
     shim_bytes: bytes = b"#!/bin/sh\nexit 0\n",
 ) -> dict[str, Any]:
+    baseline = manager.load_baseline()
+    version = baseline["release"]["exact_version"]
+    platform_id = manager.current_platform_id()
+    artifact = dict(baseline["release"]["exact_artifacts"][platform_id])
+    artifact["platform"] = platform_id
     runtime = manager.runtime_root(target)
     home = manager.runtime_home(target)
     data = manager.runtime_data(target)
-    version_dir = data / "versions" / "validator"
+    version_dir = data / "versions" / version
+    binary_parent = version_dir / "junie" / "bin"
     for directory in (
         runtime,
         home,
@@ -1487,87 +1679,106 @@ def fake_launch_runtime_metadata(
         data,
         data / "versions",
         version_dir,
+        version_dir / "junie",
+        binary_parent,
     ):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
     shim = manager.runtime_bin(target)
-    binary = version_dir / "junie"
+    binary = binary_parent / "junie"
     shim.write_bytes(shim_bytes)
     binary.write_bytes(b"validator Junie binary\n")
     os.chmod(shim, manager.OWNER_EXECUTABLE_MODE)
     os.chmod(binary, manager.OWNER_EXECUTABLE_MODE)
-    return fake_software_metadata(
-        shim_sha256=manager.sha256_file_bounded(
-            shim,
-            max_bytes=manager.MANAGED_MAX_BYTES,
-            label="validator Junie shim",
+    current = data / "current"
+    if current.exists() or current.is_symlink():
+        current.unlink()
+    current.symlink_to(version_dir)
+    manager.atomic_write(
+        manager.runtime_receipt_path(target),
+        manager.canonical_json(
+            {
+                "schema_version": 1,
+                "product_name": manager.PRODUCT_NAME,
+                "build_version": manager.VERSION,
+                "version": version,
+                "platform": platform_id,
+                "installer": baseline["release"]["installer"],
+                "update_info": baseline["release"]["update_info"],
+                "artifact": artifact,
+                "artifact_verification": {
+                    "size_verified": True,
+                    "sha256_verified": True,
+                    "method": "validator",
+                },
+                "installer_output_sha256": "0" * 64,
+            }
         ),
-        binary_size=binary.stat().st_size,
-        binary_sha256=manager.sha256_file_bounded(
-            binary,
-            max_bytes=manager.SOFTWARE_FILE_MAX_BYTES,
-            label="validator Junie binary",
-        ),
+        target,
     )
+    return manager.current_software_metadata(target)
 
 
 def validate_profile_switch_lifecycle(manager: Any) -> None:
-    def run() -> None:
-        with tempfile.TemporaryDirectory(prefix="nddev-junie-profile-cycle-") as raw:
-            target = Path(raw) / "target"
-            setup = manager.load_setup(DEFAULT_SETUP_ID)
-            safe = manager.load_profile("safe")
-            full_auto = manager.load_profile("full-auto")
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-profile-cycle-") as raw:
+        target = Path(raw) / "target"
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        safe = manager.load_profile("safe")
+        full_auto = manager.load_profile("full-auto")
 
-            installed = manager.write_setup(target, setup, safe)
-            if installed["setup_id"] != DEFAULT_SETUP_ID or installed["profile_id"] != "safe":
-                raise ValueError("safe install did not record orthogonal setup/profile ids")
-            stamp = manager.read_stamp(manager.validate_target(target, create=False))
-            if stamp is None or stamp.get("schema_version") != manager.STAMP_SCHEMA:
-                raise ValueError("new install did not write the current orthogonal stamp schema")
+        installed = manager.write_setup(target, setup, safe)
+        if installed["setup_id"] != DEFAULT_SETUP_ID or installed["profile_id"] != "safe":
+            raise ValueError("safe install did not record orthogonal setup/profile ids")
+        if installed["software"] != {"state": "absent"} or installed["software_changed"]:
+            raise ValueError("setup install ambiguously mutated target-owned software")
+        stamp = manager.read_stamp(manager.validate_target(target, create=False))
+        if stamp is None or stamp.get("schema_version") != manager.STAMP_SCHEMA:
+            raise ValueError("new install did not write the current orthogonal stamp schema")
 
-            before_target = exact_tree_snapshot(target)
-            before_backup = exact_tree_snapshot(manager.backup_pool(target))
-            before_software = manager.current_software_metadata(target)
-            noop_install = manager.write_setup(target, setup, safe)
-            if noop_install["changed"] or noop_install["backup_slot"] is not None:
-                raise ValueError("identical install did not report a true no-op")
-            if noop_install["software_changed"]:
-                raise ValueError("identical install reported software mutation")
-            if manager.current_software_metadata(target) != before_software:
-                raise ValueError("identical install changed software identity")
-            if exact_tree_snapshot(target) != before_target:
-                raise ValueError("identical install changed target inode, mtime, mode, or bytes")
-            if exact_tree_snapshot(manager.backup_pool(target)) != before_backup:
-                raise ValueError("identical install changed the backup pool")
-            noop_update = manager.update_setup(target, None, None)
-            if noop_update["changed"] or noop_update["backup_slot"] is not None:
-                raise ValueError("identical update did not report a true no-op")
-            if noop_update["software_changed"]:
-                raise ValueError("identical update reported software mutation")
-            if manager.current_software_metadata(target) != before_software:
-                raise ValueError("identical update changed software identity")
-            if exact_tree_snapshot(target) != before_target:
-                raise ValueError("identical update changed target inode, mtime, mode, or bytes")
-            if exact_tree_snapshot(manager.backup_pool(target)) != before_backup:
-                raise ValueError("identical update changed the backup pool")
+        before_target = exact_tree_snapshot(target)
+        before_backup = exact_tree_snapshot(manager.backup_pool(target))
+        before_software = manager.software_state(target)
+        noop_install = manager.write_setup(target, setup, safe)
+        if noop_install["changed"] or noop_install["backup_slot"] is not None:
+            raise ValueError("identical install did not report a true no-op")
+        if noop_install["software_changed"]:
+            raise ValueError("identical install reported software mutation")
+        if manager.software_state(target) != before_software:
+            raise ValueError("identical install changed software identity")
+        if exact_tree_snapshot(target) != before_target:
+            raise ValueError("identical install changed target inode, mtime, mode, or bytes")
+        if exact_tree_snapshot(manager.backup_pool(target)) != before_backup:
+            raise ValueError("identical install changed the backup pool")
+        noop_update = manager.update_setup(target, None, None)
+        if noop_update["changed"] or noop_update["backup_slot"] is not None:
+            raise ValueError("identical update did not report a true no-op")
+        if noop_update["software_changed"]:
+            raise ValueError("identical update reported software mutation")
+        if manager.software_state(target) != before_software:
+            raise ValueError("identical update changed software identity")
+        if exact_tree_snapshot(target) != before_target:
+            raise ValueError("identical update changed target inode, mtime, mode, or bytes")
+        if exact_tree_snapshot(manager.backup_pool(target)) != before_backup:
+            raise ValueError("identical update changed the backup pool")
 
-            full_auto_result = manager.write_setup(
-                target,
-                setup,
-                full_auto,
-                require_existing=True,
-            )
-            if full_auto_result["profile_id"] != "full-auto":
-                raise ValueError("switch to full-auto did not update profile_id")
-            if manager.read_stamp(target)["setup_id"] != DEFAULT_SETUP_ID:
-                raise ValueError("profile switch changed the content setup id")
+        software = install_fake_software_via_cli(manager, target)
+        if software["software"].get("state") != "installed":
+            raise ValueError("install-cli did not publish installed software state")
 
-            safe_result = manager.write_setup(target, setup, safe, require_existing=True)
-            if safe_result["profile_id"] != "safe":
-                raise ValueError("switch back to safe did not update profile_id")
+        full_auto_result = manager.write_setup(
+            target,
+            setup,
+            full_auto,
+            require_existing=True,
+        )
+        if full_auto_result["profile_id"] != "full-auto":
+            raise ValueError("switch to full-auto did not update profile_id")
+        if manager.read_stamp(target)["setup_id"] != DEFAULT_SETUP_ID:
+            raise ValueError("profile switch changed the content setup id")
 
-    with_fake_software(manager, run)
+        safe_result = manager.write_setup(target, setup, safe, require_existing=True)
+        if safe_result["profile_id"] != "safe":
+            raise ValueError("switch back to safe did not update profile_id")
 
 
 def validate_launch_lock_concurrency(manager: Any) -> None:
@@ -1575,7 +1786,6 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
         target = Path(raw) / "target"
         target.mkdir(mode=0o700)
         canonical = manager.validate_target(target, create=False)
-        metadata = fake_launch_runtime_metadata(manager, canonical)
         setup = manager.load_setup(DEFAULT_SETUP_ID)
         safe = manager.load_profile("safe")
         full_auto = manager.load_profile("full-auto")
@@ -1585,6 +1795,7 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
 
         def run() -> None:
             manager.write_setup(canonical, setup, safe)
+            install_fake_software_via_cli(manager, canonical)
             original_popen = manager.subprocess.Popen
             original_snapshot = manager.snapshot_live_junie_home
             original_guard = manager.require_live_junie_home_unchanged
@@ -1673,7 +1884,7 @@ def validate_launch_lock_concurrency(manager: Any) -> None:
             if switched["profile_id"] != "full-auto":
                 raise ValueError("lifecycle mutation remained blocked after launch completed")
 
-        with_fake_software(manager, run, metadata=metadata)
+        run()
 
 
 def validate_external_lock_survives_internal_lock_rename(manager: Any) -> None:
@@ -1683,7 +1894,6 @@ def validate_external_lock_survives_internal_lock_rename(manager: Any) -> None:
         target = Path(raw) / "target"
         target.mkdir(mode=0o700)
         canonical = manager.validate_target(target, create=False)
-        metadata = fake_launch_runtime_metadata(manager, canonical)
         setup = manager.load_setup(DEFAULT_SETUP_ID)
         safe = manager.load_profile("safe")
         full_auto = manager.load_profile("full-auto")
@@ -1692,6 +1902,7 @@ def validate_external_lock_survives_internal_lock_rename(manager: Any) -> None:
 
         def run() -> None:
             manager.write_setup(canonical, setup, safe)
+            install_fake_software_via_cli(manager, canonical)
             ready_read, ready_write = os.pipe()
             release_read, release_write = os.pipe()
             pid = os.fork()
@@ -1778,7 +1989,7 @@ def validate_external_lock_survives_internal_lock_rename(manager: Any) -> None:
             if not (lock / manager.LOCK_FILE_NAME).is_file():
                 raise ValueError("persistent internal lock file was removed after launch")
 
-        with_fake_software(manager, run, metadata=metadata)
+        run()
 
 
 def validate_verified_launcher_handoff(manager: Any) -> None:
@@ -1800,12 +2011,13 @@ exit 23
         target = Path(raw) / "target"
         target.mkdir(mode=0o700)
         canonical = manager.validate_target(target, create=False)
-        metadata = fake_launch_runtime_metadata(manager, canonical, shim_bytes=script)
+        version = manager.load_baseline()["release"]["exact_version"]
         setup = manager.load_setup(DEFAULT_SETUP_ID)
         safe = manager.load_profile("safe")
 
         def run() -> None:
             manager.write_setup(canonical, setup, safe)
+            install_fake_software_via_cli(manager, canonical, shim_bytes=script)
             original_snapshot = manager.snapshot_live_junie_home
             original_guard = manager.require_live_junie_home_unchanged
             manager.snapshot_live_junie_home = lambda: "validator-live-home"
@@ -1842,7 +2054,7 @@ exit 23
                 manager.runtime_home(canonical) / ".local" / "share",
                 manager.runtime_data(canonical),
                 manager.runtime_data(canonical) / "versions",
-                manager.runtime_data(canonical) / "versions" / "validator",
+                manager.runtime_data(canonical) / "versions" / version,
                 manager.runtime_data(canonical) / "logs",
                 manager.runtime_cache(canonical),
                 manager.runtime_tmp(canonical),
@@ -1858,7 +2070,7 @@ exit 23
             ):
                 raise ValueError("launch image directory mode was not restored")
 
-        with_fake_software(manager, run, metadata=metadata)
+        run()
 
 
 def legacy_managed_files(manager: Any, target: Path, setup_id: str) -> dict[str, bytes]:
@@ -2074,7 +2286,7 @@ def validate_backup_transaction_fail_closed(manager: Any) -> None:
             if backup_transaction_residue(pool):
                 raise ValueError("backup publish fault left transaction residue")
 
-    with_fake_software(manager, run)
+    run()
 
 
 def write_backup_envelope(manager: Any, target: Path, envelope: dict[str, Any]) -> None:
@@ -2140,7 +2352,7 @@ def expect_restore_failure_byte_identical(
             if after != before:
                 raise ValueError(f"{label}: failed restore changed target bytes")
 
-    with_fake_software(manager, run)
+    run()
 
 
 def validate_restore_backup_fail_closed(manager: Any) -> None:
@@ -2191,7 +2403,7 @@ def validate_restore_backup_fail_closed(manager: Any) -> None:
             if target_file_bytes(target) != before:
                 raise ValueError("backup slot extra entry failure changed target bytes")
 
-    with_fake_software(manager, extra_slot_entry)
+    extra_slot_entry()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2312,6 +2524,8 @@ def main(argv: list[str] | None = None) -> int:
         validate_generated_files(manager, version)
         validate_builder_projection_invariant(manager)
         validate_manager_parse(manager)
+        validate_json_argument_boundary(manager)
+        validate_unsupported_host_preflight(manager)
         validate_bootstrap_lock_adversarial(manager)
         validate_bootstrap_lock_persistent_handover(manager)
         validate_dual_lock_persistent_handover(manager)
