@@ -1661,15 +1661,27 @@ def validate_adversarial_smokes(manager: Any) -> None:
             else:
                 os.environ["PATH"] = old_path
 
+    validate_sticky_temp_target_cleanup(manager)
+
+
+def validate_sticky_temp_target_cleanup(manager: Any) -> None:
     sticky_parent = Path("/tmp")
-    if sticky_parent.is_dir() and (stat.S_IMODE(sticky_parent.stat().st_mode) & stat.S_ISVTX):
-        target = sticky_parent / f"nddev-junie-validator-{os.getpid()}-{id(manager)}"
+    if not sticky_parent.is_dir() or not (
+        stat.S_IMODE(sticky_parent.stat().st_mode) & stat.S_ISVTX
+    ):
+        return
+    target = sticky_parent / f"nddev-junie-validator-{os.getpid()}-{id(manager)}"
+    canonical: Path | None = None
+    try:
         with manager.target_lock(target, create_parent=True):
             canonical = manager.validate_target(target, create=False)
             if stat.S_IMODE(canonical.lstat().st_mode) & 0o077:
                 raise ValueError("sticky-temp target was not created private")
-        canonical = manager.validate_target(target, create=False)
-        manager.safe_rmtree_private_directory(canonical, "sticky-temp validator target")
+    finally:
+        manager.safe_rmtree_private_directory_if_exists(
+            canonical if canonical is not None else target.resolve(strict=False),
+            "sticky-temp validator target",
+        )
 
 
 def fake_software_metadata(
