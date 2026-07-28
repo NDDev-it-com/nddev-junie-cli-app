@@ -8,11 +8,10 @@ files with a stamp, rollback snapshot, target-internal lock, and target-internal
 rotating backups.
 
 `--target` is the managed control and project root. The launched Junie Home is an
-isolated runtime directory below that target. Explicit config, guidelines, skills,
-agents, commands, MCP, hooks, and extension source files remain deterministic
-regular files under the control root and are passed to Junie by exact flags and
-environment variables. The action allowlist is pathless native Junie state and is
-materialized under the isolated runtime home.
+isolated runtime directory below that target. Scope ownership and projection
+details are defined by `cli-tools/nddev_junie_cli.py` and summarized by
+`config/nddev-contract.json` so this README does not duplicate managed-path
+lists.
 
 ## Commands
 
@@ -28,6 +27,10 @@ python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/targe
 python3 cli-tools/nddev_junie_cli.py remove --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target -- --version
 ```
+
+`plan` is side-effect-free and reports the stable `changed` managed-path set
+that the corresponding `install`, `switch`, `update`, or `migrate` mutation
+would write or remove.
 
 ## Junie CLI Baseline
 

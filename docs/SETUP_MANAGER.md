@@ -32,6 +32,10 @@ timeout switches. Healthy target-owned software is left in place by `install`;
 `update` is the explicit repair path for supported partial runtime state. Unsafe
 targets fail closed before external installer work begins.
 
+`plan` remains read-only and reports the stable `changed` managed-path set that
+the matching setup/profile mutation would write or remove, including legacy
+managed-file removals during migration.
+
 The supported runtime scope is `macos-arm64`, `macos-x64`,
 `ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. JetBrains publishes the
 Ubuntu-compatible assets under official `linux-*` artifact names; the manager

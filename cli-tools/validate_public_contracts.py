@@ -1333,6 +1333,30 @@ def validate_adversarial_smokes(manager: Any) -> None:
         marker.write_text("keep\n", encoding="utf-8")
         managed = marker_target / "config.json"
         manager.atomic_write(managed, b"{}\n", marker_target)
+        managed.write_bytes(b"old\n")
+        original_fsync = manager.os.fsync
+        fsync_calls = {"count": 0}
+
+        def fail_parent_fsync_once(fd: int) -> None:
+            fsync_calls["count"] += 1
+            if fsync_calls["count"] == 2:
+                raise OSError("parent fsync fault")
+            original_fsync(fd)
+
+        manager.os.fsync = fail_parent_fsync_once
+        try:
+            try:
+                manager.atomic_write(managed, b"new\n", marker_target)
+            except OSError:
+                pass
+            else:
+                raise ValueError("atomic write parent fsync fault did not raise")
+        finally:
+            manager.os.fsync = original_fsync
+        if managed.read_bytes() != b"old\n":
+            raise ValueError("atomic write parent fsync rollback changed destination bytes")
+        if list(marker_target.glob(".config.json.nddev.tmp.*")):
+            raise ValueError("atomic write parent fsync rollback left temporary sibling")
         snapshot = manager.snapshot_files(marker_target, ["config.json"])
         managed.unlink()
         manager.restore_snapshot(marker_target, snapshot)
@@ -1501,6 +1525,32 @@ def validate_profile_switch_lifecycle(manager: Any) -> None:
             stamp = manager.read_stamp(manager.validate_target(target, create=False))
             if stamp is None or stamp.get("schema_version") != manager.STAMP_SCHEMA:
                 raise ValueError("new install did not write the current orthogonal stamp schema")
+
+            before_target = exact_tree_snapshot(target)
+            before_backup = exact_tree_snapshot(manager.backup_pool(target))
+            before_software = manager.current_software_metadata(target)
+            noop_install = manager.write_setup(target, setup, safe)
+            if noop_install["changed"] or noop_install["backup_slot"] is not None:
+                raise ValueError("identical install did not report a true no-op")
+            if noop_install["software_changed"]:
+                raise ValueError("identical install reported software mutation")
+            if manager.current_software_metadata(target) != before_software:
+                raise ValueError("identical install changed software identity")
+            if exact_tree_snapshot(target) != before_target:
+                raise ValueError("identical install changed target inode, mtime, mode, or bytes")
+            if exact_tree_snapshot(manager.backup_pool(target)) != before_backup:
+                raise ValueError("identical install changed the backup pool")
+            noop_update = manager.update_setup(target, None, None)
+            if noop_update["changed"] or noop_update["backup_slot"] is not None:
+                raise ValueError("identical update did not report a true no-op")
+            if noop_update["software_changed"]:
+                raise ValueError("identical update reported software mutation")
+            if manager.current_software_metadata(target) != before_software:
+                raise ValueError("identical update changed software identity")
+            if exact_tree_snapshot(target) != before_target:
+                raise ValueError("identical update changed target inode, mtime, mode, or bytes")
+            if exact_tree_snapshot(manager.backup_pool(target)) != before_backup:
+                raise ValueError("identical update changed the backup pool")
 
             full_auto_result = manager.write_setup(
                 target,
@@ -1924,6 +1974,109 @@ def target_file_bytes(target: Path) -> dict[str, bytes]:
     return files
 
 
+def tree_snapshot(root: Path) -> tuple[tuple[str, str, int, bytes | str | None], ...]:
+    if not root.exists():
+        return ((".", "absent", 0, None),)
+    rows: list[tuple[str, str, int, bytes | str | None]] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISDIR(info.st_mode):
+            rows.append((relative, "dir", mode, None))
+        elif stat.S_ISREG(info.st_mode):
+            rows.append((relative, "file", mode, path.read_bytes()))
+        elif stat.S_ISLNK(info.st_mode):
+            rows.append((relative, "symlink", mode, os.readlink(path)))
+        else:
+            rows.append((relative, "other", mode, None))
+    return tuple(rows)
+
+
+def exact_tree_snapshot(
+    root: Path,
+) -> tuple[tuple[str, str, int, int, int, bytes | str | None], ...]:
+    if not root.exists():
+        return ((".", "absent", 0, 0, 0, None),)
+    rows: list[tuple[str, str, int, int, int, bytes | str | None]] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        metadata = (mode, info.st_ino, info.st_mtime_ns)
+        if stat.S_ISDIR(info.st_mode):
+            rows.append((relative, "dir", *metadata, None))
+        elif stat.S_ISREG(info.st_mode):
+            rows.append((relative, "file", *metadata, path.read_bytes()))
+        elif stat.S_ISLNK(info.st_mode):
+            rows.append((relative, "symlink", *metadata, os.readlink(path)))
+        else:
+            rows.append((relative, "other", *metadata, None))
+    return tuple(rows)
+
+
+def backup_transaction_residue(pool: Path) -> list[str]:
+    if not pool.exists():
+        return []
+    return sorted(path.name for path in pool.iterdir() if ".nddev-backup." in path.name)
+
+
+def validate_backup_transaction_fail_closed(manager: Any) -> None:
+    def run() -> None:
+        with tempfile.TemporaryDirectory(prefix="nddev-junie-backup-transaction-") as raw:
+            target = Path(raw) / "target"
+            setup = manager.load_setup(DEFAULT_SETUP_ID)
+            safe = manager.load_profile("safe")
+            full_auto = manager.load_profile("full-auto")
+            manager.write_setup(target, setup, safe)
+            for index in range(12):
+                manager.write_setup(
+                    target,
+                    setup,
+                    full_auto if index % 2 == 0 else safe,
+                    require_existing=True,
+                )
+            pool = manager.backup_pool(manager.validate_target(target, create=False))
+            if sorted(path.name for path in pool.iterdir()) != [str(index) for index in range(10)]:
+                raise ValueError("backup transaction validator did not fill all slots")
+            before_pool = tree_snapshot(pool)
+            before_target = target_file_bytes(target)
+            original_replace = manager.os.replace
+
+            def fail_backup_publish(
+                source: str | os.PathLike[str],
+                destination: str | os.PathLike[str],
+            ) -> None:
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if (
+                    source_path.name.startswith(f".{manager.BACKUP_NAME}.nddev.tmp.")
+                    and destination_path.name == manager.BACKUP_NAME
+                    and destination_path.parent.parent.resolve() == pool.resolve()
+                ):
+                    raise OSError("backup publish fault")
+                original_replace(source, destination)
+
+            manager.os.replace = fail_backup_publish
+            try:
+                try:
+                    manager.write_setup(target, setup, full_auto, require_existing=True)
+                except OSError:
+                    pass
+                else:
+                    raise ValueError("full-slot backup publish fault did not raise")
+            finally:
+                manager.os.replace = original_replace
+            if tree_snapshot(pool) != before_pool:
+                raise ValueError("backup publish fault changed the backup pool")
+            if target_file_bytes(target) != before_target:
+                raise ValueError("backup publish fault changed target bytes")
+            if backup_transaction_residue(pool):
+                raise ValueError("backup publish fault left transaction residue")
+
+    with_fake_software(manager, run)
+
+
 def write_backup_envelope(manager: Any, target: Path, envelope: dict[str, Any]) -> None:
     path = manager.backup_pool(target) / "0" / manager.BACKUP_NAME
     manager.atomic_write(path, manager.canonical_json(envelope), target)
@@ -2024,6 +2177,21 @@ def validate_restore_backup_fail_closed(manager: Any) -> None:
         "invalid backup path",
         invalid_path,
     )
+
+    def extra_slot_entry() -> None:
+        with tempfile.TemporaryDirectory(prefix="nddev-junie-restore-extra-entry-") as raw:
+            target = restore_corruption_target(manager, Path(raw))
+            extra = manager.backup_pool(target) / "0" / "extra.json"
+            extra.write_text("{}\n", encoding="utf-8")
+            os.chmod(extra, manager.OWNER_FILE_MODE)
+            before = target_file_bytes(target)
+            expect_manager_failure(
+                "backup slot extra entry", lambda: manager.restore_backup(target, 0)
+            )
+            if target_file_bytes(target) != before:
+                raise ValueError("backup slot extra entry failure changed target bytes")
+
+    with_fake_software(manager, extra_slot_entry)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2153,6 +2321,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_external_lock_survives_internal_lock_rename(manager)
         validate_verified_launcher_handoff(manager)
         validate_legacy_mapping_migration(manager)
+        validate_backup_transaction_fail_closed(manager)
         validate_restore_backup_fail_closed(manager)
     validate_workflows()
     validate_release_workflow(version, contract, manifest)

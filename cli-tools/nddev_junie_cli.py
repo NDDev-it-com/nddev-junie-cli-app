@@ -26,6 +26,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
+_ORIGINAL_OS_FSYNC = os.fsync
+_ORIGINAL_OS_RENAME = os.rename
+_ORIGINAL_OS_WRITE = os.write
+
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 PRODUCT_NAME = "nddev-junie-cli-app"
@@ -181,6 +185,18 @@ class RuntimeRemoveTransaction:
     removed_root: Path | None = None
 
 
+@dataclass
+class BackupTransaction:
+    pool: Path | None = None
+    pool_created: bool = False
+    slot: int | None = None
+    slot_dir: Path | None = None
+    envelope: bytes | None = None
+    previous_envelope: FileSnapshot | None = None
+    slot_created: bool = False
+    slot_committed: bool = False
+
+
 @dataclass(frozen=True)
 class BackupRestorePlan:
     files: dict[str, bytes]
@@ -258,7 +274,7 @@ class DirectoryTransaction:
     def cleanup(self) -> None:
         for path in reversed(self.created):
             with contextlib.suppress(OSError):
-                path.rmdir()
+                rmdir_path(path)
 
 
 class RuntimeValidationError(JunieCliSetupError):
@@ -721,6 +737,7 @@ def ensure_private_directory(path: Path, target: Path, label: str) -> None:
 def safe_rmtree_private_directory(path: Path, label: str) -> None:
     require_private_directory(path, label)
     shutil.rmtree(path)
+    fsync_directory(path.parent)
 
 
 def safe_rmtree_private_directory_if_exists(path: Path, label: str) -> None:
@@ -1144,10 +1161,10 @@ def acquire_target_lock(
                 os.close(directory_fd)
         if cleanup_created_artifacts_on_failure and created_lock_file:
             with contextlib.suppress(OSError):
-                lock_file_path(canonical).unlink()
+                unlink_path_if_exists(lock_file_path(canonical))
         if cleanup_created_artifacts_on_failure and created_directory:
             with contextlib.suppress(OSError):
-                directory.rmdir()
+                rmdir_path(directory)
         transaction.cleanup()
         raise
 
@@ -1163,9 +1180,9 @@ def release_target_lock(handle: TargetLockHandle, *, cleanup_artifacts: bool) ->
         os.close(handle.directory_fd)
     if cleanup_artifacts:
         with contextlib.suppress(OSError):
-            handle.lock_file.unlink()
+            unlink_path_if_exists(handle.lock_file)
         with contextlib.suppress(OSError):
-            handle.directory.rmdir()
+            rmdir_path(handle.directory)
 
 
 def validate_target(
@@ -1328,6 +1345,7 @@ def ensure_real_parent(path: Path, target: Path) -> None:
         info = stat_existing(current, f"managed directory {current}")
         if info is None:
             current.mkdir(mode=OWNER_DIRECTORY_MODE)
+            fsync_directory(current.parent)
             continue
         require_current_owner(info, f"managed directory {current}")
         if not stat.S_ISDIR(info.st_mode):
@@ -1363,20 +1381,166 @@ def read_existing_file(path: Path, *, max_bytes: int, label: str) -> bytes | Non
     return data
 
 
+def fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | nofollow_flag())
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def unlink_path(path: Path) -> None:
+    path.unlink()
+    fsync_directory(path.parent)
+
+
+def unlink_path_if_exists(path: Path) -> None:
+    try:
+        unlink_path(path)
+    except FileNotFoundError:
+        return
+
+
+def rmdir_path(path: Path) -> None:
+    parent = path.parent
+    path.rmdir()
+    fsync_directory(parent)
+
+
+def fsync_directory_unpatched(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | nofollow_flag())
+    try:
+        _ORIGINAL_OS_FSYNC(fd)
+    finally:
+        os.close(fd)
+
+
+def rmdir_path_unpatched(path: Path) -> None:
+    parent = path.parent
+    path.rmdir()
+    fsync_directory_unpatched(parent)
+
+
+def safe_rmtree_private_directory_fsynced(path: Path, label: str) -> None:
+    safe_rmtree_private_directory(path, label)
+
+
+def write_all_fd(fd: int, data: bytes) -> None:
+    total = 0
+    while total < len(data):
+        written = os.write(fd, data[total:])
+        if written <= 0:
+            fail("temporary file write made no progress")
+        total += written
+
+
+def write_all_fd_unpatched(fd: int, data: bytes) -> None:
+    total = 0
+    while total < len(data):
+        written = _ORIGINAL_OS_WRITE(fd, data[total:])
+        if written <= 0:
+            fail("temporary file write made no progress")
+        total += written
+
+
+def file_snapshot_for_atomic_write(path: Path) -> FileSnapshot:
+    info = require_existing_managed_file(path, str(path), max_bytes=MANAGED_MAX_BYTES)
+    if info is None:
+        return FileSnapshot(exists=False)
+    data = read_existing_file(path, max_bytes=MANAGED_MAX_BYTES, label=str(path))
+    return FileSnapshot(exists=True, data=data, mode=stat.S_IMODE(info.st_mode))
+
+
+def restore_atomic_write_snapshot(path: Path, snapshot: FileSnapshot, target: Path) -> None:
+    if not snapshot.exists:
+        unlink_path_if_exists(path)
+        return
+    if snapshot.data is None or snapshot.mode is None:
+        fail("atomic write snapshot is invalid")
+    atomic_write(path, snapshot.data, target, mode=snapshot.mode)
+
+
 def atomic_write(path: Path, data: bytes, target: Path, *, mode: int = OWNER_FILE_MODE) -> None:
     ensure_real_parent(path, target)
-    require_existing_managed_file(path, str(path), max_bytes=MANAGED_MAX_BYTES)
+    previous = file_snapshot_for_atomic_write(path)
     temporary = path.with_name(f".{path.name}.nddev.tmp.{os.getpid()}.{time.time_ns()}")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    replaced = False
     try:
-        with os.fdopen(fd, "wb") as handle:
-            os.fchmod(handle.fileno(), mode)
-            handle.write(data)
+        os.fchmod(fd, mode)
+        write_all_fd(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
         os.replace(temporary, path)
+        replaced = True
+        fsync_directory(path.parent)
     except BaseException:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
+            unlink_path_if_exists(temporary)
+        if replaced:
+            restore_atomic_write_snapshot(path, previous, target)
         raise
+
+
+def emergency_unlink_existing(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        require_private_directory(path, str(path))
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    fsync_directory_unpatched(path.parent)
+
+
+def emergency_atomic_restore(path: Path, item: FileSnapshot, target: Path) -> None:
+    if not item.exists:
+        emergency_unlink_existing(path)
+        return
+    if item.data is None or item.mode is None:
+        fail("rollback snapshot is invalid")
+    ensure_real_parent(path, target)
+    temporary = path.with_name(f".{path.name}.nddev.tmp.rollback.{os.getpid()}.{time.time_ns()}")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, item.mode)
+    published = False
+    try:
+        os.fchmod(fd, item.mode)
+        write_all_fd_unpatched(fd, item.data)
+        _ORIGINAL_OS_FSYNC(fd)
+        os.close(fd)
+        fd = -1
+        _ORIGINAL_OS_RENAME(temporary, path)
+        published = True
+        fsync_directory_unpatched(path.parent)
+    except BaseException:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if not published:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+        raise
+
+
+def planned_changed_relatives(
+    target: Path, current: dict[str, Any] | None, files: dict[str, bytes]
+) -> list[str]:
+    previous_relatives = [] if current is None else stamp_managed_relatives(current)
+    legacy = current is not None and is_legacy_stamp(current)
+    changed = [
+        relative
+        for relative, data in files.items()
+        if current_managed_digest(target, relative, legacy=legacy)
+        != managed_digest_for_bytes(relative, data)
+    ]
+    changed.extend(relative for relative in previous_relatives if relative not in files)
+    return unique_relatives(changed)
 
 
 def read_json_file(path: Path, *, max_bytes: int, label: str) -> dict[str, Any]:
@@ -2048,8 +2212,9 @@ def ensure_current_symlink(target: Path, version: str) -> None:
         if stat.S_ISDIR(info.st_mode):
             safe_rmtree_private_directory(current, "Junie current directory")
         else:
-            current.unlink()
+            unlink_path(current)
     current.symlink_to(desired)
+    fsync_directory(current.parent)
 
 
 def read_runtime_receipt(target: Path, baseline: dict[str, Any]) -> dict[str, Any]:
@@ -2461,8 +2626,10 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
                 runtime_home(target), target, "runtime home", repairable=False
             )
             runtime_home(target).rename(old_home)
+            fsync_directory(root)
             previous_home = old_home
         staged_home.rename(runtime_home(target))
+        fsync_directory(root)
         ensure_current_symlink(target, baseline["release"]["exact_version"])
         ensure_private_directory(runtime_root(target), target, "runtime root")
         ensure_private_directory(runtime_home(target), target, "runtime home")
@@ -2477,9 +2644,10 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             if lstat_exists(runtime_home(target)) and previous_home is not None:
-                safe_rmtree_private_directory(runtime_home(target), "runtime home")
+                safe_rmtree_private_directory_fsynced(runtime_home(target), "runtime home")
         if previous_home is not None and lstat_exists(previous_home):
             previous_home.rename(runtime_home(target))
+            fsync_directory(root)
         safe_rmtree_private_directory_if_exists(stage, "software install stage")
         prune_empty_runtime_dirs(target)
         raise
@@ -2494,16 +2662,21 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
 
 def commit_software_transaction(transaction: SoftwareTransaction) -> None:
     if transaction.previous_home is not None and lstat_exists(transaction.previous_home):
-        safe_rmtree_private_directory(transaction.previous_home, "previous runtime home")
+        with contextlib.suppress(OSError):
+            safe_rmtree_private_directory_fsynced(
+                transaction.previous_home,
+                "previous runtime home",
+            )
 
 
 def rollback_software_transaction(target: Path, transaction: SoftwareTransaction) -> None:
     if not transaction.changed:
         return
     if transaction.new_home is not None and lstat_exists(transaction.new_home):
-        safe_rmtree_private_directory(transaction.new_home, "new runtime home")
+        safe_rmtree_private_directory_fsynced(transaction.new_home, "new runtime home")
     if transaction.previous_home is not None and lstat_exists(transaction.previous_home):
         transaction.previous_home.rename(runtime_home(target))
+        fsync_directory(runtime_root(target))
     prune_empty_runtime_dirs(target)
 
 
@@ -2514,12 +2687,14 @@ def begin_runtime_remove(target: Path) -> RuntimeRemoveTransaction:
     runtime_private_directory(root, target, "runtime root", repairable=False)
     removed = target / f".{RUNTIME_DIR_NAME}.removed.{os.getpid()}.{time.time_ns()}"
     root.rename(removed)
+    fsync_directory(target)
     return RuntimeRemoveTransaction(changed=True, removed_root=removed)
 
 
 def commit_runtime_remove(transaction: RuntimeRemoveTransaction) -> None:
     if transaction.removed_root is not None:
-        safe_rmtree_private_directory(transaction.removed_root, "removed runtime root")
+        with contextlib.suppress(OSError):
+            safe_rmtree_private_directory_fsynced(transaction.removed_root, "removed runtime root")
 
 
 def rollback_runtime_remove(target: Path, transaction: RuntimeRemoveTransaction) -> None:
@@ -2527,10 +2702,11 @@ def rollback_runtime_remove(target: Path, transaction: RuntimeRemoveTransaction)
         if lstat_exists(runtime_root(target)):
             info = runtime_root(target).lstat()
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                safe_rmtree_private_directory(runtime_root(target), "runtime root")
+                safe_rmtree_private_directory_fsynced(runtime_root(target), "runtime root")
             else:
-                runtime_root(target).unlink()
+                unlink_path(runtime_root(target))
         transaction.removed_root.rename(runtime_root(target))
+        fsync_directory(runtime_root(target).parent)
 
 
 def prune_empty_runtime_dirs(target: Path) -> None:
@@ -2541,7 +2717,7 @@ def prune_empty_runtime_dirs(target: Path) -> None:
         runtime_root(target),
     ):
         with contextlib.suppress(OSError):
-            directory.rmdir()
+            rmdir_path(directory)
 
 
 def stamp_path(target: Path) -> Path:
@@ -2681,11 +2857,19 @@ def unique_relatives(relatives: list[str] | tuple[str, ...] | set[str]) -> list[
     return sorted(set(relatives))
 
 
-def snapshot_files(target: Path, relatives: list[str]) -> dict[str, bytes | None]:
-    snapshot: dict[str, bytes | None] = {}
+def snapshot_files(target: Path, relatives: list[str]) -> dict[str, FileSnapshot]:
+    snapshot: dict[str, FileSnapshot] = {}
     for relative in unique_relatives([*relatives, STAMP_NAME]):
-        snapshot[relative] = read_existing_file(
-            safe_target_path(target, relative), max_bytes=MANAGED_MAX_BYTES, label=relative
+        path = safe_target_path(target, relative)
+        info = require_existing_managed_file(path, relative, max_bytes=MANAGED_MAX_BYTES)
+        if info is None:
+            snapshot[relative] = FileSnapshot(exists=False)
+            continue
+        data = read_existing_file(path, max_bytes=MANAGED_MAX_BYTES, label=relative)
+        snapshot[relative] = FileSnapshot(
+            exists=True,
+            data=data,
+            mode=stat.S_IMODE(info.st_mode),
         )
     return snapshot
 
@@ -2716,12 +2900,29 @@ def capture_transaction_snapshot(
     )
 
 
-def restore_transaction_snapshot(target: Path, snapshot: TransactionSnapshot) -> None:
+def target_contains_only_lock_artifacts(target: Path) -> bool:
+    if not lstat_exists(target):
+        return True
+    try:
+        entries = sorted(path.name for path in target.iterdir())
+    except OSError:
+        return False
+    if entries != [LOCK_DIR_NAME]:
+        return False
+    lock_dir = target / LOCK_DIR_NAME
+    try:
+        require_private_directory(lock_dir, "target lock directory")
+        lock_entries = sorted(path.name for path in lock_dir.iterdir())
+    except JunieCliSetupError:
+        return False
+    return lock_entries == [LOCK_FILE_NAME]
+
+
+def apply_transaction_snapshot_once(target: Path, snapshot: TransactionSnapshot) -> None:
     for relative, item in snapshot.files.items():
         path = safe_target_path(target, relative)
         if not item.exists:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+            unlink_path_if_exists(path)
             continue
         if item.data is None or item.mode is None:
             fail("transaction snapshot is invalid")
@@ -2732,34 +2933,131 @@ def restore_transaction_snapshot(target: Path, snapshot: TransactionSnapshot) ->
             chmod_private_directory(target, snapshot.target_mode, "target")
     if not snapshot.target_existed:
         with contextlib.suppress(OSError):
-            target.rmdir()
+            rmdir_path(target)
 
 
-def restore_snapshot(target: Path, snapshot: dict[str, bytes | None]) -> None:
-    for relative, data in snapshot.items():
+def validate_transaction_snapshot_restored(target: Path, snapshot: TransactionSnapshot) -> None:
+    if snapshot.target_existed:
+        if snapshot.target_mode is not None:
+            info = require_real_directory(target, "target")
+            if stat.S_IMODE(info.st_mode) != snapshot.target_mode:
+                fail("transaction rollback did not restore the target mode")
+    elif not target_contains_only_lock_artifacts(target):
+        fail("transaction rollback did not remove the created target")
+    for relative, item in snapshot.files.items():
         path = safe_target_path(target, relative)
-        if data is None:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+        info = require_existing_managed_file(path, relative, max_bytes=MANAGED_MAX_BYTES)
+        if not item.exists:
+            if info is not None:
+                fail("transaction rollback did not restore file absence")
             continue
-        atomic_write(path, data, target)
+        if info is None or item.data is None or item.mode is None:
+            fail("transaction rollback did not restore file presence")
+        if stat.S_IMODE(info.st_mode) != item.mode:
+            fail("transaction rollback did not restore file mode")
+        current = read_existing_file(path, max_bytes=MANAGED_MAX_BYTES, label=relative)
+        if current != item.data:
+            fail("transaction rollback did not restore file bytes")
+
+
+def restore_transaction_snapshot(target: Path, snapshot: TransactionSnapshot) -> None:
+    last_error: BaseException | None = None
+    for _attempt in range(3):
+        try:
+            apply_transaction_snapshot_once(target, snapshot)
+            validate_transaction_snapshot_restored(target, snapshot)
+            return
+        except BaseException as exc:
+            last_error = exc
+    try:
+        emergency_restore_transaction_snapshot(target, snapshot)
+        validate_transaction_snapshot_restored(target, snapshot)
+        return
+    except BaseException as exc:
+        last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def apply_snapshot_once(target: Path, snapshot: dict[str, FileSnapshot]) -> None:
+    for relative, item in snapshot.items():
+        path = safe_target_path(target, relative)
+        if not item.exists:
+            unlink_path_if_exists(path)
+            continue
+        if item.data is None or item.mode is None:
+            fail("snapshot is invalid")
+        atomic_write(path, item.data, target, mode=item.mode)
     prune_empty_managed_dirs(target, list(snapshot))
 
 
-def choose_backup_slot(pool: Path) -> int:
+def restore_snapshot(target: Path, snapshot: dict[str, FileSnapshot]) -> None:
+    last_error: BaseException | None = None
+    for _attempt in range(3):
+        try:
+            apply_snapshot_once(target, snapshot)
+            validate_snapshot_restored(target, snapshot)
+            return
+        except BaseException as exc:
+            last_error = exc
+    try:
+        emergency_restore_file_snapshot(target, snapshot)
+        validate_snapshot_restored(target, snapshot)
+        return
+    except BaseException as exc:
+        last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def emergency_restore_file_snapshot(target: Path, snapshot: dict[str, FileSnapshot]) -> None:
+    errors: list[BaseException] = []
+    for relative, item in snapshot.items():
+        try:
+            emergency_atomic_restore(safe_target_path(target, relative), item, target)
+        except BaseException as exc:
+            errors.append(exc)
+    with contextlib.suppress(OSError):
+        prune_empty_managed_dirs(target, list(snapshot))
+    try:
+        validate_snapshot_restored(target, snapshot)
+    except BaseException:
+        if errors:
+            raise errors[-1]
+        raise
+
+
+def emergency_restore_transaction_snapshot(target: Path, snapshot: TransactionSnapshot) -> None:
+    emergency_restore_file_snapshot(target, snapshot.files)
+    if snapshot.target_existed and snapshot.target_mode is not None:
+        with contextlib.suppress(FileNotFoundError):
+            chmod_private_directory(target, snapshot.target_mode, "target")
+    elif not snapshot.target_existed:
+        with contextlib.suppress(OSError):
+            rmdir_path_unpatched(target)
+
+
+def ensure_backup_pool(pool: Path) -> bool:
     info = stat_existing(pool, "backup pool")
     if info is None:
         try:
             pool.mkdir(mode=OWNER_DIRECTORY_MODE)
         except FileExistsError:
             fail("backup pool appeared during creation")
+        fsync_directory(pool.parent)
         require_private_directory(pool, "backup pool")
+        return True
     else:
         require_current_owner(info, "backup pool")
         if not stat.S_ISDIR(info.st_mode):
             fail("backup pool must be a directory")
         if stat.S_IMODE(info.st_mode) & 0o077:
             fail("backup pool must be private")
+        return False
+
+
+def choose_backup_slot(pool: Path) -> int:
+    ensure_backup_pool(pool)
     for slot in range(10):
         slot_path = pool / str(slot)
         if not lstat_exists(slot_path):
@@ -2775,24 +3073,14 @@ def choose_backup_slot(pool: Path) -> int:
     return min(range(10), key=lambda item: (pool / str(item)).lstat().st_mtime_ns)
 
 
-def create_backup(target: Path, stamp: dict[str, Any]) -> int:
-    pool = backup_pool(target)
-    slot = choose_backup_slot(pool)
-    slot_dir = pool / str(slot)
-    if lstat_exists(slot_dir):
-        safe_rmtree_private_directory(slot_dir, f"backup slot {slot}")
-    try:
-        slot_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
-    except FileExistsError:
-        fail(f"backup slot {slot} appeared during creation")
-    require_private_directory(slot_dir, f"backup slot {slot}")
+def backup_envelope(target: Path, stamp: dict[str, Any], slot: int) -> dict[str, Any]:
     files: dict[str, Any] = {}
     for relative in unique_relatives([*stamp_managed_relatives(stamp), STAMP_NAME]):
         data = read_existing_file(
             safe_target_path(target, relative), max_bytes=MANAGED_MAX_BYTES, label=relative
         )
         files[relative] = None if data is None else base64.b64encode(data).decode("ascii")
-    envelope = {
+    return {
         "schema_version": 2,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
@@ -2804,8 +3092,103 @@ def create_backup(target: Path, stamp: dict[str, Any]) -> int:
         "created_at": int(time.time()),
         "files": files,
     }
-    atomic_write(slot_dir / BACKUP_NAME, canonical_json(envelope), slot_dir)
-    return slot
+
+
+def begin_backup_transaction(target: Path, stamp: dict[str, Any]) -> BackupTransaction:
+    pool = backup_pool(target)
+    pool_created = ensure_backup_pool(pool)
+    slot = choose_backup_slot(pool)
+    slot_dir = pool / str(slot)
+    previous_envelope = FileSnapshot(exists=False)
+    if lstat_exists(slot_dir):
+        validate_backup_slot_entries(slot_dir, slot)
+        envelope_info = require_existing_managed_file(
+            slot_dir / BACKUP_NAME,
+            BACKUP_NAME,
+            max_bytes=METADATA_MAX_BYTES,
+        )
+        if envelope_info is None:
+            fail(f"backup slot {slot} is missing its envelope")
+        previous_data = read_existing_file(
+            slot_dir / BACKUP_NAME,
+            max_bytes=METADATA_MAX_BYTES,
+            label=BACKUP_NAME,
+        )
+        previous_envelope = FileSnapshot(
+            exists=True,
+            data=previous_data,
+            mode=stat.S_IMODE(envelope_info.st_mode),
+        )
+    transaction = BackupTransaction(
+        pool=pool,
+        pool_created=pool_created,
+        slot=slot,
+        slot_dir=slot_dir,
+        envelope=canonical_json(backup_envelope(target, stamp, slot)),
+        previous_envelope=previous_envelope,
+    )
+    return transaction
+
+
+def commit_backup_transaction(transaction: BackupTransaction) -> None:
+    if transaction.slot is None:
+        return
+    if transaction.pool is None or transaction.slot_dir is None or transaction.envelope is None:
+        fail("backup transaction is invalid")
+    slot = transaction.slot
+    slot_dir = transaction.slot_dir
+    try:
+        if not lstat_exists(slot_dir):
+            slot_dir.mkdir(mode=OWNER_DIRECTORY_MODE)
+            fsync_directory(slot_dir.parent)
+            transaction.slot_created = True
+        require_private_directory(slot_dir, f"backup slot {slot}")
+        atomic_write(slot_dir / BACKUP_NAME, transaction.envelope, slot_dir)
+        transaction.slot_committed = True
+    except BaseException:
+        rollback_backup_transaction(transaction)
+        raise
+
+
+def cleanup_backup_transaction(transaction: BackupTransaction) -> None:
+    transaction.envelope = None
+    transaction.previous_envelope = None
+
+
+def rollback_backup_transaction(transaction: BackupTransaction) -> None:
+    pool = transaction.pool
+    slot = transaction.slot
+    slot_dir = transaction.slot_dir
+    if slot_dir is not None and (transaction.slot_committed or transaction.slot_created):
+        if slot_dir is None:
+            fail("backup transaction is invalid")
+        previous = transaction.previous_envelope or FileSnapshot(exists=False)
+        if previous.exists:
+            if previous.data is None or previous.mode is None:
+                fail("backup transaction snapshot is invalid")
+            require_private_directory(slot_dir, f"backup slot {slot}")
+            atomic_write(slot_dir / BACKUP_NAME, previous.data, slot_dir, mode=previous.mode)
+        elif lstat_exists(slot_dir):
+            safe_rmtree_private_directory(slot_dir, f"backup slot {slot}")
+        transaction.slot_committed = False
+        transaction.slot_created = False
+    if transaction.pool_created and pool is not None:
+        with contextlib.suppress(OSError):
+            rmdir_path(pool)
+
+
+def create_backup(target: Path, stamp: dict[str, Any]) -> int:
+    transaction = begin_backup_transaction(target, stamp)
+    try:
+        commit_backup_transaction(transaction)
+        validate_backup_transaction_postcondition(target, transaction)
+        cleanup_backup_transaction(transaction)
+    except BaseException:
+        rollback_backup_transaction(transaction)
+        raise
+    if transaction.slot is None:
+        fail("backup transaction did not choose a slot")
+    return transaction.slot
 
 
 def require_backup_string(value: Any, label: str) -> str:
@@ -2902,8 +3285,19 @@ def validate_backup_envelope_scalars(
         fail("backup files are invalid")
 
 
-def build_backup_restore_plan(
-    target: Path, slot: int, envelope: dict[str, Any]
+def validate_backup_slot_entries(slot_dir: Path, slot: int) -> None:
+    require_private_directory(slot_dir, f"backup slot {slot}")
+    names = sorted(path.name for path in slot_dir.iterdir())
+    if names != [BACKUP_NAME]:
+        fail("backup slot contains entries outside the envelope")
+
+
+def validate_backup_payload(
+    target: Path,
+    slot: int,
+    envelope: dict[str, Any],
+    *,
+    require_current_software: bool,
 ) -> BackupRestorePlan:
     validate_backup_envelope_scalars(target, slot, envelope)
     files = envelope["files"]
@@ -2932,13 +3326,36 @@ def build_backup_restore_plan(
         digest = managed_digest_for_bytes(relative, decoded[relative], legacy=legacy)
         if digest != expected:
             fail("backup payload digest does not match the backup stamp")
-    try:
-        current_software = current_software_metadata(target)
-    except JunieCliSetupError as exc:
-        fail(f"backup target software is not restorable: {exc}")
-    if current_software != stamp["software"]:
-        fail("backup software does not match current target runtime")
+    if require_current_software:
+        try:
+            current_software = current_software_metadata(target)
+        except JunieCliSetupError as exc:
+            fail(f"backup target software is not restorable: {exc}")
+        if current_software != stamp["software"]:
+            fail("backup software does not match current target runtime")
     return BackupRestorePlan(files=decoded, stamp=stamp, relatives=expected_relatives)
+
+
+def build_backup_restore_plan(
+    target: Path, slot: int, envelope: dict[str, Any]
+) -> BackupRestorePlan:
+    return validate_backup_payload(target, slot, envelope, require_current_software=True)
+
+
+def validate_backup_transaction_postcondition(target: Path, transaction: BackupTransaction) -> None:
+    if transaction.slot is None:
+        return
+    if transaction.slot_dir is None:
+        fail("backup transaction is invalid")
+    validate_backup_slot_entries(transaction.slot_dir, transaction.slot)
+    envelope_path = transaction.slot_dir / BACKUP_NAME
+    envelope = read_json_file(envelope_path, max_bytes=METADATA_MAX_BYTES, label=BACKUP_NAME)
+    validate_backup_payload(
+        target,
+        transaction.slot,
+        envelope,
+        require_current_software=False,
+    )
 
 
 def validate_restored_backup_state(target: Path, expected_stamp: dict[str, Any]) -> dict[str, Any]:
@@ -2951,15 +3368,21 @@ def validate_restored_backup_state(target: Path, expected_stamp: dict[str, Any])
     return restored_stamp
 
 
-def validate_snapshot_restored(target: Path, snapshot: dict[str, bytes | None]) -> None:
+def validate_snapshot_restored(target: Path, snapshot: dict[str, FileSnapshot]) -> None:
     for relative, expected in snapshot.items():
-        current = read_existing_file(
-            safe_target_path(target, relative),
-            max_bytes=MANAGED_MAX_BYTES,
-            label=relative,
-        )
-        if current != expected:
-            fail("restore rollback did not restore the previous target state")
+        path = safe_target_path(target, relative)
+        info = require_existing_managed_file(path, relative, max_bytes=MANAGED_MAX_BYTES)
+        if not expected.exists:
+            if info is not None:
+                fail("restore rollback did not restore file absence")
+            continue
+        if info is None or expected.data is None or expected.mode is None:
+            fail("restore rollback did not restore file presence")
+        if stat.S_IMODE(info.st_mode) != expected.mode:
+            fail("restore rollback did not restore file mode")
+        current = read_existing_file(path, max_bytes=MANAGED_MAX_BYTES, label=relative)
+        if current != expected.data:
+            fail("restore rollback did not restore file bytes")
 
 
 def build_stamp(
@@ -2982,6 +3405,44 @@ def build_stamp(
         "managed_files": managed,
         "software": software,
     }
+
+
+def setup_result_payload(
+    target: Path,
+    setup_id: str,
+    profile_id: str,
+    changed: list[str],
+    backup_slot: int | None,
+    software_changed: bool,
+    software: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "setup_id": setup_id,
+        "profile_id": profile_id,
+        "changed": changed,
+        "backup_slot": backup_slot,
+        "software_changed": software_changed,
+        "software": {
+            "state": "installed",
+            "version": software["version"],
+            "platform": software["platform"],
+        },
+        "target": str(validate_target(target, create=False)),
+    }
+
+
+def validate_desired_setup_postcondition(
+    target: Path,
+    desired_stamp: dict[str, Any],
+    backup_tx: BackupTransaction,
+) -> None:
+    current = read_stamp(target)
+    if current != desired_stamp:
+        fail("setup postcondition did not publish the desired stamp")
+    drift = drift_for_stamp(target, desired_stamp)
+    if drift:
+        fail(f"setup postcondition detected drift: {', '.join(drift)}")
+    validate_backup_transaction_postcondition(target, backup_tx)
 
 
 def assert_no_unmanaged_conflicts(target: Path, relatives: list[str]) -> None:
@@ -3043,67 +3504,88 @@ def write_setup_locked(
     current = read_stamp(target)
     if require_existing and current is None:
         fail("operation requires an already managed target")
+    current_drift: list[str] = []
     if current is not None:
         if current["schema_version"] != STAMP_SCHEMA and not allow_legacy_migration:
             fail("legacy managed target must be migrated before this operation")
         if allow_legacy_migration:
             validate_legacy_migration_clean(target, current)
-        drift = drift_for_stamp(target, current)
-        if drift and not (repair_software and drift == ["software"]):
-            fail(f"managed target has drift: {', '.join(drift)}")
+        current_drift = drift_for_stamp(target, current)
+        if current_drift and not (repair_software and current_drift == ["software"]):
+            fail(f"managed target has drift: {', '.join(current_drift)}")
     files = desired_files(target, setup, profile)
     previous_relatives = [] if current is None else stamp_managed_relatives(current)
     transaction_relatives = unique_relatives([*previous_relatives, *files])
     if current is None:
         assert_no_unmanaged_conflicts(target, transaction_relatives)
-    changed = [
-        relative
-        for relative, data in files.items()
-        if current_managed_digest(target, relative) != managed_digest_for_bytes(relative, data)
-    ]
+    changed = planned_changed_relatives(target, current, files)
+    if (
+        current is not None
+        and not allow_legacy_migration
+        and current["schema_version"] == STAMP_SCHEMA
+        and current["setup_id"] == setup["id"]
+        and current.get("profile_id") == profile["id"]
+        and not changed
+        and not current_drift
+    ):
+        software = current.get("software")
+        if not isinstance(software, dict):
+            fail("stamp software is invalid")
+        return setup_result_payload(
+            target,
+            setup["id"],
+            profile["id"],
+            changed,
+            None,
+            False,
+            software,
+        )
     backup_slot = None
+    backup_tx = BackupTransaction()
     if current is not None and (
         current["schema_version"] != STAMP_SCHEMA
         or current["setup_id"] != setup["id"]
         or current.get("profile_id") != profile["id"]
     ):
-        backup_slot = create_backup(target, current)
-    snapshot = capture_transaction_snapshot(
-        target, target_existed=target_existed, relatives=transaction_relatives
-    )
+        backup_tx = begin_backup_transaction(target, current)
+        backup_slot = backup_tx.slot
+    snapshot: TransactionSnapshot | None = None
     software_tx: SoftwareTransaction | None = None
     try:
+        snapshot = capture_transaction_snapshot(
+            target, target_existed=target_existed, relatives=transaction_relatives
+        )
         software_tx = begin_software_transaction(target, repair=repair_software)
         for relative, data in files.items():
             atomic_write(safe_target_path(target, relative), data, target)
         for relative in previous_relatives:
             if relative not in files:
-                with contextlib.suppress(FileNotFoundError):
-                    safe_target_path(target, relative).unlink()
+                unlink_path_if_exists(safe_target_path(target, relative))
         prune_empty_managed_dirs(target, transaction_relatives)
         desired_stamp = build_stamp(target, setup["id"], profile["id"], files, software_tx.metadata)
         atomic_write(stamp_path(target), canonical_json(desired_stamp), target)
+        commit_backup_transaction(backup_tx)
+        validate_desired_setup_postcondition(target, desired_stamp, backup_tx)
+        commit_software_transaction(software_tx)
+        cleanup_backup_transaction(backup_tx)
     except BaseException:
+        rollback_backup_transaction(backup_tx)
         if software_tx is not None:
             rollback_software_transaction(target, software_tx)
         else:
             prune_empty_runtime_dirs(target)
-        restore_transaction_snapshot(target, snapshot)
+        if snapshot is not None:
+            restore_transaction_snapshot(target, snapshot)
         raise
-    commit_software_transaction(software_tx)
-    return {
-        "setup_id": setup["id"],
-        "profile_id": profile["id"],
-        "changed": changed,
-        "backup_slot": backup_slot,
-        "software_changed": software_tx.changed,
-        "software": {
-            "state": "installed",
-            "version": software_tx.metadata["version"],
-            "platform": software_tx.metadata["platform"],
-        },
-        "target": str(validate_target(target, create=False)),
-    }
+    return setup_result_payload(
+        target,
+        setup["id"],
+        profile["id"],
+        changed,
+        backup_slot,
+        software_tx.changed,
+        software_tx.metadata,
+    )
 
 
 def write_setup(
@@ -3198,7 +3680,7 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
     with target_lock(target, create_parent=True) as directory_transaction:
         target = validate_target(target, create=True, transaction=directory_transaction)
         require_private_directory(backup_pool(target), "backup pool")
-        require_private_directory(backup_pool(target) / str(slot), f"backup slot {slot}")
+        validate_backup_slot_entries(backup_pool(target) / str(slot), slot)
         envelope_path = backup_pool(target) / str(slot) / BACKUP_NAME
         envelope = read_json_file(envelope_path, max_bytes=METADATA_MAX_BYTES, label=BACKUP_NAME)
         plan = build_backup_restore_plan(target, slot, envelope)
@@ -3209,8 +3691,7 @@ def restore_backup(target: Path, slot: int) -> dict[str, Any]:
         try:
             for relative in current_relatives:
                 if relative not in plan.files:
-                    with contextlib.suppress(FileNotFoundError):
-                        safe_target_path(target, relative).unlink()
+                    unlink_path_if_exists(safe_target_path(target, relative))
             for relative in plan.relatives:
                 atomic_write(safe_target_path(target, relative), plan.files[relative], target)
             prune_empty_managed_dirs(target, restore_relatives)
@@ -3268,10 +3749,8 @@ def remove_setup(target: Path) -> dict[str, Any]:
                 elif legacy and relative in MERGED_MARKER_PATHS:
                     remove_managed_block_from_target(target, relative)
                 else:
-                    with contextlib.suppress(FileNotFoundError):
-                        safe_target_path(target, relative).unlink()
-            with contextlib.suppress(FileNotFoundError):
-                stamp_path(target).unlink()
+                    unlink_path_if_exists(safe_target_path(target, relative))
+            unlink_path_if_exists(stamp_path(target))
             prune_empty_managed_dirs(target, managed_relatives)
         except BaseException:
             if runtime_tx is not None:
@@ -3300,7 +3779,7 @@ def remove_managed_json_keys(target: Path, relative: str) -> None:
     if value:
         atomic_write(path, canonical_json(value), target)
     else:
-        path.unlink()
+        unlink_path(path)
 
 
 def remove_managed_block_from_target(target: Path, relative: str) -> None:
@@ -3316,7 +3795,7 @@ def remove_managed_block_from_target(target: Path, relative: str) -> None:
     if updated.strip():
         atomic_write(path, updated.encode("utf-8"), target)
     else:
-        path.unlink()
+        unlink_path(path)
 
 
 def prune_empty_managed_dirs(target: Path, relatives: list[str] | None = None) -> None:
@@ -3329,13 +3808,15 @@ def prune_empty_managed_dirs(target: Path, relatives: list[str] | None = None) -
     directories = sorted(candidates, key=lambda item: len(item.parts), reverse=True)
     for directory in directories:
         with contextlib.suppress(OSError):
-            directory.rmdir()
+            rmdir_path(directory)
 
 
 def plan_payload_locked(
     target: Path, setup: dict[str, Any], profile: dict[str, Any]
 ) -> dict[str, Any]:
     status = status_payload(target)
+    current = read_stamp(target) if status["managed"] else None
+    files = desired_files(target, setup, profile)
     operation = "install"
     backup_required = False
     if status["managed"]:
@@ -3357,6 +3838,7 @@ def plan_payload_locked(
         "legacy_setup_id": status["legacy_setup_id"],
         "drift": status["drift"],
         "backup_required": backup_required,
+        "changed": planned_changed_relatives(target, current, files),
         "software": status["software"],
         "mutates": False,
     }
