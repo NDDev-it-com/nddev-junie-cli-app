@@ -117,7 +117,38 @@
     "tested_release": "2383.10",
     "marketing_version": "26.7.20",
     "exact_artifact_hashes_available": true,
-    "supported_platforms": ["linux-aarch64", "linux-amd64", "macos-aarch64", "macos-amd64"]
+    "supported_platforms": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "official_artifact_platforms": [
+      "linux-aarch64",
+      "linux-amd64",
+      "macos-aarch64",
+      "macos-amd64"
+    ],
+    "artifact_platform_map": {
+      "macos-arm64": "macos-aarch64",
+      "macos-x64": "macos-amd64",
+      "ubuntu-glibc-arm64": "linux-aarch64",
+      "ubuntu-glibc-x64": "linux-amd64"
+    },
+    "ubuntu_support": {
+      "distribution_detection": "platform.freedesktop_os_release ID=ubuntu",
+      "desktop_server_model": "Ubuntu Desktop and Server share ID=ubuntu plus glibc host detection.",
+      "ubuntu_release_floor": null,
+      "glibc_version_floor": null,
+      "official_floor": "no-official-floor",
+      "binary_abi": "glibc"
+    },
+    "unsupported_platforms": {
+      "windows": "unsupported",
+      "non-ubuntu-linux": "Rejected before network, staging, or runtime mutation even when an official linux-* artifact exists.",
+      "linux-musl": "unsupported because the official Junie linux-* artifact is treated as glibc-bound",
+      "unsupported-architecture": "Only arm64/aarch64 and x64/amd64 are supported."
+    }
   },
   "runtime_launch": {
     "command": "junie",

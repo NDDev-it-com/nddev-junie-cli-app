@@ -38,6 +38,18 @@ SETUP_ORDER = ("nddev-builder",)
 DEFAULT_PROFILE_ID = "full-auto"
 PROFILE_ORDER = ("safe", "full-auto")
 LEGACY_SETUP_IDS = ("safe", "full-auto", "balanced")
+SUPPORTED_PUBLIC_PLATFORMS = (
+    "macos-arm64",
+    "macos-x64",
+    "ubuntu-glibc-arm64",
+    "ubuntu-glibc-x64",
+)
+OFFICIAL_ARTIFACT_PLATFORM_BY_HOST = {
+    "macos-arm64": "macos-aarch64",
+    "macos-x64": "macos-amd64",
+    "ubuntu-glibc-arm64": "linux-aarch64",
+    "ubuntu-glibc-x64": "linux-amd64",
+}
 STAMP_NAME = "NDDEV-JUNIE-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-JUNIE-CLI-BACKUP.json"
 STAMP_SCHEMA = 3
@@ -333,9 +345,7 @@ def snapshot_live_junie_home() -> LiveJunieHomeSnapshot:
     )
 
 
-def require_live_junie_home_unchanged(
-    before: LiveJunieHomeSnapshot, *, context: str
-) -> None:
+def require_live_junie_home_unchanged(before: LiveJunieHomeSnapshot, *, context: str) -> None:
     after = snapshot_live_junie_home()
     if after != before:
         fail(f"{context} changed the live account Junie home; target isolation failed")
@@ -407,22 +417,71 @@ def update_info_source(baseline: dict[str, Any]) -> str:
     return baseline["release"]["update_info"]
 
 
-def current_platform_id() -> str:
-    system = platform.system()
-    machine = platform.machine().lower()
+def linux_os_release(os_release: dict[str, str] | None = None) -> dict[str, str]:
+    if os_release is not None:
+        return {str(key): str(value) for key, value in os_release.items()}
+    reader = getattr(platform, "freedesktop_os_release", None)
+    if reader is None:
+        fail("Linux distribution detection requires freedesktop_os_release metadata")
+    try:
+        return {str(key): str(value) for key, value in reader().items()}
+    except OSError as exc:
+        fail(f"cannot read Linux distribution metadata: {exc}")
+
+
+def require_glibc_linux(libc: tuple[str, str] | None = None) -> None:
+    detected = platform.libc_ver() if libc is None else libc
+    libc_name = (detected[0] if detected else "").lower()
+    if libc_name != "glibc":
+        fail("unsupported Linux C library: official Junie linux-* artifacts require glibc")
+
+
+def current_host_id(
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+    os_release: dict[str, str] | None = None,
+    libc: tuple[str, str] | None = None,
+) -> str:
+    system = platform.system() if system is None else system
+    machine = (platform.machine() if machine is None else machine).lower()
     if system == "Linux":
-        os_name = "linux"
+        release = linux_os_release(os_release)
+        distribution = release.get("ID", "").strip().lower()
+        if distribution != "ubuntu":
+            fail(
+                "unsupported Linux distribution: "
+                f"{distribution or 'unknown'}; supported Linux scope is Ubuntu Desktop/Server"
+            )
+        require_glibc_linux(libc)
+        os_name = "ubuntu-glibc"
     elif system == "Darwin":
         os_name = "macos"
     else:
         fail(f"unsupported OS: {system}")
     if machine in ("x86_64", "amd64"):
-        arch = "amd64"
+        arch = "x64"
     elif machine in ("aarch64", "arm64"):
-        arch = "aarch64"
+        arch = "arm64"
     else:
         fail(f"unsupported architecture: {machine}")
     return f"{os_name}-{arch}"
+
+
+def current_platform_id(
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+    os_release: dict[str, str] | None = None,
+    libc: tuple[str, str] | None = None,
+) -> str:
+    host_id = current_host_id(
+        system=system,
+        machine=machine,
+        os_release=os_release,
+        libc=libc,
+    )
+    return OFFICIAL_ARTIFACT_PLATFORM_BY_HOST[host_id]
 
 
 def parse_update_info(data: bytes) -> list[dict[str, Any]]:
@@ -445,8 +504,9 @@ def parse_update_info(data: bytes) -> list[dict[str, Any]]:
 
 
 def artifact_metadata_from_update_info(
-    baseline: dict[str, Any], update_info_url: str
+    baseline: dict[str, Any], update_info_url: str, platform_id: str | None = None
 ) -> dict[str, Any]:
+    platform_id = current_platform_id() if platform_id is None else platform_id
     data = read_url_bounded(
         update_info_url, max_bytes=UPDATE_INFO_MAX_BYTES, label="update-info.jsonl"
     )
@@ -457,16 +517,16 @@ def artifact_metadata_from_update_info(
     missing = sorted(set(expected) - set(matches))
     if missing:
         fail(f"update-info is missing Junie {version} artifacts: {', '.join(missing)}")
-    for platform_id, artifact in expected.items():
-        row = matches[platform_id]
+    for expected_platform_id, artifact in expected.items():
+        row = matches[expected_platform_id]
         common_expected = {
             "marketing": baseline["release"]["marketing_version"],
             "version": version,
-            "platform": platform_id,
+            "platform": expected_platform_id,
         }
         for key, expected_value in common_expected.items():
             if row.get(key) != expected_value:
-                fail(f"update-info {platform_id} {key} does not match the baseline")
+                fail(f"update-info {expected_platform_id} {key} does not match the baseline")
         exact_expected = {
             "downloadUrl": artifact["download_url"],
             "sha256": artifact["sha256"],
@@ -474,8 +534,7 @@ def artifact_metadata_from_update_info(
         }
         for key, expected_value in exact_expected.items():
             if row.get(key) != expected_value:
-                fail(f"update-info {platform_id} {key} does not match the baseline")
-    platform_id = current_platform_id()
+                fail(f"update-info {expected_platform_id} {key} does not match the baseline")
     if platform_id not in expected:
         fail(f"Junie {version} artifact is not pinned for {platform_id}")
     selected_row = matches[platform_id]
@@ -1494,7 +1553,7 @@ def render_config(target: Path, setup: dict[str, Any], profile: dict[str, Any]) 
                             "command": hook_command,
                             "timeout": 5,
                         }
-                    ]
+                    ],
                 }
             ]
         },
@@ -1582,18 +1641,10 @@ def desired_files(target: Path, setup: dict[str, Any], profile: dict[str, Any]) 
     files[f"{package}/.junie-extension/marketplace.json"] = render_extension_manifest()
     files[f"{package}/extensions/nddev-builder/extension.json"] = render_extension_json()
     files[f"{package}/extensions/nddev-builder/guidelines/AGENTS.md"] = files["AGENTS.md"]
-    files[f"{package}/extensions/nddev-builder/mcp/.mcp.json"] = canonical_json(
-        {"mcpServers": {}}
-    )
-    copy_builder_projection(
-        files, "skills", f"{package}/extensions/nddev-builder/skills"
-    )
-    copy_builder_projection(
-        files, "agents", f"{package}/extensions/nddev-builder/agents"
-    )
-    copy_builder_projection(
-        files, "commands", f"{package}/extensions/nddev-builder/commands"
-    )
+    files[f"{package}/extensions/nddev-builder/mcp/.mcp.json"] = canonical_json({"mcpServers": {}})
+    copy_builder_projection(files, "skills", f"{package}/extensions/nddev-builder/skills")
+    copy_builder_projection(files, "agents", f"{package}/extensions/nddev-builder/agents")
+    copy_builder_projection(files, "commands", f"{package}/extensions/nddev-builder/commands")
     return files
 
 
@@ -1605,9 +1656,7 @@ def managed_digest_for_bytes(relative: str, data: bytes, *, legacy: bool = False
         return sha256_bytes(block.encode("utf-8"))
     if legacy and relative in LEGACY_MANAGED_JSON_KEYS:
         value = parse_optional_json(data, relative)
-        subset = {
-            key: value.get(key) for key in LEGACY_MANAGED_JSON_KEYS[relative] if key in value
-        }
+        subset = {key: value.get(key) for key in LEGACY_MANAGED_JSON_KEYS[relative] if key in value}
         return sha256_bytes(canonical_json(subset))
     return sha256_bytes(data)
 
@@ -2041,8 +2090,9 @@ def read_runtime_receipt(target: Path, baseline: dict[str, Any]) -> dict[str, An
         runtime_fail(
             "runtime receipt artifact is invalid", code="runtime_receipt_artifact", repairable=True
         )
-    expected_artifact = dict(baseline["release"]["exact_artifacts"][current_platform_id()])
-    expected_artifact["platform"] = current_platform_id()
+    platform_id = current_platform_id()
+    expected_artifact = dict(baseline["release"]["exact_artifacts"][platform_id])
+    expected_artifact["platform"] = platform_id
     if artifact != expected_artifact:
         runtime_fail(
             "runtime receipt artifact does not match the baseline",
@@ -2320,6 +2370,7 @@ def build_runtime_receipt(
 
 
 def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str, Any]:
+    platform_id = current_platform_id()
     installer_url, expected_installer_sha256 = installer_source(baseline)
     update_info_url = update_info_source(baseline)
     installer_bytes = read_url_bounded(
@@ -2328,7 +2379,7 @@ def install_software_to_stage(stage: Path, baseline: dict[str, Any]) -> dict[str
     actual_installer_sha256 = sha256_bytes(installer_bytes)
     if actual_installer_sha256 != expected_installer_sha256:
         fail("Junie installer SHA256 does not match the pinned baseline")
-    artifact = artifact_metadata_from_update_info(baseline, update_info_url)
+    artifact = artifact_metadata_from_update_info(baseline, update_info_url, platform_id)
     artifact_verification = verify_artifact_binding(artifact)
     stage_home = stage / "home"
     stage_tmp = stage / "tmp"
@@ -2386,6 +2437,7 @@ def begin_software_transaction(target: Path, *, repair: bool) -> SoftwareTransac
         if not repair:
             fail("Junie software runtime is partial; run update to repair it")
     baseline = load_baseline()
+    current_platform_id()
     root = runtime_root(target)
     require_runtime_directory(target, target, "target")
     root_info = stat_existing(root, "runtime root")
@@ -2841,9 +2893,7 @@ def validate_backup_envelope_scalars(
     if envelope.get("canonical_target") != str(validate_target(target, create=False)):
         fail("backup is bound to a different canonical target")
     require_backup_string(envelope.get("source_setup_id"), "backup source_setup_id")
-    require_backup_optional_string(
-        envelope.get("source_profile_id"), "backup source_profile_id"
-    )
+    require_backup_optional_string(envelope.get("source_profile_id"), "backup source_profile_id")
     require_backup_optional_string(
         envelope.get("source_legacy_setup_id"), "backup source_legacy_setup_id"
     )
@@ -2852,7 +2902,9 @@ def validate_backup_envelope_scalars(
         fail("backup files are invalid")
 
 
-def build_backup_restore_plan(target: Path, slot: int, envelope: dict[str, Any]) -> BackupRestorePlan:
+def build_backup_restore_plan(
+    target: Path, slot: int, envelope: dict[str, Any]
+) -> BackupRestorePlan:
     validate_backup_envelope_scalars(target, slot, envelope)
     files = envelope["files"]
     decoded: dict[str, bytes] = {}
@@ -3062,6 +3114,7 @@ def write_setup(
     require_existing: bool = False,
     repair_software: bool = False,
 ) -> dict[str, Any]:
+    current_platform_id()
     with target_lock(target, create_parent=True) as directory_transaction:
         return write_setup_locked(
             target,
@@ -3074,6 +3127,7 @@ def write_setup(
 
 
 def update_setup(target: Path, setup_id: str | None, profile_id: str | None) -> dict[str, Any]:
+    current_platform_id()
     with target_lock(target, create_parent=False) as directory_transaction:
         target = validate_target(target, create=False)
         if not lstat_exists(target):
@@ -3096,6 +3150,7 @@ def update_setup(target: Path, setup_id: str | None, profile_id: str | None) -> 
 
 
 def migrate_setup(target: Path, setup_id: str | None, profile_id: str | None) -> dict[str, Any]:
+    current_platform_id()
     with target_lock(target, create_parent=False) as directory_transaction:
         target = validate_target(target, create=False)
         if not lstat_exists(target):
@@ -3119,7 +3174,9 @@ def migrate_setup(target: Path, setup_id: str | None, profile_id: str | None) ->
             fail("migrate supports only --setup nddev-builder")
         selected_profile = profile_id or stamp_profile_id(current)
         if selected_profile is None:
-            fail("legacy setup has no safe profile mapping; pass --profile safe or --profile full-auto")
+            fail(
+                "legacy setup has no safe profile mapping; pass --profile safe or --profile full-auto"
+            )
         profile = load_profile(selected_profile)
         result = write_setup_locked(
             target,
@@ -3275,7 +3332,9 @@ def prune_empty_managed_dirs(target: Path, relatives: list[str] | None = None) -
             directory.rmdir()
 
 
-def plan_payload_locked(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+def plan_payload_locked(
+    target: Path, setup: dict[str, Any], profile: dict[str, Any]
+) -> dict[str, Any]:
     status = status_payload(target)
     operation = "install"
     backup_required = False
@@ -3451,6 +3510,7 @@ def launch(target: Path, child_args: list[str]) -> int:
     override = child_args_use_target_scope_overrides(child_args)
     if override is not None:
         fail(f"{override} is managed by the target launch environment")
+    current_platform_id()
     with target_lock(target, create_parent=False):
         plan = build_launch_plan_locked(target, child_args)
         live_before = snapshot_live_junie_home()

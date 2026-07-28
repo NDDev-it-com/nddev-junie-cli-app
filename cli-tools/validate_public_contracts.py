@@ -7,8 +7,8 @@ import argparse
 import base64
 import contextlib
 import hashlib
-import io
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -28,7 +28,26 @@ SETUP_ORDER = ["nddev-builder"]
 PROFILE_ORDER = ["safe", "full-auto"]
 DEFAULT_SETUP_ID = "nddev-builder"
 DEFAULT_PROFILE_ID = "full-auto"
-SUPPORTED_PLATFORMS = {"linux-aarch64", "linux-amd64", "macos-aarch64", "macos-amd64"}
+PUBLIC_SUPPORTED_PLATFORM_ORDER = [
+    "macos-arm64",
+    "macos-x64",
+    "ubuntu-glibc-arm64",
+    "ubuntu-glibc-x64",
+]
+PUBLIC_SUPPORTED_PLATFORMS = set(PUBLIC_SUPPORTED_PLATFORM_ORDER)
+OFFICIAL_ARTIFACT_PLATFORM_ORDER = [
+    "linux-aarch64",
+    "linux-amd64",
+    "macos-aarch64",
+    "macos-amd64",
+]
+OFFICIAL_ARTIFACT_PLATFORMS = set(OFFICIAL_ARTIFACT_PLATFORM_ORDER)
+ARTIFACT_PLATFORM_MAP = {
+    "macos-arm64": "macos-aarch64",
+    "macos-x64": "macos-amd64",
+    "ubuntu-glibc-arm64": "linux-aarch64",
+    "ubuntu-glibc-x64": "linux-amd64",
+}
 REQUIRED_WORKFLOWS = {
     "actionlint.yml": ".github/workflows/actionlint.yml",
     "codeql.yml": ".github/workflows/public-codeql.yml",
@@ -120,7 +139,9 @@ def load_version() -> str:
 
 
 def load_manager() -> Any:
-    spec = importlib.util.spec_from_file_location("nddev_junie_cli_public", ROOT / "cli-tools" / "nddev_junie_cli.py")
+    spec = importlib.util.spec_from_file_location(
+        "nddev_junie_cli_public", ROOT / "cli-tools" / "nddev_junie_cli.py"
+    )
     if spec is None or spec.loader is None:
         raise ValueError("cannot load manager module")
     module = importlib.util.module_from_spec(spec)
@@ -195,11 +216,7 @@ def tracked_paths() -> set[str] | None:
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ValueError(f"git tracked path scan failed: {exc}") from exc
     try:
-        return {
-            item.decode("utf-8")
-            for item in completed.stdout.split(b"\0")
-            if item
-        }
+        return {item.decode("utf-8") for item in completed.stdout.split(b"\0") if item}
     except UnicodeDecodeError as exc:
         raise ValueError(f"git tracked path scan returned non-UTF-8 paths: {exc}") from exc
 
@@ -316,8 +333,7 @@ def require_release_path_shape(path: str, label: str) -> None:
             ) from exc
         if stat.S_ISLNK(child_info.st_mode):
             raise ValueError(
-                f"release workflow {label} must not contain symlinks: "
-                f"{child.relative_to(ROOT)}"
+                f"release workflow {label} must not contain symlinks: {child.relative_to(ROOT)}"
             )
 
 
@@ -387,8 +403,7 @@ def validate_release_runtime_subset(archive_paths: list[str], runtime_paths: lis
     missing = sorted(path for path in runtime_paths if not path_covered(path, archive_paths))
     if missing:
         raise ValueError(
-            "release workflow runtime_paths must be covered by archive_paths: "
-            + ", ".join(missing)
+            "release workflow runtime_paths must be covered by archive_paths: " + ", ".join(missing)
         )
 
 
@@ -513,15 +528,63 @@ def validate_required_files() -> None:
             raise ValueError(f"missing required public path {relative}")
 
 
-def validate_baseline(baseline: dict[str, Any], contract: dict[str, Any]) -> None:
+def validate_supported_platform_scope(
+    baseline: dict[str, Any], contract: dict[str, Any], manifest: dict[str, Any]
+) -> None:
+    release = baseline["release"]
+    runtime = contract["runtime_compatibility"]
+    for label, owner in (
+        ("baseline release", release),
+        ("contract runtime_compatibility", runtime),
+        ("manifest", manifest),
+    ):
+        if owner.get("supported_platforms") != PUBLIC_SUPPORTED_PLATFORM_ORDER:
+            raise ValueError(f"{label}: supported platforms must be macOS and Ubuntu only")
+        if owner.get("artifact_platform_map") != ARTIFACT_PLATFORM_MAP:
+            raise ValueError(f"{label}: artifact platform map is not synchronized")
+        unsupported = owner.get("unsupported_platforms")
+        if not isinstance(unsupported, dict):
+            raise ValueError(f"{label}: unsupported platform scope must be documented")
+        for key in ("windows", "non-ubuntu-linux", "linux-musl", "unsupported-architecture"):
+            if key not in unsupported:
+                raise ValueError(f"{label}: unsupported platform scope is missing {key}")
+    if runtime.get("official_artifact_platforms") != OFFICIAL_ARTIFACT_PLATFORM_ORDER:
+        raise ValueError("contract official artifact platforms are not synchronized")
+    if manifest.get("official_artifact_platforms") != OFFICIAL_ARTIFACT_PLATFORM_ORDER:
+        raise ValueError("manifest official artifact platforms are not synchronized")
+    ubuntu_support = release.get("ubuntu_support")
+    if ubuntu_support != runtime.get("ubuntu_support"):
+        raise ValueError("baseline and contract Ubuntu support policy differ")
+    if ubuntu_support != manifest.get("ubuntu_support"):
+        raise ValueError("manifest Ubuntu support policy differs from the contract")
+    if not isinstance(ubuntu_support, dict):
+        raise ValueError("Ubuntu support policy must be an object")
+    if ubuntu_support.get("distribution_detection") != "platform.freedesktop_os_release ID=ubuntu":
+        raise ValueError("Ubuntu distribution detection owner is not documented")
+    if ubuntu_support.get("ubuntu_release_floor") is not None:
+        raise ValueError("Ubuntu release floor must remain null until upstream publishes one")
+    if ubuntu_support.get("glibc_version_floor") is not None:
+        raise ValueError("glibc version floor must remain null until upstream publishes one")
+    if ubuntu_support.get("official_floor") != "no-official-floor":
+        raise ValueError("Ubuntu/glibc floor policy must be no-official-floor")
+    if ubuntu_support.get("binary_abi") != "glibc":
+        raise ValueError("Ubuntu binary ABI policy must be glibc")
+    if any(str(platform_id).startswith("linux-") for platform_id in runtime["supported_platforms"]):
+        raise ValueError("public supported-platform contract must not expose generic Linux")
+    if set(release["exact_artifacts"]) != OFFICIAL_ARTIFACT_PLATFORMS:
+        raise ValueError("baseline must preserve only official macOS/linux artifact keys")
+    if set(release["exact_artifact_hashes"]) != OFFICIAL_ARTIFACT_PLATFORMS:
+        raise ValueError("baseline exact hashes must preserve only official artifact keys")
+
+
+def validate_baseline(
+    baseline: dict[str, Any], contract: dict[str, Any], manifest: dict[str, Any]
+) -> None:
     if baseline["release"]["channel"] != "release":
         raise ValueError("baseline channel must be release")
     if baseline["runtime"]["command"] != "junie":
         raise ValueError("baseline command must be junie")
-    if set(baseline["release"]["exact_artifacts"]) != SUPPORTED_PLATFORMS:
-        raise ValueError("baseline must contain only macOS/Linux artifacts")
-    if set(baseline["release"]["exact_artifact_hashes"]) != SUPPORTED_PLATFORMS:
-        raise ValueError("baseline exact hashes must contain only macOS/Linux artifacts")
+    validate_supported_platform_scope(baseline, contract, manifest)
     for platform_id, artifact in baseline["release"]["exact_artifacts"].items():
         hashes = baseline["release"]["exact_artifact_hashes"][platform_id]
         if artifact["sha256"] != hashes["sha256"] or artifact["size"] != hashes["size"]:
@@ -540,6 +603,87 @@ def validate_baseline(baseline: dict[str, Any], contract: dict[str, Any]) -> Non
         raise ValueError("contract software version differs from baseline")
     if lifecycle["marketing_version"] != baseline["release"]["marketing_version"]:
         raise ValueError("contract marketing version differs from baseline")
+
+
+def expect_platform_failure(manager: Any, label: str, **kwargs: Any) -> None:
+    try:
+        manager.current_platform_id(**kwargs)
+    except manager.JunieCliSetupError:
+        return
+    raise ValueError(f"{label}: unsupported platform was accepted")
+
+
+def validate_platform_detection(manager: Any) -> None:
+    accepted = {
+        "macos arm64": (
+            {"system": "Darwin", "machine": "arm64"},
+            "macos-arm64",
+            "macos-aarch64",
+        ),
+        "macos x64": (
+            {"system": "Darwin", "machine": "x86_64"},
+            "macos-x64",
+            "macos-amd64",
+        ),
+        "ubuntu arm64": (
+            {
+                "system": "Linux",
+                "machine": "aarch64",
+                "os_release": {"ID": "ubuntu", "NAME": "Ubuntu", "VERSION_ID": "24.04"},
+                "libc": ("glibc", "2.39"),
+            },
+            "ubuntu-glibc-arm64",
+            "linux-aarch64",
+        ),
+        "ubuntu x64": (
+            {
+                "system": "Linux",
+                "machine": "x86_64",
+                "os_release": {"ID": "ubuntu", "NAME": "Ubuntu Server", "VERSION_ID": "22.04"},
+                "libc": ("glibc", "2.35"),
+            },
+            "ubuntu-glibc-x64",
+            "linux-amd64",
+        ),
+    }
+    for label, (kwargs, expected_host, expected_platform) in accepted.items():
+        actual_host = manager.current_host_id(**kwargs)
+        if actual_host != expected_host:
+            raise ValueError(f"{label}: detected host {actual_host}, expected {expected_host}")
+        actual_platform = manager.current_platform_id(**kwargs)
+        if actual_platform != expected_platform:
+            raise ValueError(
+                f"{label}: detected artifact platform {actual_platform}, expected {expected_platform}"
+            )
+    for label, kwargs in {
+        "debian x64": {
+            "system": "Linux",
+            "machine": "x86_64",
+            "os_release": {"ID": "debian", "ID_LIKE": "debian"},
+            "libc": ("glibc", "2.36"),
+        },
+        "alpine musl": {
+            "system": "Linux",
+            "machine": "x86_64",
+            "os_release": {"ID": "alpine"},
+            "libc": ("musl", "1.2.5"),
+        },
+        "ubuntu musl": {
+            "system": "Linux",
+            "machine": "x86_64",
+            "os_release": {"ID": "ubuntu", "VERSION_ID": "24.04"},
+            "libc": ("musl", "1.2.5"),
+        },
+        "unknown linux": {
+            "system": "Linux",
+            "machine": "x86_64",
+            "os_release": {},
+            "libc": ("glibc", "2.39"),
+        },
+        "windows": {"system": "Windows", "machine": "AMD64"},
+        "unsupported arch": {"system": "Darwin", "machine": "armv7l"},
+    }.items():
+        expect_platform_failure(manager, label, **kwargs)
 
 
 def validate_generated_files(manager: Any, version: str) -> None:
@@ -575,16 +719,19 @@ def validate_generated_files(manager: Any, version: str) -> None:
     present_forbidden_config_keys = sorted(forbidden_config_keys & set(config))
     if present_forbidden_config_keys:
         raise ValueError(
-            "generated config uses unsupported keys: "
-            + ", ".join(present_forbidden_config_keys)
+            "generated config uses unsupported keys: " + ", ".join(present_forbidden_config_keys)
         )
     if "hooks" not in config:
         raise ValueError("managed config must enable the deterministic builder hook")
-    allowlist = json.loads(files[".nddev-junie-cli-runtime/home/.junie/allowlist.json"].decode("utf-8"))
+    allowlist = json.loads(
+        files[".nddev-junie-cli-runtime/home/.junie/allowlist.json"].decode("utf-8")
+    )
     if allowlist.get("defaultBehavior") != "ask":
         raise ValueError("managed allowlist must remain ask-first")
     marketplace = json.loads(
-        files["extensions/nddev-builder-marketplace/.junie-extension/marketplace.json"].decode("utf-8")
+        files["extensions/nddev-builder-marketplace/.junie-extension/marketplace.json"].decode(
+            "utf-8"
+        )
     )
     if marketplace.get("metadata", {}).get("version") != version:
         raise ValueError("extension marketplace metadata version differs from VERSION")
@@ -794,8 +941,8 @@ def validate_production_source() -> None:
         "INSTALLER_SHA256",
         "UPDATE_INFO_URL",
         "VERIFY_ARTIFACT_SHA256",
-        "INSTALL_TIMEOUT_SECONDS\"",
-        "PROBE_TIMEOUT_SECONDS\"",
+        'INSTALL_TIMEOUT_SECONDS"',
+        'PROBE_TIMEOUT_SECONDS"',
         "test_override_enabled",
         "env_timeout_seconds",
         "fixture override",
@@ -808,12 +955,11 @@ def validate_production_source() -> None:
     present = sorted(literal for literal in forbidden_literals if literal in source)
     if present:
         raise ValueError(
-            "production manager exposes test/source/timeout switch literals: "
-            + ", ".join(present)
+            "production manager exposes test/source/timeout switch literals: " + ", ".join(present)
         )
-    if "os.environ.get(\"NDDEV_" in source or "os.environ['NDDEV_" in source:
+    if 'os.environ.get("NDDEV_' in source or "os.environ['NDDEV_" in source:
         raise ValueError("production manager must not read NDDEV_* environment overrides")
-    if "tempfile.gettempdir" in source or "os.environ.get(\"TMPDIR\"" in source:
+    if "tempfile.gettempdir" in source or 'os.environ.get("TMPDIR"' in source:
         raise ValueError("bootstrap lock must not derive from ambient temp environment")
     allowed_child_env = {
         'env["NDDEV_JUNIE_EXPECTED_ARTIFACT_SHA256"] = artifact["sha256"]',
@@ -931,9 +1077,7 @@ def validate_bootstrap_lock_persistent_handover(manager: Any) -> None:
                     info = lock_path.stat()
                     os.write(
                         ready_write,
-                        json.dumps({"inode": info.st_ino, "device": info.st_dev}).encode(
-                            "utf-8"
-                        ),
+                        json.dumps({"inode": info.st_ino, "device": info.st_dev}).encode("utf-8"),
                     )
                 except Exception as exc:
                     child_write_and_exit(ready_write, f"ERROR {label}: {exc}", 1)
@@ -992,7 +1136,10 @@ def validate_bootstrap_lock_persistent_handover(manager: Any) -> None:
                 os.close(second_release)
             wait_child_success(second_pid, "second holder")
         final_info = lock_path.stat()
-        if final_info.st_ino != first_identity["inode"] or final_info.st_dev != first_identity["device"]:
+        if (
+            final_info.st_ino != first_identity["inode"]
+            or final_info.st_dev != first_identity["device"]
+        ):
             raise ValueError("bootstrap lock inode changed after all releases")
 
 
@@ -1688,10 +1835,7 @@ def legacy_managed_files(manager: Any, target: Path, setup_id: str) -> dict[str,
         }
     )
     agents = (
-        manager.MANAGED_BEGIN
-        + "\n# Legacy NDDev Junie CLI Setup\n"
-        + manager.MANAGED_END
-        + "\n"
+        manager.MANAGED_BEGIN + "\n# Legacy NDDev Junie CLI Setup\n" + manager.MANAGED_END + "\n"
     ).encode("utf-8")
     return {"config.json": config, "allowlist.json": allowlist, "AGENTS.md": agents}
 
@@ -1975,7 +2119,10 @@ def main(argv: list[str] | None = None) -> int:
     if "launch_lock" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe launch lock scope")
     launch_lock_text = manifest.get("runtime_isolation", {}).get("launch_lock", "")
-    if "external bootstrap" not in launch_lock_text or "persistent target-internal" not in launch_lock_text:
+    if (
+        "external bootstrap" not in launch_lock_text
+        or "persistent target-internal" not in launch_lock_text
+    ):
         raise ValueError("manifest launch lock must describe persistent dual locking")
     if "pre_child_artifact_revalidation" not in manifest.get("runtime_isolation", {}):
         raise ValueError("manifest runtime_isolation must describe artifact revalidation")
@@ -1987,10 +2134,11 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("manifest runtime_isolation must describe same-UID boundary")
     if build.get("junie_cli_tested") != baseline["release"]["stable_version"]:
         raise ValueError("tested Junie CLI version differs from baseline release")
-    validate_baseline(baseline, contract)
+    validate_baseline(baseline, contract, manifest)
     validate_required_files()
     validate_claude_import_bridge()
     manager = load_manager()
+    validate_platform_detection(manager)
     validate_production_source()
     with injected_bootstrap_lock_root(manager):
         validate_generated_files(manager, version)

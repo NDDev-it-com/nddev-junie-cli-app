@@ -12,6 +12,32 @@
     "marketing_version": "26.7.20",
     "eap_status_note": "Official headless documentation states Junie CLI is currently EAP; NDDev pins the release channel artifact listed in update-info.jsonl.",
     "exact_version": "2383.10",
+    "supported_platforms": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "artifact_platform_map": {
+      "macos-arm64": "macos-aarch64",
+      "macos-x64": "macos-amd64",
+      "ubuntu-glibc-arm64": "linux-aarch64",
+      "ubuntu-glibc-x64": "linux-amd64"
+    },
+    "ubuntu_support": {
+      "distribution_detection": "platform.freedesktop_os_release ID=ubuntu",
+      "desktop_server_model": "Ubuntu Desktop and Server share ID=ubuntu plus glibc host detection.",
+      "ubuntu_release_floor": null,
+      "glibc_version_floor": null,
+      "official_floor": "no-official-floor",
+      "binary_abi": "glibc"
+    },
+    "unsupported_platforms": {
+      "windows": "unsupported",
+      "non-ubuntu-linux": "unsupported before network, staging, or runtime mutation",
+      "linux-musl": "unsupported",
+      "unsupported-architecture": "unsupported"
+    },
     "installer": {
       "url": "https://junie.jetbrains.com/install.sh",
       "sha256": "a37b9ce2d7bdacdcccd59afd6b8a84d96d2349a5ab6a3707c83f5b731af294bd"

@@ -50,6 +50,22 @@ managed paths, installer probe details, lock implementation, launch handoff,
 scope flags, environment bindings, and same-user tamper boundary are defined by
 the code-owned sources above.
 
+## Supported Platforms
+
+NDDev supports Junie CLI on `macos-arm64`, `macos-x64`,
+`ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. Official JetBrains artifact keys
+and URLs remain named `macos-*` and `linux-*`; the public support contract maps
+those official keys to NDDev product host ids in `config/nddev-contract.json`
+and `references/junie-cli-baseline.json`.
+
+Linux distribution detection uses structured OS metadata and accepts Ubuntu
+Desktop or Server through the same `ID=ubuntu` plus glibc host check. JetBrains
+does not publish an Ubuntu release or glibc version floor for the pinned
+`linux-*` artifacts, so the contract stores that floor as `null` and
+`no-official-floor`. `non-ubuntu-linux`, `linux-musl`, `windows`, and
+`unsupported-architecture` hosts fail closed before installer network access,
+staging, or runtime mutation.
+
 ## Setups
 
 `nddev-builder` is the only active content setup. `full-auto` is the default
