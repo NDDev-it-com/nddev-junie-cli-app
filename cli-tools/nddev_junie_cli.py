@@ -213,6 +213,10 @@ class SoftwareTransaction:
 class RuntimeRemoveTransaction:
     changed: bool
     removed_root: Path | None = None
+    removed_container: Path | None = None
+    moved_entries: list[tuple[str, Path]] | None = None
+    previous_directories: dict[str, DirectorySnapshot] | None = None
+    target_directory: DirectorySnapshot | None = None
 
 
 @dataclass
@@ -1384,12 +1388,20 @@ def runtime_receipt_path(target: Path) -> Path:
 
 
 @contextlib.contextmanager
-def target_lock(target: Path, *, create_parent: bool = False, allow_missing: bool = False):
+def target_lock(
+    target: Path,
+    *,
+    create_parent: bool = False,
+    allow_missing: bool = False,
+    cleanup_created_artifacts_on_release: bool = False,
+):
     transaction = DirectoryTransaction([])
     lexical_handle = acquire_lexical_bootstrap_lock(target)
     bootstrap_handle: BootstrapLockHandle | None = None
     lock_handle: TargetLockHandle | None = None
     canonical: Path | None = None
+    creation_anchor: Path | None = None
+    creation_anchor_before: DirectorySnapshot | None = None
     target_directory_before_lock: DirectorySnapshot | None = None
     lock_directory_before_lock: DirectorySnapshot | None = None
     failed = False
@@ -1397,6 +1409,10 @@ def target_lock(target: Path, *, create_parent: bool = False, allow_missing: boo
         canonical_identity = validate_target_identity_for_lock(target)
         bootstrap_handle = acquire_bootstrap_lock(canonical_identity)
         if create_parent:
+            creation_anchor, creation_anchor_before = nearest_existing_directory_snapshot(
+                canonical_identity.parent,
+                "target creation parent",
+            )
             canonical = validate_target(target, create=True, transaction=transaction)
         else:
             canonical = validate_target(target, create=False)
@@ -1422,13 +1438,15 @@ def target_lock(target: Path, *, create_parent: bool = False, allow_missing: boo
         if lock_handle is not None:
             release_target_lock(
                 lock_handle,
-                cleanup_artifacts=failed,
+                cleanup_artifacts=failed or cleanup_created_artifacts_on_release,
             )
-        if failed and canonical is not None:
+        if failed:
+            transaction.cleanup()
+        if (failed or cleanup_created_artifacts_on_release) and canonical is not None:
             restore_backup_directory_metadata(lock_path(canonical), lock_directory_before_lock)
             restore_backup_directory_metadata(canonical, target_directory_before_lock)
         if failed:
-            transaction.cleanup()
+            restore_backup_directory_metadata(creation_anchor, creation_anchor_before)
         if bootstrap_handle is not None:
             release_bootstrap_lock(bootstrap_handle)
         release_bootstrap_lock(lexical_handle)
@@ -2534,6 +2552,43 @@ def runtime_contains_only_setup_projection(target: Path) -> bool:
     return True
 
 
+def runtime_setup_projection_paths(target: Path) -> tuple[set[Path], set[Path]]:
+    root = runtime_root(target)
+    home = runtime_home(target)
+    setup_state = home / ".junie"
+    return (
+        {root, home, setup_state},
+        {setup_state / "allowlist.json"},
+    )
+
+
+def runtime_removable_paths_preserving_setup_projection(target: Path) -> list[Path]:
+    root = runtime_root(target)
+    allowed_directories, allowed_files = runtime_setup_projection_paths(target)
+    removable: list[Path] = []
+
+    def collect(path: Path) -> None:
+        if path in allowed_files:
+            return
+        if path in allowed_directories:
+            try:
+                children = sorted(path.iterdir(), key=lambda item: item.name)
+            except FileNotFoundError:
+                return
+            for child in children:
+                collect(child)
+            return
+        removable.append(path)
+
+    try:
+        children = sorted(root.iterdir(), key=lambda item: item.name)
+    except FileNotFoundError:
+        return []
+    for child in children:
+        collect(child)
+    return sorted(removable, key=lambda item: item.relative_to(root).as_posix())
+
+
 def software_state(target: Path) -> dict[str, Any]:
     try:
         runtime_root(target).lstat()
@@ -2930,24 +2985,87 @@ def rollback_software_transaction(target: Path, transaction: SoftwareTransaction
         prune_empty_runtime_dirs(target)
 
 
-def begin_runtime_remove(target: Path) -> RuntimeRemoveTransaction:
+def begin_runtime_remove(
+    target: Path, *, preserve_setup_projection: bool = False
+) -> RuntimeRemoveTransaction:
     root = runtime_root(target)
     if not lstat_exists(root):
         return RuntimeRemoveTransaction(changed=False)
     runtime_private_directory(root, target, "runtime root", repairable=False)
+    target_directory = backup_directory_snapshot(target)
+    previous_directories = runtime_directory_snapshot_map(target)
+    if preserve_setup_projection:
+        removable = runtime_removable_paths_preserving_setup_projection(target)
+        if not removable:
+            return RuntimeRemoveTransaction(changed=False)
+        removed_container = target / f".{RUNTIME_DIR_NAME}.removed.{os.getpid()}.{time.time_ns()}"
+        moved_entries: list[tuple[str, Path]] = []
+        transaction = RuntimeRemoveTransaction(
+            changed=True,
+            removed_container=removed_container,
+            moved_entries=moved_entries,
+            previous_directories=previous_directories,
+            target_directory=target_directory,
+        )
+        try:
+            removed_container.mkdir(mode=OWNER_DIRECTORY_MODE)
+            fsync_directory(target)
+            for path in removable:
+                relative = path.relative_to(root).as_posix()
+                destination = safe_target_path(removed_container, relative)
+                ensure_real_parent(destination, removed_container)
+                path.rename(destination)
+                fsync_directory(path.parent)
+                fsync_directory(destination.parent)
+                moved_entries.append((relative, destination))
+        except BaseException:
+            rollback_runtime_remove(target, transaction)
+            raise
+        return transaction
     removed = target / f".{RUNTIME_DIR_NAME}.removed.{os.getpid()}.{time.time_ns()}"
     root.rename(removed)
     fsync_directory(target)
-    return RuntimeRemoveTransaction(changed=True, removed_root=removed)
+    return RuntimeRemoveTransaction(
+        changed=True,
+        removed_root=removed,
+        previous_directories=previous_directories,
+        target_directory=target_directory,
+    )
 
 
 def commit_runtime_remove(transaction: RuntimeRemoveTransaction) -> None:
     if transaction.removed_root is not None:
         with contextlib.suppress(OSError):
             safe_rmtree_private_directory_fsynced(transaction.removed_root, "removed runtime root")
+    if transaction.removed_container is not None:
+        with contextlib.suppress(OSError):
+            safe_rmtree_private_directory_fsynced(
+                transaction.removed_container,
+                "removed runtime entries",
+            )
 
 
 def rollback_runtime_remove(target: Path, transaction: RuntimeRemoveTransaction) -> None:
+    if transaction.removed_container is not None:
+        root = runtime_root(target)
+        for relative, removed_path in reversed(transaction.moved_entries or []):
+            destination = safe_target_path(root, relative)
+            if lstat_exists(destination):
+                info = destination.lstat()
+                if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                    safe_rmtree_private_directory_fsynced(destination, f"runtime entry {relative}")
+                else:
+                    unlink_path(destination)
+            ensure_real_parent(destination, target)
+            if lstat_exists(removed_path):
+                removed_path.rename(destination)
+                fsync_directory(destination.parent)
+                fsync_directory(removed_path.parent)
+        if lstat_exists(transaction.removed_container):
+            safe_rmtree_private_directory_fsynced(
+                transaction.removed_container,
+                "removed runtime entries",
+            )
     if transaction.removed_root is not None and lstat_exists(transaction.removed_root):
         if lstat_exists(runtime_root(target)):
             info = runtime_root(target).lstat()
@@ -2957,6 +3075,8 @@ def rollback_runtime_remove(target: Path, transaction: RuntimeRemoveTransaction)
                 unlink_path(runtime_root(target))
         transaction.removed_root.rename(runtime_root(target))
         fsync_directory(runtime_root(target).parent)
+    restore_runtime_directory_metadata(target, transaction.previous_directories)
+    restore_backup_directory_metadata(target, transaction.target_directory)
 
 
 def prune_empty_runtime_dirs(target: Path) -> None:
@@ -3486,6 +3606,26 @@ def backup_directory_snapshot(path: Path) -> DirectorySnapshot:
         device=info.st_dev,
         inode=info.st_ino,
     )
+
+
+def nearest_existing_directory_snapshot(path: Path, label: str) -> tuple[Path, DirectorySnapshot]:
+    current = path
+    while True:
+        info = stat_existing(current, label)
+        if info is not None:
+            if not stat.S_ISDIR(info.st_mode):
+                fail(f"{label} must be a directory")
+            return current, DirectorySnapshot(
+                exists=True,
+                mode=stat.S_IMODE(info.st_mode),
+                mtime_ns=info.st_mtime_ns,
+                device=info.st_dev,
+                inode=info.st_ino,
+            )
+        parent = current.parent
+        if parent == current:
+            fail(f"{label} parent is missing")
+        current = parent
 
 
 def restore_backup_directory_metadata(
@@ -4235,12 +4375,21 @@ def install_or_update_cli(target: Path, *, repair: bool, command: str) -> dict[s
             fail(
                 "install-cli requires absent target-owned software; use update-cli to repair drift"
             )
+        current_software = current.get("software")
+        if isinstance(current_software, dict) and current_software.get("state") != "absent":
+            with contextlib.suppress(JunieCliSetupError):
+                metadata = current_software_metadata(target)
+                if current_software == metadata:
+                    return software_result_payload(target, command, False, metadata)
         snapshot: TransactionSnapshot | None = None
         software_tx: SoftwareTransaction | None = None
         try:
             snapshot = capture_transaction_snapshot(target, target_existed=True, relatives=[])
             software_tx = begin_software_transaction(target, repair=repair)
-            desired_stamp = write_stamp_software_state(target, current, software_tx.metadata)
+            if software_tx.changed or current.get("software") != software_tx.metadata:
+                desired_stamp = write_stamp_software_state(target, current, software_tx.metadata)
+            else:
+                desired_stamp = current
             commit_software_transaction(software_tx)
             cleanup_transaction_preserve_dir(snapshot)
         except BaseException:
@@ -4269,12 +4418,19 @@ def remove_cli(target: Path) -> dict[str, Any]:
             unexpected = [item for item in drift_for_stamp(target, current) if item != "software"]
             if unexpected:
                 fail(f"managed target has drift: {', '.join(unexpected)}")
+            if current.get("software") == {"state": "absent"} and software_state(target) == {
+                "state": "absent"
+            }:
+                return software_result_payload(target, "remove-cli", False, {"state": "absent"})
         snapshot: TransactionSnapshot | None = None
         runtime_tx: RuntimeRemoveTransaction | None = None
         try:
             if current is not None:
                 snapshot = capture_transaction_snapshot(target, target_existed=True, relatives=[])
-            runtime_tx = begin_runtime_remove(target)
+            runtime_tx = begin_runtime_remove(
+                target,
+                preserve_setup_projection=current is not None,
+            )
             if current is not None:
                 write_stamp_software_state(target, current, {"state": "absent"})
                 cleanup_transaction_preserve_dir(snapshot)
@@ -4468,7 +4624,12 @@ def plan_payload_locked(
 
 
 def plan_payload(target: Path, setup: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
-    with target_lock(target, create_parent=False, allow_missing=True):
+    with target_lock(
+        target,
+        create_parent=False,
+        allow_missing=True,
+        cleanup_created_artifacts_on_release=True,
+    ):
         return plan_payload_locked(target, setup, profile)
 
 
@@ -4705,7 +4866,12 @@ def dispatch(args: argparse.Namespace) -> int:
     require_supported_host()
     if args.command == "status":
         target = require_absolute_target(args.target)
-        with target_lock(target, create_parent=False, allow_missing=True):
+        with target_lock(
+            target,
+            create_parent=False,
+            allow_missing=True,
+            cleanup_created_artifacts_on_release=True,
+        ):
             emit(status_payload(target), as_json=args.json)
         return 0
     if args.command == "plan":
@@ -4752,7 +4918,12 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.command == "software-status":
         target = require_absolute_target(args.target)
-        with target_lock(target, create_parent=False, allow_missing=True):
+        with target_lock(
+            target,
+            create_parent=False,
+            allow_missing=True,
+            cleanup_created_artifacts_on_release=True,
+        ):
             emit(software_status_payload(target), as_json=args.json)
         return 0
     if args.command == "install-cli":

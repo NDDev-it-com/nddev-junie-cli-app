@@ -4,6 +4,7 @@
   "junie_cli_channel": "release",
   "junie_cli_tested": "2383.10",
   "nddev_builder_projection_version": "0.2.0",
+  "python_requires": ">=3.9",
   "runtime_baseline_ref": "references/junie-cli-baseline.json",
   "shared_ci": {
     "repository": "NDDev-it-com/ci-workflows",

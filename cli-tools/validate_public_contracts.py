@@ -29,6 +29,17 @@ SETUP_ORDER = ["nddev-builder"]
 PROFILE_ORDER = ["safe", "full-auto"]
 DEFAULT_SETUP_ID = "nddev-builder"
 DEFAULT_PROFILE_ID = "full-auto"
+PYTHON_REQUIRES = ">=3.9"
+REQUIRED_BUILD_VERSION_KEYS = {
+    "schema_version",
+    "build_version",
+    "junie_cli_channel",
+    "junie_cli_tested",
+    "nddev_builder_projection_version",
+    "python_requires",
+    "runtime_baseline_ref",
+    "shared_ci",
+}
 PUBLIC_SUPPORTED_PLATFORM_ORDER = [
     "macos-arm64",
     "macos-x64",
@@ -1034,6 +1045,30 @@ def expect_os_failure(label: str, callback: Any) -> None:
     raise ValueError(f"{label}: expected OS-level denial")
 
 
+def manager_main_json(manager: Any, argv: list[str], *, expected: int = 0) -> dict[str, Any]:
+    args = list(argv)
+    if "--json" not in args:
+        args.append("--json")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = manager.main(args)
+    if code != expected:
+        raise ValueError(
+            f"manager returned {code}, expected {expected}: {args!r}; "
+            f"stdout={stdout.getvalue()!r} stderr={stderr.getvalue()!r}"
+        )
+    if stderr.getvalue():
+        raise ValueError(f"manager wrote stderr for {args!r}: {stderr.getvalue()!r}")
+    try:
+        payload = json.loads(stdout.getvalue())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"manager did not emit JSON for {args!r}: {stdout.getvalue()!r}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("manager JSON payload must be an object")
+    return payload
+
+
 def hash_bounded_regular_file(
     path: Path,
     expected_info: os.stat_result,
@@ -1862,6 +1897,136 @@ def validate_profile_switch_lifecycle(manager: Any) -> None:
             raise ValueError("switch back to safe did not update profile_id")
 
 
+def validate_software_remove_and_noop_lifecycle(manager: Any) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-software-remove-") as raw:
+        target = Path(raw) / "target"
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        safe = manager.load_profile("safe")
+        manager.write_setup(target, setup, safe)
+        install_fake_software_via_cli(manager, target)
+        before_update = exact_tree_snapshot(target)
+        update = manager.install_or_update_cli(target, repair=True, command="update-cli")
+        if update["software_changed"]:
+            raise ValueError("already-current update-cli reported software mutation")
+        if exact_tree_snapshot(target) != before_update:
+            raise ValueError("already-current update-cli changed target identity")
+
+        allowlist = target / manager.RUNTIME_ALLOWLIST_RELATIVE
+        allowlist_before = exact_path_snapshot(allowlist)
+        removed = manager.remove_cli(target)
+        if not removed["software_changed"]:
+            raise ValueError("remove-cli did not report software removal")
+        if removed["software"] != {"state": "absent"}:
+            raise ValueError("remove-cli did not return absent software state")
+        if manager.software_state(target) != {"state": "absent"}:
+            raise ValueError("remove-cli did not leave absent software state")
+        if not manager.runtime_contains_only_setup_projection(target):
+            raise ValueError("remove-cli did not preserve only setup-owned runtime projection")
+        if exact_path_snapshot(allowlist) != allowlist_before:
+            raise ValueError("remove-cli changed setup-owned runtime allowlist identity")
+        status = manager_main_json(manager, ["status", "--target", str(target)])
+        if status.get("drift"):
+            raise ValueError(f"remove-cli left setup drift: {status['drift']}")
+        if temporary_residue(target):
+            raise ValueError("remove-cli left transaction residue")
+
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-software-remove-fault-") as raw:
+        target = Path(raw) / "target"
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        safe = manager.load_profile("safe")
+        manager.write_setup(target, setup, safe)
+        install_fake_software_via_cli(manager, target)
+        before_fault = exact_tree_snapshot(target)
+        original_write = manager.write_stamp_software_state
+        observed_removed = {"value": False}
+
+        def fail_after_removed_state(
+            target_path: Path, current: dict[str, Any], software: dict[str, Any]
+        ) -> dict[str, Any]:
+            if manager.software_state(target_path) != {"state": "absent"}:
+                raise ValueError("remove-cli fault did not observe absent software state")
+            if not list(target_path.glob(f".{manager.RUNTIME_DIR_NAME}.removed.*")):
+                raise ValueError("remove-cli fault did not stage removed runtime entries")
+            observed_removed["value"] = True
+            raise manager.JunieCliSetupError("post-remove validator fault")
+
+        manager.write_stamp_software_state = fail_after_removed_state
+        try:
+            expect_manager_failure(
+                "remove-cli post-remove fault", lambda: manager.remove_cli(target)
+            )
+        finally:
+            manager.write_stamp_software_state = original_write
+        if not observed_removed["value"]:
+            raise ValueError("remove-cli post-remove fault was not injected")
+        if exact_tree_snapshot(target) != before_fault:
+            raise ValueError("remove-cli post-remove fault changed target identity")
+        if temporary_residue(target):
+            raise ValueError("remove-cli post-remove fault left transaction residue")
+
+
+def validate_failed_first_install_restores_parent(manager: Any) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-first-install-fault-") as raw:
+        parent = Path(raw) / "targets"
+        parent.mkdir(mode=0o700)
+        target = parent / "junie"
+        before_parent = exact_tree_snapshot(parent)
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        safe = manager.load_profile("safe")
+        original_atomic = manager.atomic_write
+        failed = {"value": False}
+
+        def fail_config_write(
+            path: Path, data: bytes, target_path: Path, *, mode: int = 0o600
+        ) -> None:
+            if Path(path).name == "config.json" and not failed["value"]:
+                failed["value"] = True
+                raise manager.JunieCliSetupError("first install validator fault")
+            original_atomic(path, data, target_path, mode=mode)
+
+        manager.atomic_write = fail_config_write
+        try:
+            expect_manager_failure(
+                "failed first setup install",
+                lambda: manager.write_setup(target, setup, safe),
+            )
+        finally:
+            manager.atomic_write = original_atomic
+        if not failed["value"]:
+            raise ValueError("first install fault was not injected")
+        if target.exists():
+            raise ValueError("failed first setup install left the target directory")
+        if exact_tree_snapshot(parent) != before_parent:
+            raise ValueError("failed first setup install changed parent identity")
+
+
+def validate_read_commands_leave_target_unchanged(manager: Any) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-junie-read-locks-") as raw:
+        setup = manager.load_setup(DEFAULT_SETUP_ID)
+        profile = manager.load_profile(DEFAULT_PROFILE_ID)
+        commands = (
+            ["status"],
+            ["plan", "--setup", setup["id"], "--profile", profile["id"]],
+            ["software-status"],
+        )
+        for preexisting_lock in (False, True):
+            target = Path(raw) / ("prelocked" if preexisting_lock else "empty")
+            target.mkdir(mode=0o700)
+            if preexisting_lock:
+                with manager.target_lock(target, create_parent=False):
+                    pass
+            before = exact_tree_snapshot(target)
+            for command in commands:
+                manager_main_json(manager, [*command, "--target", str(target)])
+                if exact_tree_snapshot(target) != before:
+                    raise ValueError(
+                        f"{command[0]} changed target lock artifacts or metadata "
+                        f"(preexisting_lock={preexisting_lock})"
+                    )
+            if not preexisting_lock and (target / manager.LOCK_DIR_NAME).exists():
+                raise ValueError("read command left a newly-created target lock directory")
+
+
 def validate_launch_lock_concurrency(manager: Any) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-junie-launch-lock-") as raw:
         target = Path(raw) / "target"
@@ -2310,6 +2475,35 @@ def exact_tree_snapshot(
     return tuple(rows)
 
 
+def exact_path_snapshot(path: Path) -> tuple[str, int, int, int, bytes | str | None]:
+    info = path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISDIR(info.st_mode):
+        return ("dir", mode, info.st_ino, info.st_mtime_ns, None)
+    if stat.S_ISREG(info.st_mode):
+        return ("file", mode, info.st_ino, info.st_mtime_ns, path.read_bytes())
+    if stat.S_ISLNK(info.st_mode):
+        return ("symlink", mode, info.st_ino, info.st_mtime_ns, os.readlink(path))
+    return ("other", mode, info.st_ino, info.st_mtime_ns, None)
+
+
+def temporary_residue(target: Path) -> list[str]:
+    if not target.exists():
+        return []
+    markers = (
+        ".nddev.tmp.",
+        ".nddev-backup.",
+        ".removed.",
+        ".install-stage.",
+        ".old.",
+    )
+    return sorted(
+        path.relative_to(target).as_posix()
+        for path in target.rglob("*")
+        if any(marker in path.name for marker in markers)
+    )
+
+
 def backup_transaction_residue(pool: Path) -> list[str]:
     if not pool.exists():
         return []
@@ -2498,6 +2692,13 @@ def main(argv: list[str] | None = None) -> int:
     baseline = load_json(ROOT / "references" / "junie-cli-baseline.json")
     ids = setup_ids()
     profiles = profile_ids()
+    if set(build) != REQUIRED_BUILD_VERSION_KEYS:
+        raise ValueError(
+            "build/version.json keys are not synchronized: "
+            f"actual={sorted(build)}, expected={sorted(REQUIRED_BUILD_VERSION_KEYS)}"
+        )
+    if build.get("python_requires") != PYTHON_REQUIRES:
+        raise ValueError("build/version.json python_requires must declare the Python 3.9 floor")
     if build.get("build_version") != version or manifest.get("build_version") != version:
         raise ValueError("build version fields are not synchronized")
     if build.get("nddev_builder_projection_version") != version:
@@ -2626,6 +2827,9 @@ def main(argv: list[str] | None = None) -> int:
         validate_legacy_mapping_migration(manager)
         validate_backup_transaction_fail_closed(manager)
         validate_restore_backup_fail_closed(manager)
+        validate_software_remove_and_noop_lifecycle(manager)
+        validate_failed_first_install_restores_parent(manager)
+        validate_read_commands_leave_target_unchanged(manager)
     validate_workflows()
     validate_release_workflow(version, contract, manifest)
     print("validate_public_contracts.py: PASS")
