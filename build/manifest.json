@@ -3,11 +3,56 @@
   "product_name": "nddev-junie-cli-app",
   "build_version": "0.2.0",
   "junie_cli_channel": "release",
-  "junie_cli_tested": "2383.10",
-  "setup_ids": ["nddev-builder"],
+  "junie_cli_tested": "2470.4",
+  "setup_ids": [
+    "nddev-builder"
+  ],
   "default_setup_id": "nddev-builder",
-  "profile_ids": ["safe", "full-auto"],
+  "profile_ids": [
+    "safe",
+    "full-auto"
+  ],
   "default_profile_id": "full-auto",
+  "supported_platforms": [
+    "macos-arm64",
+    "macos-x64",
+    "ubuntu-glibc-arm64",
+    "ubuntu-glibc-x64"
+  ],
+  "official_artifact_platforms": [
+    "linux-aarch64",
+    "linux-amd64",
+    "macos-aarch64",
+    "macos-amd64",
+    "windows-aarch64",
+    "windows-amd64"
+  ],
+  "artifact_platform_map": {
+    "macos-arm64": "macos-aarch64",
+    "macos-x64": "macos-amd64",
+    "ubuntu-glibc-arm64": "linux-aarch64",
+    "ubuntu-glibc-x64": "linux-amd64"
+  },
+  "ubuntu_support": {
+    "distribution_detection": "platform.freedesktop_os_release ID=ubuntu",
+    "desktop_server_model": "Ubuntu Desktop and Server share ID=ubuntu plus glibc host detection.",
+    "ubuntu_release_floor": null,
+    "glibc_version_floor": null,
+    "official_floor": "no-official-floor",
+    "binary_abi": "glibc"
+  },
+  "unsupported_platforms": {
+    "windows": "unsupported",
+    "non-ubuntu-linux": "unsupported",
+    "linux-musl": "unsupported",
+    "unsupported-architecture": "unsupported"
+  },
+  "unsupported_official_artifact_platforms": {
+    "windows": [
+      "windows-aarch64",
+      "windows-amd64"
+    ]
+  },
   "manager": "cli-tools/nddev_junie_cli.py",
   "contract": "config/nddev-contract.json",
   "runtime_baseline": "references/junie-cli-baseline.json",
@@ -18,11 +63,37 @@
     "java": "target-owned JVM user.home and java.io.tmpdir",
     "default_locations": "disabled through official Junie CLI flags and environment variables",
     "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
-    "launch_lock": "persistent external bootstrap O_NOFOLLOW 0600 flock under resolved fixed system temp is acquired before target creation/inspection and released last; persistent target-internal O_NOFOLLOW 0600 lock file is acquired second, its parent is 0500 while held and restored to 0700 on release",
+    "launch_lock": "persistent lexical external bootstrap O_NOFOLLOW 0600 flock under resolved fixed system temp is acquired before parent/canonical target inspection, canonical-target external bootstrap flock is acquired second, and persistent target-internal O_NOFOLLOW 0600 lock file is acquired third; target lock parent is 0500 while held and restored to 0700 on release",
     "pre_child_artifact_revalidation": "target-owned Junie shim and pinned Junie binary path, inode, size, and SHA256 are revalidated immediately before child execution",
     "verified_path_handoff": "launch retains open verified fds as evidence, materializes a dedicated launch image at <target>/.nddev-junie-cli-runtime/launch-image/junie, write-protects only that dedicated launcher directory through child completion, then executes the launch image path with Popen",
     "runtime_state_writable": "target root, runtime HOME, TMP, XDG, JUNIE_DATA, JUNIE_LOG_DIR, project, and config/source directories remain writable during launch handoff protection",
     "same_uid_boundary": "ordinary target-local internal lock rename/unlink replacement is blocked by the external bootstrap lock and ordinary unlink/replace inside protected lock and launch-image directories is blocked while protected; deliberate same-UID bootstrap-root or ancestor tampering is outside this no-sandbox boundary"
+  },
+  "cleanup_journal": {
+    "directory": ".nddev-junie-cli-cleanup",
+    "journal": "NDDEV-JUNIE-CLI-CLEANUP.json",
+    "stage": "NDDEV-JUNIE-CLI-CLEANUP-STAGE.json",
+    "drain": "NDDEV-JUNIE-CLI-CLEANUP-DRAIN.json",
+    "schema": 1,
+    "stage_schema": 1,
+    "drain_schema": 1,
+    "max_payloads": 3,
+    "max_entries": 20000,
+    "max_bytes": 4294967296,
+    "max_journal_bytes": 16777216,
+    "max_stage_bytes": 33554432,
+    "stage_binding": {
+      "target_kind": "canonical-target-directory",
+      "source_anchor": "canonical_target",
+      "source_parent_kind": "cleanup-source-parent-directory",
+      "source_kind": "cleanup-source-directory",
+      "destination_anchor": "cleanup_parent",
+      "destination_parent_kind": "cleanup-tombstone-parent-directory",
+      "destination_kind": "cleanup-tombstone-payload-directory"
+    },
+    "publication": "native atomic no-replace rename of a complete fsynced immutable journal after durable promotion stage with bounded relative move intent; immutable drain intent is published before recursive deletion; final-visible stage-retirement faults preserve valid pending cleanup",
+    "read_only": "expose cleanup_pending for valid final journal/tombstones or bounded drain intent even when stage retirement residue remains; fail closed on malformed, standalone staged, missing, or incomplete pending state without recovery",
+    "mutation": "later target-bound mutations recover staged promotions and drain exact journaled tombstones or resume bounded drain intent before active changes"
   },
   "nddev_builder_projection_version": "0.2.0",
   "public_validator": "cli-tools/validate_public_contracts.py"

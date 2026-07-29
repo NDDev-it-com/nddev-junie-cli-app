@@ -8,11 +8,10 @@ files with a stamp, rollback snapshot, target-internal lock, and target-internal
 rotating backups.
 
 `--target` is the managed control and project root. The launched Junie Home is an
-isolated runtime directory below that target. Explicit config, guidelines, skills,
-agents, commands, MCP, hooks, and extension source files remain deterministic
-regular files under the control root and are passed to Junie by exact flags and
-environment variables. The action allowlist is pathless native Junie state and is
-materialized under the isolated runtime home.
+isolated runtime directory below that target. Scope ownership and projection
+details are defined by `cli-tools/nddev_junie_cli.py` and summarized by
+`config/nddev-contract.json` so this README does not duplicate managed-path
+lists.
 
 ## Commands
 
@@ -26,8 +25,21 @@ python3 cli-tools/nddev_junie_cli.py migrate --setup nddev-builder --profile ful
 python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py remove --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py software-status --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py install-cli --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py update-cli --target /absolute/target --json
+python3 cli-tools/nddev_junie_cli.py remove-cli --target /absolute/target --json
 python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target -- --version
 ```
+
+`plan` is side-effect-free and reports the stable `changed` managed-path set
+that the corresponding `install`, `switch`, `update`, or `migrate` mutation
+would write or remove.
+
+Setup commands manage projected Junie configuration, builder content, stamps,
+locks, and backups. The target-owned Junie CLI runtime is managed only through
+the `*-cli` software commands, so setup `install` never substitutes for software
+installation.
 
 ## Junie CLI Baseline
 
@@ -49,6 +61,23 @@ so concurrent lifecycle mutations are denied while Junie is running. The exact
 managed paths, installer probe details, lock implementation, launch handoff,
 scope flags, environment bindings, and same-user tamper boundary are defined by
 the code-owned sources above.
+
+## Supported Platforms
+
+NDDev supports Junie CLI on `macos-arm64`, `macos-x64`,
+`ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. Official JetBrains artifact keys
+and URLs remain vendor-owned observations. The pinned update-info release also
+contains official Windows artifacts, which NDDev records as official but
+unsupported; product support remains exactly the four macOS and Ubuntu host ids
+above.
+
+Linux distribution detection uses structured OS metadata and accepts Ubuntu
+Desktop or Server through the same `ID=ubuntu` plus glibc host check. JetBrains
+does not publish an Ubuntu release or glibc version floor for the pinned
+`linux-*` artifacts, so the contract stores that floor as `null` and
+`no-official-floor`. `non-ubuntu-linux`, `linux-musl`, `windows`, and
+`unsupported-architecture` hosts fail closed before installer network access,
+staging, or runtime mutation.
 
 ## Setups
 

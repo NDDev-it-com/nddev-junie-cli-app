@@ -8,7 +8,10 @@
   "managed_state": {
     "stamp_file": "NDDEV-JUNIE-CLI-SETUP.json",
     "stamp_schema": 3,
-    "legacy_stamp_schemas_readable": [1, 2],
+    "legacy_stamp_schemas_readable": [
+      1,
+      2
+    ],
     "default_target": null,
     "environment_variable": null,
     "managed_directory_mode": "0700",
@@ -18,11 +21,30 @@
     "lock_file_mode": "0600",
     "lock_parent_held_mode": "0500",
     "bootstrap_lock_root": "<resolved fixed system temp>/nddev-junie-cli-app-bootstrap-locks-uid-<uid>",
-    "bootstrap_lock_file": "sha256(product namespace plus canonical absolute target).lock",
+    "bootstrap_product_anchor": "<bootstrap_lock_root>/global.lock",
+    "bootstrap_target_anchor": "sha256(product namespace plus canonical absolute target).lock",
     "bootstrap_lock_file_mode": "0600",
-    "bootstrap_lock_persistent": true,
+    "bootstrap_product_anchor_persistent": true,
+    "bootstrap_target_anchor_persistent": true,
+    "bootstrap_anchor_publication": "complete fsynced temporary marker published with native atomic no-replace rename semantics and no hard-link alias publication; existing anchors are opened no-create/no-follow and never truncated, rebound, or replaced",
+    "read_only_bootstrap_coordination": "successful read commands create no product or canonical target anchor; cold no-anchor reads double-check product-anchor absence and retry if it appears; seeded reads lock the product anchor shared and hand off to a pre-existing canonical target anchor when present",
     "target_lock_persistent": true,
     "backup_directory": "<target>/.nddev-junie-cli-backups",
+    "cleanup_directory": "<target>/.nddev-junie-cli-cleanup",
+    "cleanup_journal": "<target>/NDDEV-JUNIE-CLI-CLEANUP.json",
+    "cleanup_stage": "<target>/NDDEV-JUNIE-CLI-CLEANUP-STAGE.json",
+    "cleanup_drain": "<target>/NDDEV-JUNIE-CLI-CLEANUP-DRAIN.json",
+    "cleanup_journal_schema": 1,
+    "cleanup_stage_schema": 1,
+    "cleanup_drain_schema": 1,
+    "cleanup_journal_max_payloads": 3,
+    "cleanup_journal_max_entries": 20000,
+    "cleanup_journal_max_bytes": 4294967296,
+    "cleanup_journal_max_journal_bytes": 16777216,
+    "cleanup_stage_max_bytes": 33554432,
+    "cleanup_stage_binding": "promotion stage entries bind source_anchor=canonical_target plus bounded relative source_relative, source_parent_identity, and source_kind=cleanup-source-directory to destination_anchor=cleanup_parent plus bounded relative destination_relative, fixed destination parent binding, and destination_kind=cleanup-tombstone-payload-directory; no absolute rename/delete capabilities or broad lookalike adoption are valid",
+    "cleanup_journal_publication": "complete immutable identity-bound pending journal published once with native atomic no-replace rename; a complete durable promotion stage with bounded relative move intent is published before the first source-to-tombstone move; an immutable cleanup drain intent is published before the first recursive tombstone deletion and is retired last; once an exact final journal and tombstones are visible, stage-retirement faults return success with cleanup_pending; read-only commands expose valid pending or draining state without repair and fail closed on temp aliases, standalone or malformed stage residue, missing tombstones without drain intent, nlink mismatch, malformed, unknown, or over-bound pending state",
+    "cleanup_pending_result": "status, plan, software-status, setup lifecycle, and software lifecycle JSON expose top-level cleanup_pending; setup and software lifecycle mutators expose cleanup_drained",
     "preserve_other_state": true,
     "control_root": "explicit --target, also passed as Junie --project",
     "runtime_home": "<target>/.nddev-junie-cli-runtime/home",
@@ -38,7 +60,9 @@
   },
   "setup_system": {
     "catalog_root": "setups",
-    "setup_ids": ["nddev-builder"],
+    "setup_ids": [
+      "nddev-builder"
+    ],
     "default_setup_id": "nddev-builder",
     "content_setup": "nddev-builder",
     "identity_source": "official Junie CLI docs and installer scripts from junie.jetbrains.com",
@@ -46,6 +70,7 @@
     "status_command": "python3 cli-tools/nddev_junie_cli.py status --target /absolute/target --json",
     "plan_command": "python3 cli-tools/nddev_junie_cli.py plan --setup nddev-builder --profile full-auto --target /absolute/target --json",
     "install_command": "python3 cli-tools/nddev_junie_cli.py install --setup nddev-builder --profile full-auto --target /absolute/target --json",
+    "update_command": "python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json",
     "switch_command": "python3 cli-tools/nddev_junie_cli.py switch --setup nddev-builder --profile safe --target /absolute/target --json",
     "migrate_command": "python3 cli-tools/nddev_junie_cli.py migrate --setup nddev-builder --profile full-auto --target /absolute/target --json",
     "restore_command": "python3 cli-tools/nddev_junie_cli.py restore --backup 0 --target /absolute/target --json",
@@ -54,7 +79,10 @@
   },
   "permission_profiles": {
     "catalog_root": "profiles",
-    "profile_ids": ["safe", "full-auto"],
+    "profile_ids": [
+      "safe",
+      "full-auto"
+    ],
     "default_profile_id": "full-auto",
     "safe": {
       "native_brave": false,
@@ -85,6 +113,13 @@
     "external_bootstrap_lock_outside_target": true,
     "external_bootstrap_lock_fixed_system_temp": "macOS resolved /private/tmp; Linux /tmp; never ambient TMPDIR",
     "external_bootstrap_lock_not_in_child_env": true,
+    "bootstrap_binding_atomic_publication": true,
+    "bootstrap_anchor_no_replace_publication": true,
+    "bootstrap_anchor_monotonic": true,
+    "read_only_bootstrap_no_create": true,
+    "cleanup_journal_no_replace_publication": true,
+    "cleanup_read_only_no_recovery": true,
+    "cleanup_later_mutations_drain_first": true,
     "subprocess_path": "/usr/bin:/bin:/usr/sbin:/sbin",
     "launch_holds_target_lock_until_child_exit": true,
     "launch_blocks_lifecycle_mutations_while_child_runs": true,
@@ -97,12 +132,15 @@
   "software_lifecycle": {
     "installer_url": "https://junie.jetbrains.com/install.sh",
     "installer_sha256": "a37b9ce2d7bdacdcccd59afd6b8a84d96d2349a5ab6a3707c83f5b731af294bd",
-    "version": "2383.10",
-    "marketing_version": "26.7.20",
+    "version": "2470.4",
+    "marketing_version": "26.7.27",
     "update_info": "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
     "install_only_absent": true,
     "update_repairs_safe_partial": true,
-    "update_command": "python3 cli-tools/nddev_junie_cli.py update --target /absolute/target --json",
+    "status_command": "python3 cli-tools/nddev_junie_cli.py software-status --target /absolute/target --json",
+    "install_command": "python3 cli-tools/nddev_junie_cli.py install-cli --target /absolute/target --json",
+    "update_command": "python3 cli-tools/nddev_junie_cli.py update-cli --target /absolute/target --json",
+    "remove_command": "python3 cli-tools/nddev_junie_cli.py remove-cli --target /absolute/target --json",
     "installer_execution_home": "isolated staging HOME",
     "source_overrides": false,
     "test_environment_overrides": false,
@@ -114,16 +152,58 @@
     "baseline_ref": "references/junie-cli-baseline.json",
     "command": "junie",
     "channel": "release",
-    "tested_release": "2383.10",
-    "marketing_version": "26.7.20",
+    "tested_release": "2470.4",
+    "marketing_version": "26.7.27",
     "exact_artifact_hashes_available": true,
-    "supported_platforms": ["linux-aarch64", "linux-amd64", "macos-aarch64", "macos-amd64"]
+    "supported_platforms": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "official_artifact_platforms": [
+      "linux-aarch64",
+      "linux-amd64",
+      "macos-aarch64",
+      "macos-amd64",
+      "windows-aarch64",
+      "windows-amd64"
+    ],
+    "artifact_platform_map": {
+      "macos-arm64": "macos-aarch64",
+      "macos-x64": "macos-amd64",
+      "ubuntu-glibc-arm64": "linux-aarch64",
+      "ubuntu-glibc-x64": "linux-amd64"
+    },
+    "ubuntu_support": {
+      "distribution_detection": "platform.freedesktop_os_release ID=ubuntu",
+      "desktop_server_model": "Ubuntu Desktop and Server share ID=ubuntu plus glibc host detection.",
+      "ubuntu_release_floor": null,
+      "glibc_version_floor": null,
+      "official_floor": "no-official-floor",
+      "binary_abi": "glibc"
+    },
+    "unsupported_platforms": {
+      "windows": "Rejected before target inspection, network, staging, or runtime mutation even though official windows-* artifacts exist.",
+      "non-ubuntu-linux": "Rejected before network, staging, or runtime mutation even when an official linux-* artifact exists.",
+      "linux-musl": "unsupported because the official Junie linux-* artifact is treated as glibc-bound",
+      "unsupported-architecture": "Only arm64/aarch64 and x64/amd64 are supported."
+    },
+    "unsupported_official_artifact_platforms": {
+      "windows": [
+        "windows-aarch64",
+        "windows-amd64"
+      ]
+    }
   },
   "runtime_launch": {
     "command": "junie",
-    "direct_command": ["junie", "--skip-update-check"],
+    "direct_command": [
+      "junie",
+      "--skip-update-check"
+    ],
     "manager_command": "python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target --",
-    "required_version": "2383.10",
+    "required_version": "2470.4",
     "environment_variable": null,
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
@@ -131,7 +211,7 @@
     "json_manager_errors_supported": true,
     "target_environment_scope": "T is the explicit control/project root; H is T/.nddev-junie-cli-runtime/home; Junie receives exact target-owned config, guidelines, skills, agents, MCP, commands, hooks, extensions cache, cache, temp, HOME, XDG, data, logs, and JVM home/tmp scopes",
     "live_home_guard": "account ~/.junie metadata must remain unchanged across installer probes and launches",
-    "lock_scope": "lifecycle locking acquires a persistent external bootstrap flock first under the resolved fixed system temp root, keyed by the full SHA256 of product namespace plus canonical absolute target, then acquires the persistent target-internal flock at <target>/.nddev-junie-cli.lock/lock; release order is internal first and external last",
+    "lock_scope": "lifecycle locking acquires a persistent external bootstrap flock first under the resolved fixed system temp root, keyed by the full SHA256 of product namespace plus lexical absolute target before parent/canonical target inspection, then acquires the canonical-target external flock, then acquires the persistent target-internal flock at <target>/.nddev-junie-cli.lock/lock; release order is internal first, canonical external second, lexical external last",
     "pre_child_artifact_revalidation": "target-owned Junie shim and pinned Junie binary path, inode, size, and SHA256 are captured during launch preflight and revalidated immediately before subprocess execution",
     "verified_path_handoff": "macOS does not support this manager executing Junie through fexecve or /dev/fd, so launch retains open verified fds as evidence, materializes a dedicated launch image from the verified target-owned shim at <target>/.nddev-junie-cli-runtime/launch-image/junie, write-protects only that dedicated launcher directory, immediately revalidates identity and digest, then starts the launch image path with Popen",
     "runtime_state_writable": "The managed target, runtime HOME, TMP, XDG, JUNIE_DATA, JUNIE_LOG_DIR, project, and config/source directories are not made read-only by launch handoff protection.",

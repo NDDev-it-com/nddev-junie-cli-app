@@ -32,6 +32,21 @@ timeout switches. Healthy target-owned software is left in place by `install`;
 `update` is the explicit repair path for supported partial runtime state. Unsafe
 targets fail closed before external installer work begins.
 
+`plan` remains read-only and reports the stable `changed` managed-path set that
+the matching setup/profile mutation would write or remove, including legacy
+managed-file removals during migration.
+
+The supported runtime scope is `macos-arm64`, `macos-x64`,
+`ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. JetBrains publishes the
+Ubuntu-compatible assets under official `linux-*` artifact names; the manager
+preserves those names for artifact verification while rejecting
+`non-ubuntu-linux`, `linux-musl`, `windows`, and `unsupported-architecture`
+hosts before network, staging, or runtime mutation. Ubuntu Desktop and Server
+share the same `ID=ubuntu` plus glibc host check. JetBrains does not publish an
+Ubuntu release or glibc version floor for the pinned `linux-*` artifacts, so the
+contract stores the floor as `null` and `no-official-floor` rather than a
+hardcoded `VERSION_ID`.
+
 ## Launch Isolation
 
 `launch` validates the managed target, refuses drift, keeps lifecycle ownership
