@@ -239,6 +239,8 @@ def validate_static_source() -> None:
 
 
 def validate_release_surface(manifest: dict[str, Any]) -> None:
+    agents = ROOT / "AGENTS.md"
+    require(stat.S_ISREG(agents.lstat().st_mode), "AGENTS.md must be a regular file")
     for name in REQUIRED_WORKFLOWS:
         require(
             (ROOT / ".github/workflows" / name).is_file(),
