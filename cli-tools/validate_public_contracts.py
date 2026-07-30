@@ -24,6 +24,13 @@ REQUIRED_WORKFLOWS = {
     "secret-scan.yml",
     "zizmor.yml",
 }
+INSTRUCTION_FILES = (
+    "AGENTS.md",
+    ".claude/CLAUDE.md",
+)
+INSTRUCTION_ARCHIVE_ROOTS = {
+    Path(relative).parts[0] for relative in INSTRUCTION_FILES
+}
 FORBIDDEN_RAW_OBSERVATION_FIELDS = {
     "observed_at",
     "exact_artifact_hashes",
@@ -286,6 +293,21 @@ def validate_release_surface(manifest: dict[str, Any]) -> None:
     )
     require(stat.S_ISREG(bridge.lstat().st_mode), "Claude bridge must be a regular file")
     require(bridge.read_bytes() == b"@../AGENTS.md\n", "Claude bridge mismatch")
+    release_workflow = (ROOT / ".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
+    for closure_name in ("archive_paths", "runtime_paths"):
+        match = re.search(
+            rf"(?m)^      {closure_name}: >-\n"
+            r"((?:        .+\n?)+)",
+            release_workflow,
+        )
+        require(match is not None, f"missing {closure_name} release closure")
+        closure_roots = set(match.group(1).split())
+        require(
+            INSTRUCTION_ARCHIVE_ROOTS <= closure_roots,
+            f"{closure_name} must include the complete instruction closure",
+        )
     validator = manifest.get("public_validator")
     require(
         validator == "cli-tools/validate_public_contracts.py",

@@ -27,5 +27,5 @@ jobs:
         AGENTS.md LICENSE README.md VERSION .claude .gds .github build
         cli-tools config builder profiles setups references docs
       runtime_paths: >-
-        AGENTS.md LICENSE README.md VERSION build cli-tools config builder
+        AGENTS.md LICENSE README.md VERSION .claude build cli-tools config builder
         profiles setups references docs
