@@ -23,9 +23,7 @@
     "linux-aarch64",
     "linux-amd64",
     "macos-aarch64",
-    "macos-amd64",
-    "windows-aarch64",
-    "windows-amd64"
+    "macos-amd64"
   ],
   "artifact_platform_map": {
     "macos-arm64": "macos-aarch64",
@@ -46,12 +44,6 @@
     "non-ubuntu-linux": "unsupported",
     "linux-musl": "unsupported",
     "unsupported-architecture": "unsupported"
-  },
-  "unsupported_official_artifact_platforms": {
-    "windows": [
-      "windows-aarch64",
-      "windows-amd64"
-    ]
   },
   "manager": "cli-tools/nddev_junie_cli.py",
   "contract": "config/nddev-contract.json",

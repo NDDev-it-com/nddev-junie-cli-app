@@ -154,7 +154,6 @@
     "channel": "release",
     "tested_release": "2470.4",
     "marketing_version": "26.7.27",
-    "exact_artifact_hashes_available": true,
     "supported_platforms": [
       "macos-arm64",
       "macos-x64",
@@ -165,9 +164,7 @@
       "linux-aarch64",
       "linux-amd64",
       "macos-aarch64",
-      "macos-amd64",
-      "windows-aarch64",
-      "windows-amd64"
+      "macos-amd64"
     ],
     "artifact_platform_map": {
       "macos-arm64": "macos-aarch64",
@@ -188,12 +185,6 @@
       "non-ubuntu-linux": "Rejected before network, staging, or runtime mutation even when an official linux-* artifact exists.",
       "linux-musl": "unsupported because the official Junie linux-* artifact is treated as glibc-bound",
       "unsupported-architecture": "Only arm64/aarch64 and x64/amd64 are supported."
-    },
-    "unsupported_official_artifact_platforms": {
-      "windows": [
-        "windows-aarch64",
-        "windows-amd64"
-      ]
     }
   },
   "runtime_launch": {

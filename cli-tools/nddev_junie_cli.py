@@ -58,9 +58,6 @@ OFFICIAL_ARTIFACT_PLATFORM_BY_HOST = {
     "ubuntu-glibc-arm64": "linux-aarch64",
     "ubuntu-glibc-x64": "linux-amd64",
 }
-OFFICIAL_UNSUPPORTED_ARTIFACT_PLATFORMS = {
-    "windows": ("windows-aarch64", "windows-amd64"),
-}
 STAMP_NAME = "NDDEV-JUNIE-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-JUNIE-CLI-BACKUP.json"
 STAMP_SCHEMA = 3

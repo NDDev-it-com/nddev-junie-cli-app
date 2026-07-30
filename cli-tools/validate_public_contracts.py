@@ -24,6 +24,14 @@ REQUIRED_WORKFLOWS = {
     "secret-scan.yml",
     "zizmor.yml",
 }
+FORBIDDEN_RAW_OBSERVATION_FIELDS = {
+    "observed_at",
+    "exact_artifact_hashes",
+    "unsupported_official_artifact_platforms",
+}
+FORBIDDEN_RAW_MANAGER_MARKERS = {
+    "OFFICIAL_UNSUPPORTED_ARTIFACT_PLATFORMS",
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -127,7 +135,6 @@ def validate_runtime_integrity(
     for key in (
         "supported_platforms",
         "artifact_platform_map",
-        "unsupported_official_artifact_platforms",
         "ubuntu_support",
     ):
         require(manifest.get(key) == compatibility.get(key), f"{key} mismatch")
@@ -142,8 +149,6 @@ def validate_runtime_integrity(
         "unsupported platform mismatch",
     )
     artifacts = release["exact_artifacts"]
-    hashes = release["exact_artifact_hashes"]
-    require(set(artifacts) == set(hashes), "artifact/hash ledger mismatch")
     require(
         set(artifacts) == set(manifest["official_artifact_platforms"]),
         "artifact platform closure mismatch",
@@ -156,11 +161,6 @@ def validate_runtime_integrity(
         )
         int(digest, 16)
         require(artifact.get("size", 0) > 0, f"invalid artifact size: {platform_id}")
-        require(
-            hashes[platform_id]
-            == {"sha256": digest, "size": artifact["size"]},
-            f"artifact hash projection mismatch: {platform_id}",
-        )
     software = contract["software_lifecycle"]
     require(
         software["installer_sha256"] == release["installer"]["sha256"],
@@ -171,6 +171,17 @@ def validate_runtime_integrity(
         software["installer_url"] == release["installer"]["url"],
         "installer URL mismatch",
     )
+    for label, value in (
+        ("manifest", manifest),
+        ("contract", contract),
+        ("baseline", baseline),
+    ):
+        serialized = json.dumps(value, sort_keys=True)
+        for field in FORBIDDEN_RAW_OBSERVATION_FIELDS:
+            require(
+                f'"{field}"' not in serialized,
+                f"{label} contains raw observation field {field}",
+            )
 
 
 def validate_builder_projection(version: str, contract: dict[str, Any]) -> None:
@@ -236,6 +247,8 @@ def validate_static_source() -> None:
         "FAIL_AFTER",
     ):
         require(marker not in source, f"public manager contains test marker {marker}")
+    for marker in FORBIDDEN_RAW_MANAGER_MARKERS:
+        require(marker not in source, f"public manager contains raw observation marker {marker}")
 
 
 def validate_release_surface(manifest: dict[str, Any]) -> None:

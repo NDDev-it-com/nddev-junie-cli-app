@@ -1,6 +1,5 @@
 {
   "schema_version": 2,
-  "observed_at": "2026-07-28",
   "product": {
     "vendor": "JetBrains",
     "name": "Junie CLI",
@@ -23,12 +22,6 @@
       "macos-x64": "macos-amd64",
       "ubuntu-glibc-arm64": "linux-aarch64",
       "ubuntu-glibc-x64": "linux-amd64"
-    },
-    "unsupported_official_artifact_platforms": {
-      "windows": [
-        "windows-aarch64",
-        "windows-amd64"
-      ]
     },
     "ubuntu_support": {
       "distribution_detection": "platform.freedesktop_os_release ID=ubuntu",
@@ -69,42 +62,6 @@
         "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-macos-amd64.zip",
         "sha256": "503a6136a459d8fdb684710b2745b6d114909e619a1043de316ddb9b124c91a8",
         "size": 267611567
-      },
-      "windows-aarch64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-windows-aarch64.zip",
-        "sha256": "298e84e1c3f7df4ddc2ae4347ef6a81452def3b2ae986cf95db3350a2a801ad0",
-        "size": 298645215
-      },
-      "windows-amd64": {
-        "download_url": "https://github.com/JetBrains/junie/releases/download/2470.4/junie-release-2470.4-windows-amd64.zip",
-        "sha256": "e5f81a9d442106ce169b8efb92a57b9aa195c2dfcd9d6ff95b1fa324f992d4b5",
-        "size": 264550919
-      }
-    },
-    "exact_artifact_hashes": {
-      "linux-aarch64": {
-        "sha256": "976c6f974598bb34197f434dd041cfbb1cd663d95702ee3260bcb07815a0f630",
-        "size": 269351924
-      },
-      "linux-amd64": {
-        "sha256": "661dba7d55e097ae0eb62ff2475b4e9fe7a59d8e25560d8c1981aad85901b60c",
-        "size": 269957159
-      },
-      "macos-aarch64": {
-        "sha256": "2b0c86dad5402d89a2a9931c0d018e7ceea246a037412a503601931cd353209b",
-        "size": 266474468
-      },
-      "macos-amd64": {
-        "sha256": "503a6136a459d8fdb684710b2745b6d114909e619a1043de316ddb9b124c91a8",
-        "size": 267611567
-      },
-      "windows-aarch64": {
-        "sha256": "298e84e1c3f7df4ddc2ae4347ef6a81452def3b2ae986cf95db3350a2a801ad0",
-        "size": 298645215
-      },
-      "windows-amd64": {
-        "sha256": "e5f81a9d442106ce169b8efb92a57b9aa195c2dfcd9d6ff95b1fa324f992d4b5",
-        "size": 264550919
       }
     }
   },
