@@ -28,9 +28,7 @@ INSTRUCTION_FILES = (
     "AGENTS.md",
     ".claude/CLAUDE.md",
 )
-INSTRUCTION_ARCHIVE_ROOTS = {
-    Path(relative).parts[0] for relative in INSTRUCTION_FILES
-}
+INSTRUCTION_ARCHIVE_ROOTS = {Path(relative).parts[0] for relative in INSTRUCTION_FILES}
 FORBIDDEN_RAW_OBSERVATION_FIELDS = {
     "observed_at",
     "exact_artifact_hashes",
@@ -100,13 +98,11 @@ def validate_catalog(manifest: dict[str, Any], contract: dict[str, Any]) -> None
         "profile catalog mismatch",
     )
     require(
-        manifest.get("default_setup_id")
-        == contract["setup_system"]["default_setup_id"],
+        manifest.get("default_setup_id") == contract["setup_system"]["default_setup_id"],
         "default setup mismatch",
     )
     require(
-        manifest.get("default_profile_id")
-        == contract["permission_profiles"]["default_profile_id"],
+        manifest.get("default_profile_id") == contract["permission_profiles"]["default_profile_id"],
         "default profile mismatch",
     )
     require(isinstance(setup_ids, list) and setup_ids, "setup catalog missing")
@@ -146,13 +142,11 @@ def validate_runtime_integrity(
     ):
         require(manifest.get(key) == compatibility.get(key), f"{key} mismatch")
     require(
-        set(manifest["official_artifact_platforms"])
-        == set(release["exact_artifacts"]),
+        set(manifest["official_artifact_platforms"]) == set(release["exact_artifacts"]),
         "official artifact platform mismatch",
     )
     require(
-        set(manifest["unsupported_platforms"])
-        == set(compatibility["unsupported_platforms"]),
+        set(manifest["unsupported_platforms"]) == set(compatibility["unsupported_platforms"]),
         "unsupported platform mismatch",
     )
     artifacts = release["exact_artifacts"]
@@ -207,8 +201,7 @@ def validate_builder_projection(version: str, contract: dict[str, Any]) -> None:
     for relative in ("skills", "agents", "commands"):
         projection_root = root / relative
         require(
-            projection_root.is_dir()
-            and any(path.is_file() for path in projection_root.rglob("*")),
+            projection_root.is_dir() and any(path.is_file() for path in projection_root.rglob("*")),
             f"empty builder projection: {relative}",
         )
     marketplace = toolkit.get("local_extension_marketplace")
@@ -243,9 +236,7 @@ def validate_static_source() -> None:
     path = ROOT / "cli-tools/nddev_junie_cli.py"
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
-    functions = {
-        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
-    }
+    functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
     require({"parse_args", "main"} <= functions, "manager parse_args/main missing")
     for marker in (
         "NDDEV_JUNIE_CLI_TEST",
@@ -293,9 +284,7 @@ def validate_release_surface(manifest: dict[str, Any]) -> None:
     )
     require(stat.S_ISREG(bridge.lstat().st_mode), "Claude bridge must be a regular file")
     require(bridge.read_bytes() == b"@../AGENTS.md\n", "Claude bridge mismatch")
-    release_workflow = (ROOT / ".github/workflows/release.yml").read_text(
-        encoding="utf-8"
-    )
+    release_workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     for closure_name in ("archive_paths", "runtime_paths"):
         match = re.search(
             rf"(?m)^      {closure_name}: >-\n"
@@ -323,9 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest, contract, baseline = validate_versions()
         validate_catalog(manifest, contract)
         validate_runtime_integrity(manifest, contract, baseline)
-        validate_builder_projection(
-            manifest["nddev_builder_projection_version"], contract
-        )
+        validate_builder_projection(manifest["nddev_builder_projection_version"], contract)
         validate_static_source()
         validate_release_surface(manifest)
     except Exception as exc:
