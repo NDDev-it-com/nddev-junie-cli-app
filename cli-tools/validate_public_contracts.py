@@ -8,6 +8,7 @@ import ast
 import hashlib
 import json
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -258,10 +259,18 @@ def validate_release_surface(manifest: dict[str, Any]) -> None:
         "setups",
     ):
         require((ROOT / relative).exists(), f"missing release path {relative}")
+    bridge_root = ROOT / ".claude"
+    bridge = bridge_root / "CLAUDE.md"
     require(
-        (ROOT / ".claude/CLAUDE.md").read_bytes() == b"@../AGENTS.md\n",
-        "Claude bridge mismatch",
+        stat.S_ISDIR(bridge_root.lstat().st_mode),
+        "Claude bridge root must be a directory",
     )
+    require(
+        sorted(path.name for path in bridge_root.iterdir()) == ["CLAUDE.md"],
+        "Claude bridge directory must contain only CLAUDE.md",
+    )
+    require(stat.S_ISREG(bridge.lstat().st_mode), "Claude bridge must be a regular file")
+    require(bridge.read_bytes() == b"@../AGENTS.md\n", "Claude bridge mismatch")
     validator = manifest.get("public_validator")
     require(
         validator == "cli-tools/validate_public_contracts.py",
