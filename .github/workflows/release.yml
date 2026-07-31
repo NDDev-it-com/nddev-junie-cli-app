@@ -24,7 +24,7 @@ jobs:
       version: ${{ github.ref_name }}
       package_name: nddev-junie-cli-app
       archive_paths: >-
-        AGENTS.md LICENSE README.md VERSION .claude .gds .github build
+        AGENTS.md LICENSE README.md VERSION CHANGELOG.md .claude .gds .github build
         cli-tools config builder profiles setups references docs
       runtime_paths: >-
         AGENTS.md LICENSE README.md VERSION .claude build cli-tools config builder
