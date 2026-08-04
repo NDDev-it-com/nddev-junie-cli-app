@@ -225,7 +225,7 @@ TARGET_SCOPE_FLAGS = {
     "--agent-location",
     "--agent-default-location",
     "--command-location",
-    "--command-default-locations",
+    "--command-default-location",
     "--extensions-default-location",
     "--guidelines-filename",
     "--model-location",
@@ -4317,7 +4317,12 @@ def resolve_junie_binary(version_dir: Path, target: Path) -> Path:
     for candidate in candidates:
         try:
             info = candidate.lstat()
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
+            # FileNotFoundError: candidate does not exist.
+            # NotADirectoryError: an earlier path component is a regular file
+            # (e.g. versions/<v>/junie is the launcher script, so
+            # versions/<v>/junie/bin/junie cannot be traversed). Either way
+            # this candidate is not the binary; try the next one.
             continue
         try:
             require_current_owner(info, "Junie binary")
@@ -4695,7 +4700,7 @@ def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> Non
                 "false",
                 "--command-location",
                 str(commands),
-                "--command-default-locations",
+                "--command-default-location",
                 "false",
                 "--model-default-locations",
                 "false",
@@ -4711,6 +4716,12 @@ def run_stage_version_probe(stage_home: Path, version: str, timeout: int) -> Non
             capture_output=True,
             check=False,
             timeout=timeout,
+            # Junie is a JVM app that writes runtime state (~/.junie) under the
+            # isolated probe HOME. Force an owner-only umask so anything it
+            # creates is already private and survives the
+            # require_private_directory check that follows, regardless of the
+            # caller's ambient umask.
+            preexec_fn=lambda: os.umask(0o077),
         )
     except FileNotFoundError as exc:
         fail(f"stage Junie version probe command is missing: {exc}")
@@ -6800,7 +6811,7 @@ def build_launch_plan_locked(target: Path, child_args: list[str]) -> LaunchPlan:
             "false",
             "--command-location",
             str((canonical / "commands").resolve()),
-            "--command-default-locations",
+            "--command-default-location",
             "false",
             "--model-default-locations",
             "false",
