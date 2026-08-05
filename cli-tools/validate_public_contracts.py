@@ -252,11 +252,7 @@ def validate_static_source() -> None:
 def validate_release_surface(manifest: dict[str, Any]) -> None:
     agents = ROOT / "AGENTS.md"
     require(stat.S_ISREG(agents.lstat().st_mode), "AGENTS.md must be a regular file")
-    for name in REQUIRED_WORKFLOWS:
-        require(
-            (ROOT / ".github/workflows" / name).is_file(),
-            f"missing workflow {name}",
-        )
+    require((ROOT / "release/package.yml").is_file(), "missing release package manifest")
     for relative in (
         "AGENTS.md",
         "LICENSE",
@@ -284,11 +280,11 @@ def validate_release_surface(manifest: dict[str, Any]) -> None:
     )
     require(stat.S_ISREG(bridge.lstat().st_mode), "Claude bridge must be a regular file")
     require(bridge.read_bytes() == b"@../AGENTS.md\n", "Claude bridge mismatch")
-    release_workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    release_workflow = (ROOT / "release/package.yml").read_text(encoding="utf-8")
     for closure_name in ("archive_paths", "runtime_paths"):
         match = re.search(
-            rf"(?m)^      {closure_name}: >-\n"
-            r"((?:        .+\n?)+)",
+            rf"(?m)^{closure_name}: >-\n"
+            r"((?:  .+\n?)+)",
             release_workflow,
         )
         require(match is not None, f"missing {closure_name} release closure")

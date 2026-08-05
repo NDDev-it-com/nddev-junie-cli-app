@@ -1,0 +1,9 @@
+schema_version: 1
+package_name: nddev-junie-cli-app
+version_source: VERSION
+archive_paths: >-
+  AGENTS.md LICENSE README.md VERSION CHANGELOG.md .claude .gds .github build cli-tools config
+  builder profiles setups references docs release
+runtime_paths: >-
+  AGENTS.md LICENSE README.md VERSION .claude build cli-tools config builder profiles setups
+  references docs
