@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-08-05
+
+- Update the supported Junie CLI release to `2548.5` (`26.8.3`) with exact
+  official artifact URLs, sizes, and SHA-256 identities for macOS and Ubuntu
+  on arm64 and x64.
+
 ## [0.2.0]
 
 - Provide a target-explicit Junie CLI setup manager with transactional setup

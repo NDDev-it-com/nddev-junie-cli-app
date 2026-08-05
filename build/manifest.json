@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "product_name": "nddev-junie-cli-app",
-  "build_version": "0.2.0",
+  "build_version": "0.2.1",
   "junie_cli_channel": "release",
-  "junie_cli_tested": "2470.4",
+  "junie_cli_tested": "2548.5",
   "setup_ids": [
     "nddev-builder"
   ],
@@ -87,6 +87,6 @@
     "read_only": "expose cleanup_pending for valid final journal/tombstones or bounded drain intent even when stage retirement residue remains; fail closed on malformed, standalone staged, missing, or incomplete pending state without recovery",
     "mutation": "later target-bound mutations recover staged promotions and drain exact journaled tombstones or resume bounded drain intent before active changes"
   },
-  "nddev_builder_projection_version": "0.2.0",
+  "nddev_builder_projection_version": "0.2.1",
   "public_validator": "cli-tools/validate_public_contracts.py"
 }

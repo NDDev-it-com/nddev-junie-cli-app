@@ -132,8 +132,8 @@
   "software_lifecycle": {
     "installer_url": "https://junie.jetbrains.com/install.sh",
     "installer_sha256": "a37b9ce2d7bdacdcccd59afd6b8a84d96d2349a5ab6a3707c83f5b731af294bd",
-    "version": "2470.4",
-    "marketing_version": "26.7.27",
+    "version": "2548.5",
+    "marketing_version": "26.8.3",
     "update_info": "https://raw.githubusercontent.com/jetbrains-junie/junie/main/update-info.jsonl",
     "install_only_absent": true,
     "update_repairs_safe_partial": true,
@@ -152,8 +152,8 @@
     "baseline_ref": "references/junie-cli-baseline.json",
     "command": "junie",
     "channel": "release",
-    "tested_release": "2470.4",
-    "marketing_version": "26.7.27",
+    "tested_release": "2548.5",
+    "marketing_version": "26.8.3",
     "supported_platforms": [
       "macos-arm64",
       "macos-x64",
@@ -194,7 +194,7 @@
       "--skip-update-check"
     ],
     "manager_command": "python3 cli-tools/nddev_junie_cli.py launch --target /absolute/target --",
-    "required_version": "2470.4",
+    "required_version": "2548.5",
     "environment_variable": null,
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
